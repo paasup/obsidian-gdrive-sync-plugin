@@ -1,0 +1,12 @@
+{
+  "id": "obsidian-gdrive-sync-plugin",
+  "name": "Google Drive File Sync",
+  "version": "2.0.0",
+  "minAppVersion": "0.12.0",
+  "description": "Synchronize Obsidian folders with Google Drive using Google Identity Services",
+  "author": "GunSik Choi",
+  "authorUrl": "https://www.paasup.io",
+  "fundingUrl": "https://buymeacoffee.com/yourname",
+  "isDesktopOnly": false,
+  "hasSettings": true
+}
