@@ -1,10 +1,11 @@
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal } from 'obsidian';
 
 interface GDriveSyncSettings {
     clientId: string;
     clientSecret: string;
     apiKey: string;
-    syncFolder: string;
+    syncFolders: string[]; // 변경: 단일 폴더에서 복수 폴더로
+    syncWholeVault: boolean; // 추가: 전체 vault 동기화 옵션
     autoSync: boolean;
     syncInterval: number;
     accessToken: string;
@@ -18,7 +19,8 @@ const DEFAULT_SETTINGS: GDriveSyncSettings = {
     clientId: '',
     clientSecret: '',
     apiKey: '',
-    syncFolder: '',
+    syncFolders: [], // 빈 배열로 초기화
+    syncWholeVault: false, // 기본값은 false
     autoSync: false,
     syncInterval: 300000, // 5 minutes
     accessToken: '',
@@ -27,6 +29,194 @@ const DEFAULT_SETTINGS: GDriveSyncSettings = {
     syncMode: 'modified', // 기본: 수정 시간 기반
     lastSyncTime: 0
 };
+
+// 폴더 트리 선택 모달 클래스
+class FolderTreeModal extends Modal {
+    private plugin: GDriveSyncPlugin;
+    private onChoose: (folder: TFolder) => void;
+    private expandedFolders: Set<string> = new Set();
+
+    constructor(app: App, plugin: GDriveSyncPlugin, onChoose: (folder: TFolder) => void) {
+        super(app);
+        this.plugin = plugin;
+        this.onChoose = onChoose;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Select Folder to Sync' });
+        
+        const treeContainer = contentEl.createEl('div', { 
+            cls: 'folder-tree-container',
+            attr: { 
+                style: 'max-height: 400px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; padding: 10px; margin: 10px 0;' 
+            }
+        });
+
+        this.renderFolderTree(treeContainer);
+
+        // 버튼 컨테이너
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'text-align: right; margin-top: 15px;' }
+        });
+
+        // 취소 버튼
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel',
+            attr: { style: 'margin-right: 10px;' }
+        });
+        cancelButton.onclick = () => this.close();
+
+        // Vault Root 선택 버튼
+        const selectRootButton = buttonContainer.createEl('button', { 
+            text: 'Select Vault Root',
+            cls: 'mod-cta',
+            attr: { style: 'margin-right: 10px;' }
+        });
+        selectRootButton.onclick = () => {
+            this.onChoose(this.app.vault.getRoot());
+            this.close();
+        };
+    }
+
+    private renderFolderTree(container: HTMLElement) {
+        const rootFolder = this.app.vault.getRoot();
+        const rootFolders = rootFolder.children
+            .filter(child => child instanceof TFolder)
+            .sort((a, b) => a.name.localeCompare(b.name)) as TFolder[];
+
+        rootFolders.forEach(folder => {
+            this.renderFolderNode(container, folder, 0);
+        });
+    }
+
+    private renderFolderNode(container: HTMLElement, folder: TFolder, depth: number) {
+        const nodeEl = container.createEl('div', { 
+            cls: 'folder-tree-node',
+            attr: { 
+                style: `margin-left: ${depth * 20}px; cursor: pointer; padding: 4px 8px; border-radius: 4px; margin-bottom: 2px;` 
+            }
+        });
+
+        // 호버 효과
+        nodeEl.addEventListener('mouseenter', () => {
+            nodeEl.style.backgroundColor = 'var(--background-modifier-hover)';
+        });
+        nodeEl.addEventListener('mouseleave', () => {
+            nodeEl.style.backgroundColor = 'transparent';
+        });
+
+        const hasChildren = folder.children.some(child => child instanceof TFolder);
+        const isExpanded = this.expandedFolders.has(folder.path);
+
+        // 폴더 아이콘과 이름
+        const folderContent = nodeEl.createEl('div', { 
+            attr: { style: 'display: flex; align-items: center;' }
+        });
+
+        // 확장/축소 아이콘
+        const expandIcon = folderContent.createEl('span', { 
+            text: hasChildren ? (isExpanded ? '▼' : '▶') : '  ',
+            attr: { 
+                style: 'margin-right: 8px; width: 12px; display: inline-block; font-size: 10px;' 
+            }
+        });
+
+        // 폴더 아이콘과 이름
+        const folderIcon = folderContent.createEl('span', { 
+            text: '📁',
+            attr: { style: 'margin-right: 6px;' }
+        });
+
+        const folderName = folderContent.createEl('span', { 
+            text: folder.name || 'Vault Root',
+            attr: { style: 'flex-grow: 1;' }
+        });
+
+        // 선택 버튼
+        const selectBtn = folderContent.createEl('button', { 
+            text: 'Select',
+            cls: 'mod-small',
+            attr: { 
+                style: 'margin-left: 10px; padding: 2px 8px; font-size: 11px;' 
+            }
+        });
+
+        // 이벤트 리스너
+        expandIcon.onclick = (e) => {
+            e.stopPropagation();
+            if (hasChildren) {
+                this.toggleFolder(folder.path, container);
+            }
+        };
+
+        folderName.onclick = () => {
+            if (hasChildren) {
+                this.toggleFolder(folder.path, container);
+            }
+        };
+
+        selectBtn.onclick = (e) => {
+            e.stopPropagation();
+            this.onChoose(folder);
+            this.close();
+        };
+
+        // 하위 폴더 렌더링 (확장된 경우)
+        if (hasChildren && isExpanded) {
+            const subFolders = folder.children
+                .filter(child => child instanceof TFolder)
+                .sort((a, b) => a.name.localeCompare(b.name)) as TFolder[];
+
+            subFolders.forEach(subFolder => {
+                this.renderFolderNode(container, subFolder, depth + 1);
+            });
+        }
+    }
+
+    private toggleFolder(folderPath: string, container: HTMLElement) {
+        if (this.expandedFolders.has(folderPath)) {
+            this.expandedFolders.delete(folderPath);
+        } else {
+            this.expandedFolders.add(folderPath);
+        }
+        
+        // 트리 다시 렌더링
+        container.empty();
+        this.renderFolderTree(container);
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+// 기존 FolderSuggestModal 클래스는 유지하되, 사용하지 않음
+class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
+    private folders: TFolder[];
+    private onChoose: (folder: TFolder) => void;
+
+    constructor(app: App, folders: TFolder[], onChoose: (folder: TFolder) => void) {
+        super(app);
+        this.folders = folders;
+        this.onChoose = onChoose;
+    }
+
+    getItems(): TFolder[] {
+        return this.folders;
+    }
+
+    getItemText(folder: TFolder): string {
+        return folder.path || '/'; // 루트 폴더의 경우 '/' 표시
+    }
+
+    onChooseItem(folder: TFolder, evt: MouseEvent | KeyboardEvent): void {
+        this.onChoose(folder);
+    }
+}
 
 export default class GDriveSyncPlugin extends Plugin {
     settings: GDriveSyncSettings;
@@ -51,7 +241,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
         this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
 
-        console.log('Plugin loaded - Desktop App authentication mode with folder structure preservation');
+        console.log('Plugin loaded - Desktop App authentication mode with multi-folder support');
 
         if (this.settings.autoSync) {
             this.setupAutoSync();
@@ -66,6 +256,13 @@ export default class GDriveSyncPlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        
+        // 기존 syncFolder 설정을 syncFolders로 마이그레이션
+        const oldData = await this.loadData();
+        if (oldData && oldData.syncFolder && !oldData.syncFolders) {
+            this.settings.syncFolders = [oldData.syncFolder];
+            await this.saveSettings();
+        }
     }
 
     async saveSettings() {
@@ -206,8 +403,8 @@ export default class GDriveSyncPlugin extends Plugin {
             return;
         }
 
-        if (!this.settings.syncFolder) {
-            new Notice('Please select a folder to sync in settings');
+        if (!this.settings.syncWholeVault && this.settings.syncFolders.length === 0) {
+            new Notice('Please select folders to sync or enable "Sync Whole Vault" in settings');
             return;
         }
 
@@ -219,18 +416,60 @@ export default class GDriveSyncPlugin extends Plugin {
                 return;
             }
 
-            const folder = this.app.vault.getAbstractFileByPath(this.settings.syncFolder);
-            if (!folder || !(folder instanceof TFolder)) {
-                new Notice('Sync folder not found');
-                return;
+            if (this.settings.syncWholeVault) {
+                // 전체 vault 동기화
+                await this.syncVault();
+            } else {
+                // 선택된 폴더들 동기화
+                for (const folderPath of this.settings.syncFolders) {
+                    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+                    if (folder && folder instanceof TFolder) {
+                        await this.syncFolder(folder);
+                    } else {
+                        console.warn(`Folder not found: ${folderPath}`);
+                        new Notice(`⚠️ Folder not found: ${folderPath}`);
+                    }
+                }
             }
 
-            await this.syncFolder(folder);
             new Notice('Google Drive sync completed');
 
         } catch (error) {
             console.error('Sync failed:', error);
             new Notice('Google Drive sync failed');
+        }
+    }
+
+    // 전체 vault 동기화
+    async syncVault() {
+        console.log('Syncing whole vault...');
+        
+        try {
+            // Google Drive에서 Obsidian 동기화 폴더 찾기 또는 생성
+            const driveFolder = await this.getOrCreateDriveFolder();
+            if (!driveFolder) {
+                new Notice('❌ Failed to create or find Google Drive folder');
+                return;
+            }
+
+            console.log(`✓ Google Drive folder ready: ${this.settings.driveFolder}`);
+
+            // vault의 모든 파일 수집
+            const allFiles = this.app.vault.getFiles();
+            const filesToSync = allFiles.filter(file => this.shouldSyncFileType(file));
+            
+            console.log(`Found ${filesToSync.length} files to sync from whole vault`);
+
+            if (filesToSync.length === 0) {
+                new Notice('No files found to sync in vault');
+                return;
+            }
+
+            await this.syncFilesToDrive(filesToSync, driveFolder.id, 'vault');
+
+        } catch (error) {
+            console.error('Sync vault error:', error);
+            new Notice('❌ Vault sync failed. Check console for details.');
         }
     }
 
@@ -250,52 +489,56 @@ export default class GDriveSyncPlugin extends Plugin {
 
             // 로컬 파일 수집
             const filesToSync = await this.collectFilesToSyncPrivate(folder, this.settings.includeSubfolders);
-            console.log(`Found ${filesToSync.length} files to sync`);
+            console.log(`Found ${filesToSync.length} files to sync from ${folder.path}`);
 
             if (filesToSync.length === 0) {
-                new Notice('No files found to sync');
+                new Notice(`No files found to sync in ${folder.path}`);
                 return;
             }
 
-            // 파일 동기화 시작
-            let successCount = 0;
-            let errorCount = 0;
-            let skippedCount = 0;
-
-            for (const file of filesToSync) {
-                try {
-                    const result = await this.syncFileToGoogleDrive(file, driveFolder.id);
-                    if (result === 'skipped') {
-                        skippedCount++;
-                    } else if (result === true) {
-                        successCount++;
-                    } else {
-                        errorCount++;
-                        console.error(`✗ Failed to sync: ${file.path}`);
-                    }
-                } catch (error) {
-                    errorCount++;
-                    console.error(`✗ Error syncing ${file.path}:`, error);
-                }
-
-                // UI 업데이트를 위한 작은 지연
-                await new Promise(resolve => setTimeout(resolve, 100));
-            }
-
-            // 동기화 시간 업데이트
-            this.settings.lastSyncTime = Date.now();
-            await this.saveSettings();
-
-            // 결과 보고
-            if (errorCount === 0) {
-                new Notice(`✅ Sync completed: ${successCount} synced, ${skippedCount} skipped`);
-            } else {
-                new Notice(`⚠️ Sync completed with errors: ${successCount} synced, ${skippedCount} skipped, ${errorCount} errors`);
-            }
+            await this.syncFilesToDrive(filesToSync, driveFolder.id, folder.path);
 
         } catch (error) {
             console.error('Sync folder error:', error);
             new Notice('❌ Sync failed. Check console for details.');
+        }
+    }
+
+    // 공통 파일 동기화 로직
+    private async syncFilesToDrive(filesToSync: TFile[], rootFolderId: string, sourceName: string) {
+        let successCount = 0;
+        let errorCount = 0;
+        let skippedCount = 0;
+
+        for (const file of filesToSync) {
+            try {
+                const result = await this.syncFileToGoogleDrive(file, rootFolderId);
+                if (result === 'skipped') {
+                    skippedCount++;
+                } else if (result === true) {
+                    successCount++;
+                } else {
+                    errorCount++;
+                    console.error(`✗ Failed to sync: ${file.path}`);
+                }
+            } catch (error) {
+                errorCount++;
+                console.error(`✗ Error syncing ${file.path}:`, error);
+            }
+
+            // UI 업데이트를 위한 작은 지연
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        // 동기화 시간 업데이트
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+
+        // 결과 보고
+        if (errorCount === 0) {
+            new Notice(`✅ ${sourceName} sync completed: ${successCount} synced, ${skippedCount} skipped`);
+        } else {
+            new Notice(`⚠️ ${sourceName} sync completed with errors: ${successCount} synced, ${skippedCount} skipped, ${errorCount} errors`);
         }
     }
 
@@ -325,8 +568,25 @@ export default class GDriveSyncPlugin extends Plugin {
         return this.collectFilesToSync(folder, includeSubfolders);
     }
 
+    // vault의 모든 폴더 가져오기 (루트 폴더 포함)
+    getAllFolders(): TFolder[] {
+        const folders: TFolder[] = [];
+        
+        // 루트 폴더 추가 (전체 vault를 나타냄)
+        const rootFolder = this.app.vault.getRoot();
+        folders.push(rootFolder);
+        
+        // 모든 하위 폴더 추가
+        const allFolders = this.app.vault.getAllLoadedFiles()
+            .filter(file => file instanceof TFolder) as TFolder[];
+        
+        folders.push(...allFolders);
+        
+        return folders.sort((a, b) => a.path.localeCompare(b.path));
+    }
+
     // 파일이 동기화 대상인지 확인
-    private shouldSyncFileType(file: TFile): boolean {
+    shouldSyncFileType(file: TFile): boolean {
         // 동기화할 파일 확장자 목록
         const syncExtensions = ['.md', '.txt', '.json', '.csv', '.html', '.css', '.js'];
         
@@ -408,19 +668,23 @@ export default class GDriveSyncPlugin extends Plugin {
     // 개별 파일을 Google Drive에 동기화
     private async syncFileToGoogleDrive(file: TFile, rootFolderId: string): Promise<boolean | 'skipped'> {
         try {
-            // 파일의 상대 경로 계산
-            const relativePath = file.path.replace(this.settings.syncFolder + '/', '');
+            // 파일의 전체 경로 사용 (full path)
+            let relativePath = file.path;
+            let fileName = file.name;
+            
+            // 전체 vault 동기화 시에는 그대로 전체 경로 사용
+            // 개별 폴더 동기화 시에도 전체 경로 유지
             
             // 실제 폴더 구조 생성
             let targetFolderId = rootFolderId;
-            let fileName = file.name;
             
             if (relativePath.includes('/')) {
-                // 중첩된 폴더 생성
+                // 중첩된 폴더 생성 (전체 경로 기준)
                 const pathParts = relativePath.split('/');
                 fileName = pathParts.pop()!; // 마지막이 파일명
                 const folderPath = pathParts.join('/');
                 
+                console.log(`Creating full folder structure: ${folderPath}`);
                 targetFolderId = await this.createNestedFolders(folderPath, rootFolderId);
                 if (!targetFolderId) {
                     console.error(`Failed to create folder structure for: ${folderPath}`);
@@ -863,17 +1127,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         containerEl.createEl('h3', { text: 'Sync Configuration' });
 
         new Setting(containerEl)
-            .setName('Sync Folder')
-            .setDesc('Local folder to sync with Google Drive')
-            .addText(text => text
-                .setPlaceholder('e.g., Documents/Sync')
-                .setValue(this.plugin.settings.syncFolder)
-                .onChange(async (value) => {
-                    this.plugin.settings.syncFolder = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
             .setName('Google Drive Folder')
             .setDesc('Name of the folder to create/use in Google Drive')
             .addText(text => text
@@ -883,6 +1136,53 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     this.plugin.settings.driveFolder = value;
                     await this.plugin.saveSettings();
                 }));
+
+        // Sync Whole Vault Option
+        new Setting(containerEl)
+            .setName('Sync Whole Vault')
+            .setDesc('Enable to sync the entire vault instead of selected folders')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.syncWholeVault)
+                .onChange(async (value) => {
+                    this.plugin.settings.syncWholeVault = value;
+                    await this.plugin.saveSettings();
+                    this.display(); // Refresh the settings display
+                }));
+
+        // Sync Folders Section (only show when not syncing whole vault)
+        if (!this.plugin.settings.syncWholeVault) {
+            const syncFoldersSection = containerEl.createEl('div', { cls: 'sync-folders-section' });
+            syncFoldersSection.createEl('h4', { text: 'Sync Folders' });
+
+            // Current sync folders display
+            const currentFoldersEl = syncFoldersSection.createEl('div', { cls: 'current-folders' });
+            this.updateCurrentFoldersDisplay(currentFoldersEl);
+
+            // Add folder button
+            new Setting(syncFoldersSection)
+                .setName('Add Sync Folder')
+                .setDesc('Select folders to sync with Google Drive')
+                .addButton(button => button
+                    .setButtonText('Select Folder')
+                    .setCta()
+                    .onClick(() => {
+                        this.openFolderSelector();
+                    }));
+
+            // Clear all folders button
+            new Setting(syncFoldersSection)
+                .setName('Clear All Folders')
+                .setDesc('Remove all selected sync folders')
+                .addButton(button => button
+                    .setButtonText('Clear All')
+                    .setWarning()
+                    .onClick(async () => {
+                        this.plugin.settings.syncFolders = [];
+                        await this.plugin.saveSettings();
+                        this.updateCurrentFoldersDisplay(currentFoldersEl);
+                        new Notice('All sync folders cleared');
+                    }));
+        }
 
         new Setting(containerEl)
             .setName('Include Subfolders')
@@ -1095,31 +1395,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             .addButton(button => button
                 .setButtonText('Preview')
                 .onClick(async () => {
-                    if (!this.plugin.settings.syncFolder) {
-                        new Notice('❌ Please set a sync folder first');
-                        return;
-                    }
-
-                    const folder = this.plugin.app.vault.getAbstractFileByPath(this.plugin.settings.syncFolder);
-                    if (!folder || !(folder instanceof TFolder)) {
-                        new Notice('❌ Sync folder not found');
-                        return;
-                    }
-
-                    const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
-                    console.log('=== SYNC PREVIEW ===');
-                    console.log(`Sync folder: ${this.plugin.settings.syncFolder}`);
-                    console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
-                    console.log(`Include subfolders: ${this.plugin.settings.includeSubfolders}`);
-                    console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
-                    console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never'}`);
-                    console.log(`Files to sync (${files.length}):`);
-                    files.forEach(file => {
-                        const modTime = new Date(file.stat.mtime).toLocaleString();
-                        console.log(`  - ${file.path} (modified: ${modTime})`);
-                    });
-                    
-                    new Notice(`📋 Found ${files.length} files to sync. Check console for details.`);
+                    await this.previewSync();
                 }));
 
         new Setting(containerEl)
@@ -1170,8 +1446,8 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                         '<br><small>No access token stored</small>'}
                 </div>
                 <div style="padding: 10px; border-radius: 4px; background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;">
-                    <strong>Mode:</strong> ✅ Desktop Application (Folder Structure Preserved)
-                    <br><small>Creates actual folders in Google Drive matching your local structure</small>
+                    <strong>Mode:</strong> ✅ Desktop Application (Multi-folder Support)
+                    <br><small>Supports multiple folder selection and whole vault sync with preserved folder structure</small>
                 </div>
             `;
         };
@@ -1213,12 +1489,12 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 </ol>
             </div>
             <div style="background-color: #e7f3ff; border: 1px solid #b3d7ff; padding: 10px; margin: 10px 0; border-radius: 4px;">
-                <p><strong>📁 동기화 동작 방식:</strong></p>
+                <p><strong>📁 동기화 동작 방식 (다중 폴더 지원):</strong></p>
                 <ul>
+                    <li><strong>전체 Vault 동기화:</strong> "Sync Whole Vault" 옵션 활성화 시 vault의 모든 파일을 동기화</li>
+                    <li><strong>선택적 폴더 동기화:</strong> 원하는 폴더만 선택하여 동기화 가능</li>
                     <li><strong>하위 폴더:</strong> "Include Subfolders" 설정에 따라 재귀적으로 처리됩니다</li>
-                    <li><strong>폴더 구조:</strong> Google Drive에 원본과 동일한 실제 폴더 구조를 생성합니다
-                        <br>예: <code>62.개인지식/10.최근식/세미나/Team.md</code> → Google Drive에서도 같은 구조
-                    </li>
+                    <li><strong>폴더 구조:</strong> Google Drive에 원본과 동일한 실제 폴더 구조를 생성합니다</li>
                     <li><strong>파일 타입:</strong> .md, .txt, .json, .csv, .html, .css, .js 파일만 동기화</li>
                     <li><strong>제외 파일:</strong> 숨김 파일(.), 임시 파일(.tmp), 백업 파일(.bak) 제외</li>
                     <li><strong>Google Drive 위치:</strong> 지정한 "Google Drive Folder" 이름으로 루트에 생성</li>
@@ -1232,5 +1508,124 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 <p><strong>💡 팁:</strong> "Preview Sync" 버튼으로 동기화 대상 파일을 미리 확인하세요!</p>
             </div>
         `;
+    }
+
+    // 현재 선택된 폴더들 표시 업데이트
+    private updateCurrentFoldersDisplay(containerEl: HTMLElement) {
+        containerEl.empty();
+        
+        if (this.plugin.settings.syncFolders.length === 0) {
+            containerEl.createEl('p', { text: 'No folders selected for sync', cls: 'setting-item-description' });
+            return;
+        }
+
+        containerEl.createEl('p', { text: 'Selected folders:', cls: 'setting-item-description' });
+        
+        const folderList = containerEl.createEl('div', { cls: 'sync-folders-list' });
+        
+        this.plugin.settings.syncFolders.forEach((folderPath, index) => {
+            const folderItem = folderList.createEl('div', { 
+                cls: 'sync-folder-item',
+                attr: { style: 'display: flex; align-items: center; margin-bottom: 5px; padding: 5px; background-color: var(--background-secondary); border-radius: 3px;' }
+            });
+            
+            const folderName = folderItem.createEl('span', { 
+                text: folderPath || '📁 Vault Root',
+                attr: { style: 'flex-grow: 1; margin-right: 10px;' }
+            });
+            
+            const removeButton = folderItem.createEl('button', { 
+                text: '✖',
+                cls: 'mod-warning',
+                attr: { style: 'min-width: 24px; height: 24px; padding: 0; border-radius: 3px;' }
+            });
+            
+            removeButton.onclick = async () => {
+                this.plugin.settings.syncFolders.splice(index, 1);
+                await this.plugin.saveSettings();
+                this.updateCurrentFoldersDisplay(containerEl);
+                new Notice(`Removed folder: ${folderPath || 'Vault Root'}`);
+            };
+        });
+    }
+
+    // 폴더 선택 모달 열기
+    private openFolderSelector() {
+        const modal = new FolderTreeModal(this.app, this.plugin, async (selectedFolder) => {
+            const folderPath = selectedFolder.path;
+            
+            // 중복 체크
+            if (this.plugin.settings.syncFolders.includes(folderPath)) {
+                new Notice(`Folder "${folderPath || 'Vault Root'}" is already selected`);
+                return;
+            }
+            
+            // 폴더 추가
+            this.plugin.settings.syncFolders.push(folderPath);
+            await this.plugin.saveSettings();
+            
+            // UI 업데이트
+            const currentFoldersEl = document.querySelector('.current-folders') as HTMLElement;
+            if (currentFoldersEl) {
+                this.updateCurrentFoldersDisplay(currentFoldersEl);
+            }
+            
+            new Notice(`Added folder: ${folderPath || 'Vault Root'}`);
+        });
+        
+        modal.open();
+    }
+
+    // 동기화 미리보기
+    private async previewSync() {
+        if (this.plugin.settings.syncWholeVault) {
+            // 전체 vault 미리보기
+            const allFiles = this.plugin.app.vault.getFiles();
+            const filesToSync = allFiles.filter(file => this.plugin.shouldSyncFileType(file));
+            
+            console.log('=== WHOLE VAULT SYNC PREVIEW ===');
+            console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
+            console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
+            console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never'}`);
+            console.log(`Files to sync (${filesToSync.length}):`);
+            filesToSync.forEach(file => {
+                const modTime = new Date(file.stat.mtime).toLocaleString();
+                console.log(`  - ${file.path} (modified: ${modTime})`);
+            });
+            
+            new Notice(`📋 Found ${filesToSync.length} files to sync from whole vault. Check console for details.`);
+        } else {
+            // 선택된 폴더들 미리보기
+            if (this.plugin.settings.syncFolders.length === 0) {
+                new Notice('❌ No folders selected for sync');
+                return;
+            }
+
+            let totalFiles = 0;
+            console.log('=== SELECTED FOLDERS SYNC PREVIEW ===');
+            console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
+            console.log(`Include subfolders: ${this.plugin.settings.includeSubfolders}`);
+            console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
+            console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never'}`);
+            console.log(`Selected folders (${this.plugin.settings.syncFolders.length}):`);
+
+            for (const folderPath of this.plugin.settings.syncFolders) {
+                const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
+                if (folder && folder instanceof TFolder) {
+                    const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
+                    totalFiles += files.length;
+                    
+                    console.log(`\n📁 ${folderPath || 'Vault Root'} (${files.length} files):`);
+                    files.forEach(file => {
+                        const modTime = new Date(file.stat.mtime).toLocaleString();
+                        console.log(`  - ${file.path} (modified: ${modTime})`);
+                    });
+                } else {
+                    console.log(`\n❌ Folder not found: ${folderPath}`);
+                }
+            }
+            
+            new Notice(`📋 Found ${totalFiles} files to sync from ${this.plugin.settings.syncFolders.length} folders. Check console for details.`);
+        }
     }
 }

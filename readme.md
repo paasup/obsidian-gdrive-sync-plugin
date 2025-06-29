@@ -115,29 +115,3 @@ capacitor://localhost
 4. Client ID와 API Key가 올바르게 입력되었는지 확인
 5. 방화벽이나 광고 차단기가 `accounts.google.com`을 차단하지 않는지 확인
 
-**Google Identity Services 인증 실패:**
-- Google Cloud Console에서 승인된 JavaScript 원본이 올바르게 설정되었는지 확인
-- `app://obsidian.md`와 `capacitor://localhost`가 포함되어 있는지 확인
-- API 키와 Client ID가 정확히 입력되었는지 확인
-- Google Drive API가 활성화되었는지 확인
-
-**토큰 관련 오류:**
-- 플러그인 설정에서 "Sign Out" 버튼을 클릭하여 기존 토큰 제거
-- 다시 "Test Connection"으로 새로운 토큰 획득
-- 토큰 만료 시 자동으로 새 토큰을 요청하도록 개선됨
-
-**팝업 관련 문제:**
-- Google Identity Services는 팝업 차단에 덜 민감하지만, 여전히 팝업 허용이 필요할 수 있음
-- Obsidian에서 팝업 허용 설정
-- 시스템 기본 브라우저에서 팝업 허용 설정
-
-**디버깅 팁:**
-- 개발자 콘솔의 Network 탭에서 `accounts.google.com` 요청 상태 확인
-- Console 탭에서 "Google Identity Services" 관련 로그 메시지 확인
-- 플러그인 설정의 "Authentication Status" 섹션에서 현재 인증 상태 확인
-- 오류 발생 시 전체 오류 메시지를 복사하여 문제 해결에 활용
-
-**마이그레이션 후 주의사항:**
-- 기존에 저장된 토큰은 자동으로 무효화됩니다
-- 처음 사용 시 다시 인증이 필요합니다
-- Google Identity Services는 더 엄격한 보안 정책을 사용하므로 승인된 원본 설정이 중요합니다
