@@ -33,20 +33,20 @@ var DEFAULT_SETTINGS = {
   clientSecret: "",
   apiKey: "",
   syncFolders: [],
-  // 빈 배열로 초기화
   syncWholeVault: false,
-  // 기본값은 false
   autoSync: false,
   syncInterval: 3e5,
-  // 5 minutes
   accessToken: "",
   driveFolder: "Obsidian-Sync",
-  // 기본 Google Drive 폴더명
   includeSubfolders: true,
-  // 기본적으로 하위 폴더 포함
   syncMode: "modified",
-  // 기본: 수정 시간 기반
-  lastSyncTime: 0
+  lastSyncTime: 0,
+  syncDirection: "bidirectional",
+  // 기본값: 양방향
+  conflictResolution: "newer",
+  // 기본값: 더 최신 파일 우선
+  createMissingFolders: true
+  // 기본값: 누락된 폴더 자동 생성
 };
 var FolderTreeModal = class extends import_obsidian.Modal {
   constructor(app, plugin, onChoose) {
@@ -186,8 +186,22 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         this.syncWithGoogleDrive();
       }
     });
+    this.addCommand({
+      id: "download-from-gdrive",
+      name: "Download from Google Drive",
+      callback: () => {
+        this.downloadFromGoogleDrive();
+      }
+    });
+    this.addCommand({
+      id: "upload-to-gdrive",
+      name: "Upload to Google Drive",
+      callback: () => {
+        this.uploadToGoogleDrive();
+      }
+    });
     this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
-    console.log("Plugin loaded - Desktop App authentication mode with multi-folder support");
+    console.log("Plugin loaded - Desktop App authentication mode with bidirectional sync support");
     if (this.settings.autoSync) {
       this.setupAutoSync();
     }
@@ -208,6 +222,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
+  // 기존 인증 메서드들은 동일하게 유지
   async authenticateGoogleDrive() {
     console.log("=== Starting Google Drive Desktop Authentication ===");
     if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
@@ -239,7 +254,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     const params = new URLSearchParams({
       client_id: this.settings.clientId,
       redirect_uri: "urn:ietf:wg:oauth:2.0:oob",
-      // Desktop app용 out-of-band
       scope: "https://www.googleapis.com/auth/drive.file",
       response_type: "code",
       access_type: "offline",
@@ -307,116 +321,441 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   isAuthenticated() {
     return !!this.settings.accessToken;
   }
+  // 메인 동기화 메서드 (양방향)
   async syncWithGoogleDrive() {
     if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
       new import_obsidian.Notice("Please configure Google Drive API credentials in settings");
-      return;
+      return this.createEmptyResult();
     }
     if (!this.settings.syncWholeVault && this.settings.syncFolders.length === 0) {
       new import_obsidian.Notice('Please select folders to sync or enable "Sync Whole Vault" in settings');
-      return;
+      return this.createEmptyResult();
     }
     new import_obsidian.Notice("Starting Google Drive sync...");
     try {
       if (!this.isAuthenticated()) {
         new import_obsidian.Notice("Please authenticate first using the Desktop App method.");
-        return;
+        return this.createEmptyResult();
+      }
+      let result;
+      if (this.settings.syncDirection === "upload") {
+        result = await this.uploadToGoogleDrive();
+      } else if (this.settings.syncDirection === "download") {
+        result = await this.downloadFromGoogleDrive();
+      } else {
+        result = await this.bidirectionalSync();
+      }
+      this.reportSyncResult(result);
+      return result;
+    } catch (error) {
+      console.error("Sync failed:", error);
+      new import_obsidian.Notice("Google Drive sync failed");
+      return this.createEmptyResult();
+    }
+  }
+  // 업로드 전용 메서드
+  async uploadToGoogleDrive() {
+    console.log("Starting upload to Google Drive...");
+    const result = this.createEmptyResult();
+    try {
+      const driveFolder = await this.getOrCreateDriveFolder();
+      if (!driveFolder) {
+        new import_obsidian.Notice("\u274C Failed to create or find Google Drive folder");
+        return result;
       }
       if (this.settings.syncWholeVault) {
-        await this.syncVault();
+        const allFiles = this.app.vault.getFiles();
+        const filesToSync = allFiles.filter((file) => this.shouldSyncFileType(file));
+        await this.uploadFilesToDrive(filesToSync, driveFolder.id, result);
       } else {
         for (const folderPath of this.settings.syncFolders) {
           const folder = this.app.vault.getAbstractFileByPath(folderPath);
           if (folder && folder instanceof import_obsidian.TFolder) {
-            await this.syncFolder(folder);
-          } else {
-            console.warn(`Folder not found: ${folderPath}`);
-            new import_obsidian.Notice(`\u26A0\uFE0F Folder not found: ${folderPath}`);
+            const filesToSync = await this.collectFilesToSync(folder, this.settings.includeSubfolders);
+            await this.uploadFilesToDrive(filesToSync, driveFolder.id, result);
           }
         }
       }
-      new import_obsidian.Notice("Google Drive sync completed");
+      this.settings.lastSyncTime = Date.now();
+      await this.saveSettings();
     } catch (error) {
-      console.error("Sync failed:", error);
-      new import_obsidian.Notice("Google Drive sync failed");
+      console.error("Upload error:", error);
+      result.errors++;
     }
+    return result;
   }
-  // 전체 vault 동기화
-  async syncVault() {
-    console.log("Syncing whole vault...");
+  // 다운로드 전용 메서드
+  async downloadFromGoogleDrive() {
+    console.log("Starting download from Google Drive...");
+    const result = this.createEmptyResult();
     try {
       const driveFolder = await this.getOrCreateDriveFolder();
       if (!driveFolder) {
-        new import_obsidian.Notice("\u274C Failed to create or find Google Drive folder");
-        return;
+        new import_obsidian.Notice("\u274C Failed to find Google Drive folder");
+        return result;
       }
-      console.log(`\u2713 Google Drive folder ready: ${this.settings.driveFolder}`);
-      const allFiles = this.app.vault.getFiles();
-      const filesToSync = allFiles.filter((file) => this.shouldSyncFileType(file));
-      console.log(`Found ${filesToSync.length} files to sync from whole vault`);
-      if (filesToSync.length === 0) {
-        new import_obsidian.Notice("No files found to sync in vault");
-        return;
-      }
-      await this.syncFilesToDrive(filesToSync, driveFolder.id, "vault");
-    } catch (error) {
-      console.error("Sync vault error:", error);
-      new import_obsidian.Notice("\u274C Vault sync failed. Check console for details.");
-    }
-  }
-  async syncFolder(folder) {
-    console.log(`Syncing folder: ${folder.path}`);
-    console.log(`Include subfolders: ${this.settings.includeSubfolders}`);
-    try {
-      const driveFolder = await this.getOrCreateDriveFolder();
-      if (!driveFolder) {
-        new import_obsidian.Notice("\u274C Failed to create or find Google Drive folder");
-        return;
-      }
-      console.log(`\u2713 Google Drive folder ready: ${this.settings.driveFolder}`);
-      const filesToSync = await this.collectFilesToSyncPrivate(folder, this.settings.includeSubfolders);
-      console.log(`Found ${filesToSync.length} files to sync from ${folder.path}`);
-      if (filesToSync.length === 0) {
-        new import_obsidian.Notice(`No files found to sync in ${folder.path}`);
-        return;
-      }
-      await this.syncFilesToDrive(filesToSync, driveFolder.id, folder.path);
-    } catch (error) {
-      console.error("Sync folder error:", error);
-      new import_obsidian.Notice("\u274C Sync failed. Check console for details.");
-    }
-  }
-  // 공통 파일 동기화 로직
-  async syncFilesToDrive(filesToSync, rootFolderId, sourceName) {
-    let successCount = 0;
-    let errorCount = 0;
-    let skippedCount = 0;
-    for (const file of filesToSync) {
-      try {
-        const result = await this.syncFileToGoogleDrive(file, rootFolderId);
-        if (result === "skipped") {
-          skippedCount++;
-        } else if (result === true) {
-          successCount++;
-        } else {
-          errorCount++;
-          console.error(`\u2717 Failed to sync: ${file.path}`);
+      const driveFiles = await this.getAllFilesFromDrive(driveFolder.id);
+      console.log(`Found ${driveFiles.length} files in Google Drive`);
+      for (const driveFile of driveFiles) {
+        try {
+          await this.downloadFileFromDrive(driveFile, result);
+        } catch (error) {
+          console.error(`Error downloading file ${driveFile.name}:`, error);
+          result.errors++;
         }
-      } catch (error) {
-        errorCount++;
-        console.error(`\u2717 Error syncing ${file.path}:`, error);
       }
+      this.settings.lastSyncTime = Date.now();
+      await this.saveSettings();
+    } catch (error) {
+      console.error("Download error:", error);
+      result.errors++;
+    }
+    return result;
+  }
+  // 양방향 동기화 메서드
+  async bidirectionalSync() {
+    console.log("Starting bidirectional sync...");
+    const result = this.createEmptyResult();
+    try {
+      const driveFolder = await this.getOrCreateDriveFolder();
+      if (!driveFolder) {
+        new import_obsidian.Notice("\u274C Failed to create or find Google Drive folder");
+        return result;
+      }
+      let localFiles = [];
+      if (this.settings.syncWholeVault) {
+        const allFiles = this.app.vault.getFiles();
+        localFiles = allFiles.filter((file) => this.shouldSyncFileType(file));
+      } else {
+        for (const folderPath of this.settings.syncFolders) {
+          const folder = this.app.vault.getAbstractFileByPath(folderPath);
+          if (folder && folder instanceof import_obsidian.TFolder) {
+            const folderFiles = await this.collectFilesToSync(folder, this.settings.includeSubfolders);
+            localFiles.push(...folderFiles);
+          }
+        }
+      }
+      const driveFiles = await this.getAllFilesFromDrive(driveFolder.id);
+      const localFileMap = /* @__PURE__ */ new Map();
+      localFiles.forEach((file) => localFileMap.set(file.path, file));
+      const driveFileMap = /* @__PURE__ */ new Map();
+      driveFiles.forEach((file) => driveFileMap.set(file.path, file));
+      const allPaths = /* @__PURE__ */ new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
+      for (const filePath of allPaths) {
+        const localFile = localFileMap.get(filePath);
+        const driveFile = driveFileMap.get(filePath);
+        try {
+          if (localFile && driveFile) {
+            await this.resolveFileConflict(localFile, driveFile, driveFolder.id, result);
+          } else if (localFile && !driveFile) {
+            await this.uploadSingleFile(localFile, driveFolder.id, result);
+          } else if (!localFile && driveFile) {
+            await this.downloadFileFromDrive(driveFile, result);
+          }
+        } catch (error) {
+          console.error(`Error syncing file ${filePath}:`, error);
+          result.errors++;
+        }
+      }
+      this.settings.lastSyncTime = Date.now();
+      await this.saveSettings();
+    } catch (error) {
+      console.error("Bidirectional sync error:", error);
+      result.errors++;
+    }
+    return result;
+  }
+  // Google Drive에서 파일 다운로드
+  async downloadFileFromDrive(driveFile, result) {
+    try {
+      const filePath = driveFile.path;
+      const localFile = this.app.vault.getAbstractFileByPath(filePath);
+      if (localFile instanceof import_obsidian.TFile) {
+        const needsUpdate = await this.shouldDownloadFile(localFile, driveFile);
+        if (!needsUpdate) {
+          result.skipped++;
+          return;
+        }
+      }
+      const content = await this.getFileContentFromDrive(driveFile.id);
+      const folderPath = filePath.substring(0, filePath.lastIndexOf("/"));
+      if (folderPath && this.settings.createMissingFolders) {
+        await this.createLocalFolderStructure(folderPath, result);
+      }
+      const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+      if (localFile instanceof import_obsidian.TFile) {
+        await this.app.vault.modify(localFile, content);
+        console.log(`\u{1F504} Updated local file: ${filePath}`);
+      } else {
+        await this.app.vault.create(filePath, content);
+        console.log(`\u{1F4E5} Downloaded new file: ${filePath}`);
+      }
+      await this.syncFileTime(filePath, remoteModTime);
+      result.downloaded++;
+    } catch (error) {
+      console.error(`Error downloading file ${driveFile.path}:`, error);
+      throw error;
+    }
+  }
+  // 파일 시간 동기화 메서드 - 대안 방법들 포함
+  async syncFileTime(filePath, targetTime) {
+    try {
+      const adapter = this.app.vault.adapter;
+      if (adapter.constructor.name === "FileSystemAdapter") {
+        try {
+          const fs = require("fs").promises;
+          const path = require("path");
+          const fullPath = path.join(adapter.basePath, filePath);
+          const targetDate = new Date(targetTime);
+          await fs.utimes(fullPath, targetDate, targetDate);
+          console.log(`\u23F0 Synced file time: ${filePath} -> ${targetDate.toLocaleString()}`);
+          return;
+        } catch (fsError) {
+          console.warn(`\u26A0\uFE0F Direct filesystem access failed: ${fsError}`);
+        }
+      }
+      try {
+        const file = this.app.vault.getAbstractFileByPath(filePath);
+        if (file instanceof import_obsidian.TFile) {
+          if (file.stat && file.stat.mtime !== void 0) {
+            file.stat.mtime = targetTime;
+            console.log(`\u23F0 Updated file stat time: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+            return;
+          }
+        }
+      } catch (obsidianError) {
+        console.warn(`\u26A0\uFE0F Obsidian API time sync failed: ${obsidianError}`);
+      }
+      try {
+        const timeMetadata = {
+          originalPath: filePath,
+          remoteModifiedTime: targetTime,
+          syncedAt: Date.now()
+        };
+        const metadataPath = `.obsidian/plugins/gdrive-sync/time-metadata/${filePath.replace(/[\/\\]/g, "_")}.json`;
+        const metadataDir = metadataPath.substring(0, metadataPath.lastIndexOf("/"));
+        try {
+          await this.app.vault.createFolder(metadataDir);
+        } catch (e) {
+        }
+        await this.app.vault.create(metadataPath, JSON.stringify(timeMetadata, null, 2));
+        console.log(`\u23F0 Stored time metadata: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+      } catch (metadataError) {
+        console.warn(`\u26A0\uFE0F Metadata time storage failed: ${metadataError}`);
+      }
+    } catch (error) {
+      console.warn(`\u26A0\uFE0F All file time sync methods failed for ${filePath}:`, error);
+    }
+  }
+  // 메타데이터에서 시간 정보를 읽어오는 헬퍼 메서드
+  async getStoredFileTime(filePath) {
+    try {
+      const metadataPath = `.obsidian/plugins/gdrive-sync/time-metadata/${filePath.replace(/[\/\\]/g, "_")}.json`;
+      const metadataFile = this.app.vault.getAbstractFileByPath(metadataPath);
+      if (metadataFile instanceof import_obsidian.TFile) {
+        const content = await this.app.vault.read(metadataFile);
+        const metadata = JSON.parse(content);
+        return metadata.remoteModifiedTime || null;
+      }
+    } catch (error) {
+    }
+    return null;
+  }
+  // 로컬 폴더 구조 생성
+  async createLocalFolderStructure(folderPath, result) {
+    if (!folderPath)
+      return;
+    const pathParts = folderPath.split("/");
+    let currentPath = "";
+    for (const part of pathParts) {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      const existingFolder = this.app.vault.getAbstractFileByPath(currentPath);
+      if (!existingFolder) {
+        try {
+          await this.app.vault.createFolder(currentPath);
+          console.log(`\u{1F4C1} Created local folder: ${currentPath}`);
+          result.createdFolders.push(currentPath);
+        } catch (error) {
+          if (!error.message.includes("already exists")) {
+            throw error;
+          }
+        }
+      }
+    }
+  }
+  // 파일 충돌 해결
+  async resolveFileConflict(localFile, driveFile, rootFolderId, result) {
+    const localModTime = localFile.stat.mtime;
+    const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+    let resolution;
+    switch (this.settings.conflictResolution) {
+      case "local":
+        resolution = "local";
+        break;
+      case "remote":
+        resolution = "remote";
+        break;
+      case "newer":
+        resolution = localModTime > remoteModTime ? "local" : "remote";
+        break;
+      case "ask":
+        resolution = localModTime > remoteModTime ? "local" : "remote";
+        console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
+        break;
+    }
+    if (resolution === "local") {
+      await this.uploadSingleFile(localFile, rootFolderId, result);
+    } else {
+      await this.downloadFileFromDrive(driveFile, result);
+    }
+    result.conflicts++;
+  }
+  // 단일 파일 업로드
+  async uploadSingleFile(file, rootFolderId, result) {
+    try {
+      const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId);
+      if (syncResult === "skipped") {
+        result.skipped++;
+      } else if (syncResult === true) {
+        result.uploaded++;
+      } else {
+        result.errors++;
+      }
+    } catch (error) {
+      console.error(`Error uploading file ${file.path}:`, error);
+      result.errors++;
+    }
+  }
+  // 여러 파일 업로드
+  async uploadFilesToDrive(filesToSync, rootFolderId, result) {
+    for (const file of filesToSync) {
+      await this.uploadSingleFile(file, rootFolderId, result);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    this.settings.lastSyncTime = Date.now();
-    await this.saveSettings();
-    if (errorCount === 0) {
-      new import_obsidian.Notice(`\u2705 ${sourceName} sync completed: ${successCount} synced, ${skippedCount} skipped`);
-    } else {
-      new import_obsidian.Notice(`\u26A0\uFE0F ${sourceName} sync completed with errors: ${successCount} synced, ${skippedCount} skipped, ${errorCount} errors`);
+  }
+  // Google Drive에서 모든 파일 가져오기 (재귀적으로 폴더 구조 포함) - public으로 변경
+  async getAllFilesFromDrive(folderId, basePath = "") {
+    const allFiles = [];
+    try {
+      let pageToken = "";
+      do {
+        const query = `'${folderId}' in parents and trashed=false`;
+        const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,mimeType,modifiedTime,size,parents)&pageSize=1000${pageToken ? `&pageToken=${pageToken}` : ""}`;
+        const response = await (0, import_obsidian.requestUrl)({
+          url,
+          method: "GET",
+          headers: {
+            "Authorization": `Bearer ${this.settings.accessToken}`
+          },
+          throw: false
+        });
+        if (response.status !== 200) {
+          console.error("Failed to list files:", response.status, response.json);
+          break;
+        }
+        const data = response.json;
+        for (const file of data.files || []) {
+          const filePath = basePath ? `${basePath}/${file.name}` : file.name;
+          if (file.mimeType === "application/vnd.google-apps.folder") {
+            if (this.settings.includeSubfolders) {
+              const subFiles = await this.getAllFilesFromDrive(file.id, filePath);
+              allFiles.push(...subFiles);
+            }
+          } else {
+            allFiles.push({
+              ...file,
+              path: filePath
+            });
+          }
+        }
+        pageToken = data.nextPageToken || "";
+      } while (pageToken);
+    } catch (error) {
+      console.error("Error getting files from Drive:", error);
+      throw error;
+    }
+    return allFiles;
+  }
+  // 파일 다운로드 필요 여부 판단
+  async shouldDownloadFile(localFile, driveFile) {
+    switch (this.settings.syncMode) {
+      case "always":
+        return true;
+      case "modified":
+        const localModTime = localFile.stat.mtime;
+        const driveModTime = new Date(driveFile.modifiedTime).getTime();
+        const storedRemoteTime = await this.getStoredFileTime(localFile.path);
+        if (storedRemoteTime && storedRemoteTime === driveModTime) {
+          return false;
+        }
+        return driveModTime > localModTime;
+      case "checksum":
+        try {
+          const localContent = await this.app.vault.read(localFile);
+          const localHash = await this.calculateFileHash(localContent);
+          const driveContent = await this.getFileContentFromDrive(driveFile.id);
+          const driveHash = await this.calculateFileHash(driveContent);
+          return localHash !== driveHash;
+        } catch (error) {
+          console.error("Error comparing file checksums:", error);
+          return true;
+        }
+      default:
+        return true;
     }
   }
-  // Public method for settings tab
+  // 동기화 결과 객체 생성
+  createEmptyResult() {
+    return {
+      uploaded: 0,
+      downloaded: 0,
+      skipped: 0,
+      conflicts: 0,
+      errors: 0,
+      createdFolders: []
+    };
+  }
+  // 동기화 결과 보고
+  reportSyncResult(result) {
+    const messages = [];
+    if (result.uploaded > 0)
+      messages.push(`${result.uploaded} uploaded`);
+    if (result.downloaded > 0)
+      messages.push(`${result.downloaded} downloaded`);
+    if (result.skipped > 0)
+      messages.push(`${result.skipped} skipped`);
+    if (result.conflicts > 0)
+      messages.push(`${result.conflicts} conflicts resolved`);
+    if (result.createdFolders.length > 0)
+      messages.push(`${result.createdFolders.length} folders created`);
+    const summary = messages.length > 0 ? messages.join(", ") : "No changes";
+    if (result.errors === 0) {
+      new import_obsidian.Notice(`\u2705 Sync completed: ${summary}`);
+    } else {
+      new import_obsidian.Notice(`\u26A0\uFE0F Sync completed with ${result.errors} errors: ${summary}`);
+    }
+    if (result.createdFolders.length > 0) {
+      console.log("Created folders:", result.createdFolders);
+    }
+  }
+  // 기존 메서드들 (syncVault, syncFolder 등은 새로운 구조에 맞게 수정)
+  async syncVault() {
+    return await this.syncWithGoogleDrive();
+  }
+  async syncFolder(folder) {
+    const originalSyncWholeVault = this.settings.syncWholeVault;
+    const originalSyncFolders = [...this.settings.syncFolders];
+    this.settings.syncWholeVault = false;
+    this.settings.syncFolders = [folder.path];
+    try {
+      const result = await this.syncWithGoogleDrive();
+      return result;
+    } finally {
+      this.settings.syncWholeVault = originalSyncWholeVault;
+      this.settings.syncFolders = originalSyncFolders;
+    }
+  }
+  // 파일 수집 메서드 (기존과 동일)
   async collectFilesToSync(folder, includeSubfolders) {
     const files = [];
     for (const child of folder.children) {
@@ -431,11 +770,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     }
     return files;
   }
-  // 동기화할 파일들을 수집 (하위 폴더 포함/제외 옵션)
-  async collectFilesToSyncPrivate(folder, includeSubfolders) {
-    return this.collectFilesToSync(folder, includeSubfolders);
-  }
-  // vault의 모든 폴더 가져오기 (루트 폴더 포함)
   getAllFolders() {
     const folders = [];
     const rootFolder = this.app.vault.getRoot();
@@ -444,7 +778,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     folders.push(...allFolders);
     return folders.sort((a, b) => a.path.localeCompare(b.path));
   }
-  // 파일이 동기화 대상인지 확인
   shouldSyncFileType(file) {
     const syncExtensions = [".md", ".txt", ".json", ".csv", ".html", ".css", ".js"];
     const excludePatterns = [
@@ -461,7 +794,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     const shouldExclude = excludePatterns.some((pattern) => pattern.test(file.name));
     return hasValidExtension && !shouldExclude;
   }
-  // Google Drive에서 Obsidian 동기화 폴더 찾기 또는 생성
+  // Google Drive 관련 메서드들 - public으로 변경하여 설정 탭에서 접근 가능
   async getOrCreateDriveFolder() {
     try {
       console.log(`Looking for Google Drive folder: ${this.settings.driveFolder}`);
@@ -508,7 +841,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return null;
     }
   }
-  // 개별 파일을 Google Drive에 동기화
   async syncFileToGoogleDrive(file, rootFolderId) {
     try {
       let relativePath = file.path;
@@ -532,19 +864,19 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         return "skipped";
       }
       const content = await this.app.vault.read(file);
+      const localModTime = file.stat.mtime;
       if (existingFile) {
         console.log(`\u{1F504} Updating ${file.path}`);
-        return await this.updateFileInDrive(existingFile.id, content, file.stat.mtime);
+        return await this.updateFileInDrive(existingFile.id, content, localModTime);
       } else {
         console.log(`\u{1F4E4} Uploading ${file.path}`);
-        return await this.uploadFileToDrive(fileName, content, targetFolderId);
+        return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
       }
     } catch (error) {
       console.error(`Error syncing file ${file.path}:`, error);
       return false;
     }
   }
-  // 파일 동기화 필요 여부 판단
   async shouldSyncFile(localFile, driveFile) {
     switch (this.settings.syncMode) {
       case "always":
@@ -574,7 +906,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         return true;
     }
   }
-  // 파일 해시 계산 (SHA-256)
   async calculateFileHash(content) {
     const encoder = new TextEncoder();
     const data = encoder.encode(content);
@@ -582,7 +913,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
   }
-  // Google Drive에서 파일 내용 가져오기
   async getFileContentFromDrive(fileId) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -604,7 +934,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       throw error;
     }
   }
-  // 중첩된 폴더 구조 생성
   async createNestedFolders(folderPath, rootFolderId) {
     const pathParts = folderPath.split("/");
     let currentFolderId = rootFolderId;
@@ -626,7 +955,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     }
     return currentFolderId;
   }
-  // Google Drive에서 폴더 검색
   async findFolderInDrive(folderName, parentFolderId) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -649,7 +977,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return null;
     }
   }
-  // Google Drive에 새 폴더 생성
   async createFolderInDrive(folderName, parentFolderId) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -678,7 +1005,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return null;
     }
   }
-  // Google Drive에서 파일 검색
   async findFileInDrive(fileName, folderId) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -701,12 +1027,13 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return null;
     }
   }
-  // Google Drive에 새 파일 업로드
-  async uploadFileToDrive(fileName, content, folderId) {
+  async uploadFileToDrive(fileName, content, folderId, localModTime) {
     try {
       const metadata = {
         name: fileName,
-        parents: [folderId]
+        parents: [folderId],
+        // 로컬 파일의 수정 시간을 Google Drive에도 반영
+        modifiedTime: localModTime ? new Date(localModTime).toISOString() : void 0
       };
       const boundary = "-------314159265358979323846";
       const delimiter = "\r\n--" + boundary + "\r\n";
@@ -728,7 +1055,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       return false;
     }
   }
-  // Google Drive의 기존 파일 업데이트
   async updateFileInDrive(fileId, content, localModTime) {
     try {
       const response = await (0, import_obsidian.requestUrl)({
@@ -761,7 +1087,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     console.log("Google API state reset completed");
   }
   async testDriveAPIConnection() {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a;
     try {
       if (!this.settings.accessToken) {
         console.log("No access token available for testing");
@@ -776,10 +1102,8 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           "Authorization": `Bearer ${this.settings.accessToken}`
         },
         throw: false
-        // 수동 에러 처리
       });
       console.log("API Response Status:", response.status);
-      console.log("API Response Headers:", response.headers);
       if (response.status === 200) {
         const data = response.json;
         console.log("Drive API test successful:", data);
@@ -794,44 +1118,16 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         return false;
       } else if (response.status === 403) {
         console.error("API access denied - Check API key and permissions");
-        try {
-          const errorData = response.json;
-          console.error("Error details:", errorData);
-          if ((_c = (_b = errorData.error) == null ? void 0 : _b.message) == null ? void 0 : _c.includes("API key")) {
-            new import_obsidian.Notice("\u274C Invalid API Key. Please check your API Key in settings.");
-          } else if ((_e = (_d = errorData.error) == null ? void 0 : _d.message) == null ? void 0 : _e.includes("quota")) {
-            new import_obsidian.Notice("\u274C API quota exceeded. Try again later.");
-          } else {
-            new import_obsidian.Notice("\u274C API access denied. Check your API Key and Drive API is enabled.");
-          }
-        } catch (parseError) {
-          new import_obsidian.Notice("\u274C API access denied. Check your API Key and Drive API is enabled.");
-        }
-        return false;
-      } else if (response.status === 400) {
-        console.error("Bad request - Check API parameters");
-        new import_obsidian.Notice("\u274C Bad request. Check your API configuration.");
+        new import_obsidian.Notice("\u274C API access denied. Check your API Key and Drive API is enabled.");
         return false;
       } else {
         console.error(`Drive API test failed: ${response.status}`);
-        try {
-          const errorData = response.json;
-          console.error("Error details:", errorData);
-        } catch (parseError) {
-          console.error("Could not parse error response");
-        }
         new import_obsidian.Notice(`\u274C Drive API connection failed (Status: ${response.status}). Check console for details.`);
         return false;
       }
     } catch (error) {
       console.error("Drive API test error:", error);
-      if ((_f = error.message) == null ? void 0 : _f.includes("Network")) {
-        new import_obsidian.Notice("\u274C Network error. Check your internet connection.");
-      } else if ((_g = error.message) == null ? void 0 : _g.includes("CORS")) {
-        new import_obsidian.Notice("\u274C CORS error. This should not happen with requestUrl.");
-      } else {
-        new import_obsidian.Notice("\u274C Unexpected error occurred. Check console for details.");
-      }
+      new import_obsidian.Notice("\u274C Unexpected error occurred. Check console for details.");
       return false;
     }
   }
@@ -844,7 +1140,7 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Google Drive File Sync Settings" });
+    containerEl.createEl("h2", { text: "Google Drive Bidirectional Sync Settings" });
     containerEl.createEl("h3", { text: "Google Drive API Configuration" });
     new import_obsidian.Setting(containerEl).setName("Client ID").setDesc("Google Drive API Client ID (Desktop Application type)").addText((text) => text.setPlaceholder("Enter your Client ID").setValue(this.plugin.settings.clientId).onChange(async (value) => {
       this.plugin.settings.clientId = value;
@@ -861,6 +1157,18 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     containerEl.createEl("h3", { text: "Sync Configuration" });
     new import_obsidian.Setting(containerEl).setName("Google Drive Folder").setDesc("Name of the folder to create/use in Google Drive").addText((text) => text.setPlaceholder("e.g., Obsidian-Sync").setValue(this.plugin.settings.driveFolder).onChange(async (value) => {
       this.plugin.settings.driveFolder = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Sync Direction").setDesc("Choose how files should be synchronized").addDropdown((dropdown) => dropdown.addOption("bidirectional", "\u{1F504} Bidirectional (Upload & Download)").addOption("upload", "\u{1F4E4} Upload Only (Local \u2192 Drive)").addOption("download", "\u{1F4E5} Download Only (Drive \u2192 Local)").setValue(this.plugin.settings.syncDirection).onChange(async (value) => {
+      this.plugin.settings.syncDirection = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Conflict Resolution").setDesc("How to handle conflicts when both local and remote files exist").addDropdown((dropdown) => dropdown.addOption("newer", "\u{1F552} Use Newer File (recommended)").addOption("local", "\u{1F4F1} Always Use Local File").addOption("remote", "\u2601\uFE0F Always Use Remote File").addOption("ask", "\u2753 Ask User (manual resolution)").setValue(this.plugin.settings.conflictResolution).onChange(async (value) => {
+      this.plugin.settings.conflictResolution = value;
+      await this.plugin.saveSettings();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Create Missing Folders").setDesc("Automatically create local folders when downloading files from Google Drive").addToggle((toggle) => toggle.setValue(this.plugin.settings.createMissingFolders).onChange(async (value) => {
+      this.plugin.settings.createMissingFolders = value;
       await this.plugin.saveSettings();
     }));
     new import_obsidian.Setting(containerEl).setName("Sync Whole Vault").setDesc("Enable to sync the entire vault instead of selected folders").addToggle((toggle) => toggle.setValue(this.plugin.settings.syncWholeVault).onChange(async (value) => {
@@ -942,7 +1250,41 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         }, 1e3);
       }
     }));
+    containerEl.createEl("h3", { text: "Sync Actions" });
+    new import_obsidian.Setting(containerEl).setName("Full Bidirectional Sync").setDesc("Perform complete bidirectional synchronization (upload new/changed local files, download new/changed remote files)").addButton((button) => button.setButtonText("\u{1F504} Sync Both Ways").setCta().onClick(async () => {
+      const originalDirection = this.plugin.settings.syncDirection;
+      this.plugin.settings.syncDirection = "bidirectional";
+      try {
+        await this.plugin.syncWithGoogleDrive();
+      } finally {
+        this.plugin.settings.syncDirection = originalDirection;
+      }
+    }));
+    new import_obsidian.Setting(containerEl).setName("Upload to Google Drive").setDesc("Upload only: Send local files to Google Drive (one-way sync)").addButton((button) => button.setButtonText("\u{1F4E4} Upload Only").onClick(async () => {
+      const originalDirection = this.plugin.settings.syncDirection;
+      this.plugin.settings.syncDirection = "upload";
+      try {
+        await this.plugin.syncWithGoogleDrive();
+      } finally {
+        this.plugin.settings.syncDirection = originalDirection;
+      }
+    }));
+    new import_obsidian.Setting(containerEl).setName("Download from Google Drive").setDesc("Download only: Get files from Google Drive to local vault (one-way sync)").addButton((button) => button.setButtonText("\u{1F4E5} Download Only").onClick(async () => {
+      const originalDirection = this.plugin.settings.syncDirection;
+      this.plugin.settings.syncDirection = "download";
+      try {
+        await this.plugin.syncWithGoogleDrive();
+      } finally {
+        this.plugin.settings.syncDirection = originalDirection;
+      }
+    }));
+    new import_obsidian.Setting(containerEl).setName("Preview Sync").setDesc("Show what files would be synced (without actually syncing)").addButton((button) => button.setButtonText("Preview").onClick(async () => {
+      await this.previewSync();
+    }));
     containerEl.createEl("h3", { text: "Testing & Debugging" });
+    new import_obsidian.Setting(containerEl).setName("Test API Connection").setDesc("Test your current access token with Google Drive API").addButton((button) => button.setButtonText("Test Connection").onClick(async () => {
+      await this.plugin.testDriveAPIConnection();
+    }));
     new import_obsidian.Setting(containerEl).setName("Debug Token").setDesc("Show current token status and validity").addButton((button) => button.setButtonText("Debug").onClick(async () => {
       if (!this.plugin.settings.accessToken) {
         new import_obsidian.Notice("\u274C No access token stored");
@@ -985,16 +1327,6 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       if (textInput)
         textInput.value = "";
     }));
-    new import_obsidian.Setting(containerEl).setName("Test API Connection").setDesc("Test your current access token with Google Drive API").addButton((button) => button.setButtonText("Test Connection").onClick(async () => {
-      await this.plugin.testDriveAPIConnection();
-    }));
-    containerEl.createEl("h3", { text: "Sync Actions" });
-    new import_obsidian.Setting(containerEl).setName("Preview Sync").setDesc("Show what files would be synced (without actually syncing)").addButton((button) => button.setButtonText("Preview").onClick(async () => {
-      await this.previewSync();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Manual Sync").setDesc("Manually trigger sync with Google Drive").addButton((button) => button.setButtonText("Sync Now").setCta().onClick(async () => {
-      await this.plugin.syncWithGoogleDrive();
-    }));
     new import_obsidian.Setting(containerEl).setName("Reset API State").setDesc("Reset Google API state if you encounter issues").addButton((button) => button.setButtonText("Reset").setWarning().onClick(() => {
       this.plugin.resetGoogleAPIState();
       new import_obsidian.Notice("Google API state reset. You may need to re-authenticate.");
@@ -1012,8 +1344,10 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
                     ${this.plugin.settings.accessToken ? "<br><small>Access token is stored</small>" : "<br><small>No access token stored</small>"}
                 </div>
                 <div style="padding: 10px; border-radius: 4px; background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;">
-                    <strong>Mode:</strong> \u2705 Desktop Application (Multi-folder Support)
-                    <br><small>Supports multiple folder selection and whole vault sync with preserved folder structure</small>
+                    <strong>Mode:</strong> \u2705 Desktop Application (Bidirectional Sync)
+                    <br><small>Supports upload, download, and bidirectional synchronization with preserved folder structure</small>
+                    <br><small>Sync Direction: ${this.plugin.settings.syncDirection === "bidirectional" ? "\u{1F504} Bidirectional" : this.plugin.settings.syncDirection === "upload" ? "\u{1F4E4} Upload Only" : "\u{1F4E5} Download Only"}</small>
+                    <br><small>Conflict Resolution: ${this.plugin.settings.conflictResolution === "newer" ? "\u{1F552} Use Newer File" : this.plugin.settings.conflictResolution === "local" ? "\u{1F4F1} Always Use Local" : this.plugin.settings.conflictResolution === "remote" ? "\u2601\uFE0F Always Use Remote" : "\u2753 Ask User"}</small>
                 </div>
             `;
     };
@@ -1036,37 +1370,42 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
                     <li>\uC0DD\uC131\uB41C <strong>Client ID</strong>\uC640 <strong>Client Secret</strong>\uC744 \uC704 \uC124\uC815\uC5D0 \uC785\uB825</li>
                     <li>Google Drive API\uAC00 \uD65C\uC131\uD654\uB418\uC5B4 \uC788\uB294\uC9C0 \uD655\uC778</li>
                 </ol>
-                <p><strong>\uC7A5\uC810:</strong> Redirect URI \uC124\uC815\uC774 \uD544\uC694 \uC5C6\uC5B4 \uB354 \uAC04\uB2E8\uD569\uB2C8\uB2E4!</p>
-                <p><strong>\u26A0\uFE0F \uC911\uC694:</strong> Desktop Application\uC5D0\uC11C\uB294 Client ID\uC640 Client Secret\uC774 \uBAA8\uB450 \uD544\uC694\uD569\uB2C8\uB2E4.</p>
             </div>
             <div style="background-color: #d1ecf1; border: 1px solid #bee5eb; padding: 10px; margin: 10px 0; border-radius: 4px;">
-                <p><strong>\u{1F504} Desktop App \uC778\uC99D \uBC29\uBC95:</strong></p>
-                <ol>
-                    <li><strong>"1. Open Auth URL" \uD074\uB9AD</strong> \u2192 \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C Google \uC778\uC99D \uD398\uC774\uC9C0 \uC5F4\uB9BC</li>
-                    <li><strong>Google \uACC4\uC815\uC73C\uB85C \uB85C\uADF8\uC778</strong> \u2192 Drive API \uAD8C\uD55C \uD5C8\uC6A9</li>
-                    <li><strong>Authorization Code \uBCF5\uC0AC</strong> \u2192 \uBE0C\uB77C\uC6B0\uC800\uC5D0 \uD45C\uC2DC\uB418\uB294 \uCF54\uB4DC \uBCF5\uC0AC</li>
-                    <li><strong>\uCF54\uB4DC \uBD99\uC5EC\uB123\uAE30</strong> \u2192 "Authorization Code" \uC785\uB825\uB780\uC5D0 \uBD99\uC5EC\uB123\uAE30</li>
-                    <li><strong>"2. Exchange for Token" \uD074\uB9AD</strong> \u2192 \uD1A0\uD070\uC73C\uB85C \uAD50\uD658 \uBC0F \uC790\uB3D9 \uD14C\uC2A4\uD2B8</li>
-                </ol>
+                <p><strong>\u{1F504} \uC591\uBC29\uD5A5 \uB3D9\uAE30\uD654 \uAE30\uB2A5:</strong></p>
+                <ul>
+                    <li><strong>\u{1F4E4} \uC5C5\uB85C\uB4DC \uC804\uC6A9:</strong> \uB85C\uCEEC \uD30C\uC77C\uC744 Google Drive\uC5D0\uB9CC \uC5C5\uB85C\uB4DC</li>
+                    <li><strong>\u{1F4E5} \uB2E4\uC6B4\uB85C\uB4DC \uC804\uC6A9:</strong> Google Drive \uD30C\uC77C\uC744 \uB85C\uCEEC\uC5D0\uB9CC \uB2E4\uC6B4\uB85C\uB4DC</li>
+                    <li><strong>\u{1F504} \uC591\uBC29\uD5A5 \uB3D9\uAE30\uD654:</strong> \uC591\uCABD \uBAA8\uB450 \uD655\uC778\uD558\uACE0 \uCD5C\uC2E0 \uC0C1\uD0DC\uB85C \uB3D9\uAE30\uD654</li>
+                </ul>
+                <p><strong>\u{1F91D} \uCDA9\uB3CC \uD574\uACB0 \uBC29\uC2DD:</strong></p>
+                <ul>
+                    <li><strong>Use Newer File:</strong> \uC218\uC815 \uC2DC\uAC04\uC774 \uB354 \uCD5C\uC2E0\uC778 \uD30C\uC77C \uC0AC\uC6A9 (\uAD8C\uC7A5)</li>
+                    <li><strong>Always Use Local:</strong> \uD56D\uC0C1 \uB85C\uCEEC \uD30C\uC77C \uC6B0\uC120</li>
+                    <li><strong>Always Use Remote:</strong> \uD56D\uC0C1 \uC6D0\uACA9 \uD30C\uC77C \uC6B0\uC120</li>
+                    <li><strong>Ask User:</strong> \uC0AC\uC6A9\uC790\uC5D0\uAC8C \uC9C1\uC811 \uD655\uC778 (\uD604\uC7AC\uB294 newer\uB85C \uB3D9\uC791)</li>
+                </ul>
+                <p><strong>\u{1F4C1} \uC790\uB3D9 \uD3F4\uB354 \uC0DD\uC131:</strong></p>
+                <ul>
+                    <li>Google Drive\uC5D0\uC11C \uB2E4\uC6B4\uB85C\uB4DC \uC2DC \uB85C\uCEEC\uC5D0 \uC5C6\uB294 \uD3F4\uB354 \uC790\uB3D9 \uC0DD\uC131</li>
+                    <li>\uD3F4\uB354 \uAD6C\uC870\uB97C \uC644\uC804\uD788 \uBCF4\uC874\uD558\uC5EC \uB3D9\uAE30\uD654</li>
+                    <li>\uCD08\uAE30 \uC124\uC815 \uC2DC Google Drive\uC758 \uC804\uCCB4 \uAD6C\uC870\uB97C \uB85C\uCEEC\uB85C \uBCF5\uC81C \uAC00\uB2A5</li>
+                </ul>
             </div>
             <div style="background-color: #e7f3ff; border: 1px solid #b3d7ff; padding: 10px; margin: 10px 0; border-radius: 4px;">
-                <p><strong>\u{1F4C1} \uB3D9\uAE30\uD654 \uB3D9\uC791 \uBC29\uC2DD (\uB2E4\uC911 \uD3F4\uB354 \uC9C0\uC6D0):</strong></p>
+                <p><strong>\u{1F680} \uC0AC\uC6A9 \uC2DC\uB098\uB9AC\uC624:</strong></p>
                 <ul>
-                    <li><strong>\uC804\uCCB4 Vault \uB3D9\uAE30\uD654:</strong> "Sync Whole Vault" \uC635\uC158 \uD65C\uC131\uD654 \uC2DC vault\uC758 \uBAA8\uB4E0 \uD30C\uC77C\uC744 \uB3D9\uAE30\uD654</li>
-                    <li><strong>\uC120\uD0DD\uC801 \uD3F4\uB354 \uB3D9\uAE30\uD654:</strong> \uC6D0\uD558\uB294 \uD3F4\uB354\uB9CC \uC120\uD0DD\uD558\uC5EC \uB3D9\uAE30\uD654 \uAC00\uB2A5</li>
-                    <li><strong>\uD558\uC704 \uD3F4\uB354:</strong> "Include Subfolders" \uC124\uC815\uC5D0 \uB530\uB77C \uC7AC\uADC0\uC801\uC73C\uB85C \uCC98\uB9AC\uB429\uB2C8\uB2E4</li>
-                    <li><strong>\uD3F4\uB354 \uAD6C\uC870:</strong> Google Drive\uC5D0 \uC6D0\uBCF8\uACFC \uB3D9\uC77C\uD55C \uC2E4\uC81C \uD3F4\uB354 \uAD6C\uC870\uB97C \uC0DD\uC131\uD569\uB2C8\uB2E4</li>
-                    <li><strong>\uD30C\uC77C \uD0C0\uC785:</strong> .md, .txt, .json, .csv, .html, .css, .js \uD30C\uC77C\uB9CC \uB3D9\uAE30\uD654</li>
-                    <li><strong>\uC81C\uC678 \uD30C\uC77C:</strong> \uC228\uAE40 \uD30C\uC77C(.), \uC784\uC2DC \uD30C\uC77C(.tmp), \uBC31\uC5C5 \uD30C\uC77C(.bak) \uC81C\uC678</li>
-                    <li><strong>Google Drive \uC704\uCE58:</strong> \uC9C0\uC815\uD55C "Google Drive Folder" \uC774\uB984\uC73C\uB85C \uB8E8\uD2B8\uC5D0 \uC0DD\uC131</li>
+                    <li><strong>\uCD08\uAE30 \uC124\uC815:</strong> "\u{1F4E5} Download Only"\uB85C Google Drive \uB0B4\uC6A9\uC744 \uB85C\uCEEC\uC5D0 \uBCF5\uC81C</li>
+                    <li><strong>\uC77C\uC0C1 \uC791\uC5C5:</strong> "\u{1F504} Sync Both Ways"\uB85C \uC591\uBC29\uD5A5 \uB3D9\uAE30\uD654</li>
+                    <li><strong>\uBC31\uC5C5:</strong> "\u{1F4E4} Upload Only"\uB85C \uB85C\uCEEC \uBCC0\uACBD\uC0AC\uD56D\uB9CC \uC5C5\uB85C\uB4DC</li>
+                    <li><strong>\uBCF5\uC6D0:</strong> "\u{1F4E5} Download Only"\uB85C Google Drive\uC5D0\uC11C \uBCF5\uC6D0</li>
                 </ul>
-                <p><strong>\u{1F504} \uB3D9\uAE30\uD654 \uBAA8\uB4DC:</strong></p>
+                <p><strong>\u{1F4A1} \uD301:</strong></p>
                 <ul>
-                    <li><strong>Always sync:</strong> \uBAA8\uB4E0 \uD30C\uC77C\uC744 \uD56D\uC0C1 \uC5C5\uB85C\uB4DC (\uAC00\uC7A5 \uC548\uC804\uD558\uC9C0\uB9CC \uB290\uB9BC)</li>
-                    <li><strong>Modified time:</strong> \uB85C\uCEEC \uD30C\uC77C\uC774 \uB354 \uCD5C\uADFC\uC5D0 \uC218\uC815\uB41C \uACBD\uC6B0\uB9CC \uB3D9\uAE30\uD654 (\uAD8C\uC7A5)</li>
-                    <li><strong>Content checksum:</strong> \uD30C\uC77C \uB0B4\uC6A9 \uD574\uC2DC\uB97C \uBE44\uAD50\uD558\uC5EC \uC2E4\uC81C \uBCC0\uACBD\uB41C \uACBD\uC6B0\uB9CC \uB3D9\uAE30\uD654 (\uAC00\uC7A5 \uC815\uD655\uD558\uC9C0\uB9CC \uB290\uB9BC)</li>
+                    <li>\uBA3C\uC800 "Preview Sync"\uB85C \uB3D9\uAE30\uD654\uB420 \uD30C\uC77C \uD655\uC778</li>
+                    <li>"Create Missing Folders" \uC635\uC158\uC73C\uB85C \uD3F4\uB354 \uAD6C\uC870 \uC790\uB3D9 \uC0DD\uC131</li>
+                    <li>Auto Sync \uAE30\uB2A5\uC73C\uB85C \uC815\uAE30\uC801 \uC790\uB3D9 \uB3D9\uAE30\uD654</li>
                 </ul>
-                <p><strong>\u{1F4A1} \uD301:</strong> "Preview Sync" \uBC84\uD2BC\uC73C\uB85C \uB3D9\uAE30\uD654 \uB300\uC0C1 \uD30C\uC77C\uC744 \uBBF8\uB9AC \uD655\uC778\uD558\uC138\uC694!</p>
             </div>
         `;
   }
@@ -1119,50 +1458,131 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     });
     modal.open();
   }
-  // 동기화 미리보기
+  // 동기화 미리보기 - 양방향 지원 버전
   async previewSync() {
-    if (this.plugin.settings.syncWholeVault) {
-      const allFiles = this.plugin.app.vault.getFiles();
-      const filesToSync = allFiles.filter((file) => this.plugin.shouldSyncFileType(file));
-      console.log("=== WHOLE VAULT SYNC PREVIEW ===");
+    if (!this.plugin.isAuthenticated()) {
+      new import_obsidian.Notice("\u274C Please authenticate first");
+      return;
+    }
+    try {
+      console.log("=== BIDIRECTIONAL SYNC PREVIEW ===");
       console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
-      console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
-      console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : "Never"}`);
-      console.log(`Files to sync (${filesToSync.length}):`);
-      filesToSync.forEach((file) => {
-        const modTime = new Date(file.stat.mtime).toLocaleString();
-        console.log(`  - ${file.path} (modified: ${modTime})`);
-      });
-      new import_obsidian.Notice(`\u{1F4CB} Found ${filesToSync.length} files to sync from whole vault. Check console for details.`);
-    } else {
-      if (this.plugin.settings.syncFolders.length === 0) {
-        new import_obsidian.Notice("\u274C No folders selected for sync");
-        return;
-      }
-      let totalFiles = 0;
-      console.log("=== SELECTED FOLDERS SYNC PREVIEW ===");
-      console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
+      console.log(`Sync direction: ${this.plugin.settings.syncDirection}`);
+      console.log(`Conflict resolution: ${this.plugin.settings.conflictResolution}`);
       console.log(`Include subfolders: ${this.plugin.settings.includeSubfolders}`);
-      console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
+      console.log(`Create missing folders: ${this.plugin.settings.createMissingFolders}`);
       console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : "Never"}`);
-      console.log(`Selected folders (${this.plugin.settings.syncFolders.length}):`);
-      for (const folderPath of this.plugin.settings.syncFolders) {
-        const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
-        if (folder && folder instanceof import_obsidian.TFolder) {
-          const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
-          totalFiles += files.length;
-          console.log(`
-\u{1F4C1} ${folderPath || "Vault Root"} (${files.length} files):`);
-          files.forEach((file) => {
-            const modTime = new Date(file.stat.mtime).toLocaleString();
-            console.log(`  - ${file.path} (modified: ${modTime})`);
-          });
-        } else {
-          console.log(`
-\u274C Folder not found: ${folderPath}`);
+      let localFiles = [];
+      if (this.plugin.settings.syncWholeVault) {
+        const allFiles = this.plugin.app.vault.getFiles();
+        localFiles = allFiles.filter((file) => this.plugin.shouldSyncFileType(file));
+        console.log(`
+\u{1F4F1} LOCAL FILES (Whole Vault): ${localFiles.length} files`);
+      } else {
+        if (this.plugin.settings.syncFolders.length === 0) {
+          new import_obsidian.Notice("\u274C No folders selected for sync");
+          return;
+        }
+        console.log(`
+\u{1F4F1} LOCAL FILES (Selected Folders):`);
+        for (const folderPath of this.plugin.settings.syncFolders) {
+          const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
+          if (folder && folder instanceof import_obsidian.TFolder) {
+            const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
+            localFiles.push(...files);
+            console.log(`  \u{1F4C1} ${folderPath || "Vault Root"}: ${files.length} files`);
+          }
         }
       }
-      new import_obsidian.Notice(`\u{1F4CB} Found ${totalFiles} files to sync from ${this.plugin.settings.syncFolders.length} folders. Check console for details.`);
+      localFiles.forEach((file) => {
+        const modTime = new Date(file.stat.mtime).toLocaleString();
+        console.log(`    - ${file.path} (modified: ${modTime})`);
+      });
+      const driveFolder = await this.plugin.getOrCreateDriveFolder();
+      if (!driveFolder) {
+        new import_obsidian.Notice("\u274C Failed to access Google Drive folder");
+        return;
+      }
+      const driveFiles = await this.plugin.getAllFilesFromDrive(driveFolder.id);
+      console.log(`
+\u2601\uFE0F GOOGLE DRIVE FILES: ${driveFiles.length} files`);
+      driveFiles.forEach((file) => {
+        const modTime = new Date(file.modifiedTime).toLocaleString();
+        console.log(`    - ${file.path} (modified: ${modTime})`);
+      });
+      const localFileMap = /* @__PURE__ */ new Map();
+      localFiles.forEach((file) => localFileMap.set(file.path, file));
+      const driveFileMap = /* @__PURE__ */ new Map();
+      driveFiles.forEach((file) => driveFileMap.set(file.path, file));
+      const allPaths = /* @__PURE__ */ new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
+      let toUpload = 0;
+      let toDownload = 0;
+      let conflicts = 0;
+      let skipped = 0;
+      console.log(`
+\u{1F50D} SYNC ANALYSIS:`);
+      for (const filePath of allPaths) {
+        const localFile = localFileMap.get(filePath);
+        const driveFile = driveFileMap.get(filePath);
+        if (localFile && driveFile) {
+          const localModTime = localFile.stat.mtime;
+          const driveModTime = new Date(driveFile.modifiedTime).getTime();
+          if (this.plugin.settings.syncDirection === "bidirectional") {
+            if (localModTime !== driveModTime) {
+              conflicts++;
+              console.log(`  \u26A0\uFE0F CONFLICT: ${filePath} (local: ${new Date(localModTime).toLocaleString()}, remote: ${new Date(driveModTime).toLocaleString()})`);
+            } else {
+              skipped++;
+              console.log(`  \u23ED\uFE0F SKIP: ${filePath} (same modification time)`);
+            }
+          } else if (this.plugin.settings.syncDirection === "upload") {
+            if (localModTime > driveModTime) {
+              toUpload++;
+              console.log(`  \u{1F4E4} UPLOAD: ${filePath}`);
+            } else {
+              skipped++;
+              console.log(`  \u23ED\uFE0F SKIP: ${filePath} (remote is newer or same)`);
+            }
+          } else if (this.plugin.settings.syncDirection === "download") {
+            if (driveModTime > localModTime) {
+              toDownload++;
+              console.log(`  \u{1F4E5} DOWNLOAD: ${filePath}`);
+            } else {
+              skipped++;
+              console.log(`  \u23ED\uFE0F SKIP: ${filePath} (local is newer or same)`);
+            }
+          }
+        } else if (localFile && !driveFile) {
+          if (this.plugin.settings.syncDirection !== "download") {
+            toUpload++;
+            console.log(`  \u{1F4E4} UPLOAD NEW: ${filePath}`);
+          } else {
+            skipped++;
+            console.log(`  \u23ED\uFE0F SKIP: ${filePath} (local only, download mode)`);
+          }
+        } else if (!localFile && driveFile) {
+          if (this.plugin.settings.syncDirection !== "upload") {
+            toDownload++;
+            console.log(`  \u{1F4E5} DOWNLOAD NEW: ${filePath}`);
+          } else {
+            skipped++;
+            console.log(`  \u23ED\uFE0F SKIP: ${filePath} (remote only, upload mode)`);
+          }
+        }
+      }
+      const summary = [
+        `\u{1F4E4} To Upload: ${toUpload}`,
+        `\u{1F4E5} To Download: ${toDownload}`,
+        `\u26A0\uFE0F Conflicts: ${conflicts}`,
+        `\u23ED\uFE0F Skipped: ${skipped}`,
+        `\u{1F4C1} Total Files: ${allPaths.size}`
+      ].join(", ");
+      console.log(`
+\u{1F4CB} SUMMARY: ${summary}`);
+      new import_obsidian.Notice(`\u{1F4CB} Sync Preview: ${summary}. Check console for details.`);
+    } catch (error) {
+      console.error("Preview sync error:", error);
+      new import_obsidian.Notice("\u274C Failed to preview sync. Check console for details.");
     }
   }
 };

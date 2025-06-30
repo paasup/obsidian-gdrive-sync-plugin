@@ -4,31 +4,126 @@ interface GDriveSyncSettings {
     clientId: string;
     clientSecret: string;
     apiKey: string;
-    syncFolders: string[]; // 변경: 단일 폴더에서 복수 폴더로
-    syncWholeVault: boolean; // 추가: 전체 vault 동기화 옵션
+    syncFolders: string[];
+    syncWholeVault: boolean;
     autoSync: boolean;
     syncInterval: number;
     accessToken: string;
-    driveFolder: string; // Google Drive 폴더 이름
-    includeSubfolders: boolean; // 하위 폴더 포함 여부
-    syncMode: 'always' | 'modified' | 'checksum'; // 동기화 모드
-    lastSyncTime: number; // 마지막 동기화 시간
+    driveFolder: string;
+    includeSubfolders: boolean;
+    syncMode: 'always' | 'modified' | 'checksum';
+    lastSyncTime: number;
+    syncDirection: 'upload' | 'download' | 'bidirectional'; // 새로 추가
+    conflictResolution: 'local' | 'remote' | 'newer' | 'ask'; // 새로 추가
+    createMissingFolders: boolean; // 새로 추가
 }
 
 const DEFAULT_SETTINGS: GDriveSyncSettings = {
     clientId: '',
     clientSecret: '',
     apiKey: '',
-    syncFolders: [], // 빈 배열로 초기화
-    syncWholeVault: false, // 기본값은 false
+    syncFolders: [],
+    syncWholeVault: false,
     autoSync: false,
-    syncInterval: 300000, // 5 minutes
+    syncInterval: 300000,
     accessToken: '',
-    driveFolder: 'Obsidian-Sync', // 기본 Google Drive 폴더명
-    includeSubfolders: true, // 기본적으로 하위 폴더 포함
-    syncMode: 'modified', // 기본: 수정 시간 기반
-    lastSyncTime: 0
+    driveFolder: 'Obsidian-Sync',
+    includeSubfolders: true,
+    syncMode: 'modified',
+    lastSyncTime: 0,
+    syncDirection: 'bidirectional', // 기본값: 양방향
+    conflictResolution: 'newer', // 기본값: 더 최신 파일 우선
+    createMissingFolders: true // 기본값: 누락된 폴더 자동 생성
 };
+
+// 동기화 결과 인터페이스
+interface SyncResult {
+    uploaded: number;
+    downloaded: number;
+    skipped: number;
+    conflicts: number;
+    errors: number;
+    createdFolders: string[];
+}
+
+// 충돌 해결 모달
+class ConflictResolutionModal extends Modal {
+    private localFile: TFile;
+    private remoteFile: any;
+    private onResolve: (resolution: 'local' | 'remote') => void;
+
+    constructor(app: App, localFile: TFile, remoteFile: any, onResolve: (resolution: 'local' | 'remote') => void) {
+        super(app);
+        this.localFile = localFile;
+        this.remoteFile = remoteFile;
+        this.onResolve = onResolve;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Sync Conflict Resolution' });
+        
+        const conflictInfo = contentEl.createEl('div', { 
+            attr: { style: 'margin: 20px 0;' }
+        });
+        
+        conflictInfo.createEl('p', { text: `File: ${this.localFile.path}` });
+        
+        const localTime = new Date(this.localFile.stat.mtime).toLocaleString();
+        const remoteTime = new Date(this.remoteFile.modifiedTime).toLocaleString();
+        
+        conflictInfo.innerHTML += `
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;">
+                <div style="padding: 15px; border: 1px solid var(--background-modifier-border); border-radius: 5px;">
+                    <h3>📱 Local File</h3>
+                    <p><strong>Modified:</strong> ${localTime}</p>
+                    <p><strong>Size:</strong> ${this.localFile.stat.size} bytes</p>
+                </div>
+                <div style="padding: 15px; border: 1px solid var(--background-modifier-border); border-radius: 5px;">
+                    <h3>☁️ Remote File</h3>
+                    <p><strong>Modified:</strong> ${remoteTime}</p>
+                    <p><strong>Size:</strong> ${this.remoteFile.size || 'Unknown'} bytes</p>
+                </div>
+            </div>
+        `;
+
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'text-align: center; margin-top: 20px;' }
+        });
+
+        const useLocalButton = buttonContainer.createEl('button', { 
+            text: 'Use Local File',
+            cls: 'mod-cta',
+            attr: { style: 'margin-right: 10px;' }
+        });
+        useLocalButton.onclick = () => {
+            this.onResolve('local');
+            this.close();
+        };
+
+        const useRemoteButton = buttonContainer.createEl('button', { 
+            text: 'Use Remote File',
+            cls: 'mod-cta',
+            attr: { style: 'margin-right: 10px;' }
+        });
+        useRemoteButton.onclick = () => {
+            this.onResolve('remote');
+            this.close();
+        };
+
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel'
+        });
+        cancelButton.onclick = () => this.close();
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
 
 // 폴더 트리 선택 모달 클래스
 class FolderTreeModal extends Modal {
@@ -57,19 +152,16 @@ class FolderTreeModal extends Modal {
 
         this.renderFolderTree(treeContainer);
 
-        // 버튼 컨테이너
         const buttonContainer = contentEl.createEl('div', { 
             attr: { style: 'text-align: right; margin-top: 15px;' }
         });
 
-        // 취소 버튼
         const cancelButton = buttonContainer.createEl('button', { 
             text: 'Cancel',
             attr: { style: 'margin-right: 10px;' }
         });
         cancelButton.onclick = () => this.close();
 
-        // Vault Root 선택 버튼
         const selectRootButton = buttonContainer.createEl('button', { 
             text: 'Select Vault Root',
             cls: 'mod-cta',
@@ -100,7 +192,6 @@ class FolderTreeModal extends Modal {
             }
         });
 
-        // 호버 효과
         nodeEl.addEventListener('mouseenter', () => {
             nodeEl.style.backgroundColor = 'var(--background-modifier-hover)';
         });
@@ -111,12 +202,10 @@ class FolderTreeModal extends Modal {
         const hasChildren = folder.children.some(child => child instanceof TFolder);
         const isExpanded = this.expandedFolders.has(folder.path);
 
-        // 폴더 아이콘과 이름
         const folderContent = nodeEl.createEl('div', { 
             attr: { style: 'display: flex; align-items: center;' }
         });
 
-        // 확장/축소 아이콘
         const expandIcon = folderContent.createEl('span', { 
             text: hasChildren ? (isExpanded ? '▼' : '▶') : '  ',
             attr: { 
@@ -124,7 +213,6 @@ class FolderTreeModal extends Modal {
             }
         });
 
-        // 폴더 아이콘과 이름
         const folderIcon = folderContent.createEl('span', { 
             text: '📁',
             attr: { style: 'margin-right: 6px;' }
@@ -135,7 +223,6 @@ class FolderTreeModal extends Modal {
             attr: { style: 'flex-grow: 1;' }
         });
 
-        // 선택 버튼
         const selectBtn = folderContent.createEl('button', { 
             text: 'Select',
             cls: 'mod-small',
@@ -144,7 +231,6 @@ class FolderTreeModal extends Modal {
             }
         });
 
-        // 이벤트 리스너
         expandIcon.onclick = (e) => {
             e.stopPropagation();
             if (hasChildren) {
@@ -164,7 +250,6 @@ class FolderTreeModal extends Modal {
             this.close();
         };
 
-        // 하위 폴더 렌더링 (확장된 경우)
         if (hasChildren && isExpanded) {
             const subFolders = folder.children
                 .filter(child => child instanceof TFolder)
@@ -183,7 +268,6 @@ class FolderTreeModal extends Modal {
             this.expandedFolders.add(folderPath);
         }
         
-        // 트리 다시 렌더링
         container.empty();
         this.renderFolderTree(container);
     }
@@ -194,7 +278,6 @@ class FolderTreeModal extends Modal {
     }
 }
 
-// 기존 FolderSuggestModal 클래스는 유지하되, 사용하지 않음
 class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
     private folders: TFolder[];
     private onChoose: (folder: TFolder) => void;
@@ -210,7 +293,7 @@ class FolderSuggestModal extends FuzzySuggestModal<TFolder> {
     }
 
     getItemText(folder: TFolder): string {
-        return folder.path || '/'; // 루트 폴더의 경우 '/' 표시
+        return folder.path || '/';
     }
 
     onChooseItem(folder: TFolder, evt: MouseEvent | KeyboardEvent): void {
@@ -239,9 +322,26 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
 
+        // 새로운 커맨드들 추가
+        this.addCommand({
+            id: 'download-from-gdrive',
+            name: 'Download from Google Drive',
+            callback: () => {
+                this.downloadFromGoogleDrive();
+            }
+        });
+
+        this.addCommand({
+            id: 'upload-to-gdrive',
+            name: 'Upload to Google Drive',
+            callback: () => {
+                this.uploadToGoogleDrive();
+            }
+        });
+
         this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
 
-        console.log('Plugin loaded - Desktop App authentication mode with multi-folder support');
+        console.log('Plugin loaded - Desktop App authentication mode with bidirectional sync support');
 
         if (this.settings.autoSync) {
             this.setupAutoSync();
@@ -257,7 +357,6 @@ export default class GDriveSyncPlugin extends Plugin {
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
         
-        // 기존 syncFolder 설정을 syncFolders로 마이그레이션
         const oldData = await this.loadData();
         if (oldData && oldData.syncFolder && !oldData.syncFolders) {
             this.settings.syncFolders = [oldData.syncFolder];
@@ -269,10 +368,10 @@ export default class GDriveSyncPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
+    // 기존 인증 메서드들은 동일하게 유지
     async authenticateGoogleDrive(): Promise<boolean> {
         console.log('=== Starting Google Drive Desktop Authentication ===');
         
-        // 설정 확인
         if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
             console.error('Missing credentials');
             new Notice('❌ Please set Client ID, Client Secret, and API Key in settings first.');
@@ -281,23 +380,20 @@ export default class GDriveSyncPlugin extends Plugin {
 
         console.log('✓ Credentials are set');
 
-        // Desktop Application용 인증 URL 생성
         const authUrl = this.generateAuthUrl();
         
         new Notice('Opening browser for Desktop App authentication...');
         console.log('Desktop Auth URL:', authUrl);
         
-        // 브라우저에서 URL 열기
         try {
             window.open(authUrl, '_blank');
             
             new Notice('🔗 Complete authentication in browser, then copy the authorization code and use "Authorization Code" input in settings.');
             
-            return false; // 수동 프로세스이므로 false 반환
+            return false;
         } catch (error) {
             console.error('Failed to open browser:', error);
             
-            // URL을 클립보드에 복사
             try {
                 navigator.clipboard.writeText(authUrl);
                 new Notice('📋 Auth URL copied to clipboard. Open it in your browser.');
@@ -313,7 +409,7 @@ export default class GDriveSyncPlugin extends Plugin {
     private generateAuthUrl(): string {
         const params = new URLSearchParams({
             client_id: this.settings.clientId,
-            redirect_uri: 'urn:ietf:wg:oauth:2.0:oob', // Desktop app용 out-of-band
+            redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
             scope: 'https://www.googleapis.com/auth/drive.file',
             response_type: 'code',
             access_type: 'offline',
@@ -374,7 +470,6 @@ export default class GDriveSyncPlugin extends Plugin {
                 return true;
             }
 
-            // 로컬 토큰 제거
             this.settings.accessToken = '';
             await this.saveSettings();
 
@@ -386,7 +481,6 @@ export default class GDriveSyncPlugin extends Plugin {
             console.error('Failed to revoke access:', error);
             new Notice('Failed to revoke access. Token cleared locally.');
             
-            // 오류가 발생해도 로컬 토큰은 제거
             this.settings.accessToken = '';
             await this.saveSettings();
             return false;
@@ -397,15 +491,16 @@ export default class GDriveSyncPlugin extends Plugin {
         return !!(this.settings.accessToken);
     }
 
-    async syncWithGoogleDrive() {
+    // 메인 동기화 메서드 (양방향)
+    async syncWithGoogleDrive(): Promise<SyncResult> {
         if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
             new Notice('Please configure Google Drive API credentials in settings');
-            return;
+            return this.createEmptyResult();
         }
 
         if (!this.settings.syncWholeVault && this.settings.syncFolders.length === 0) {
             new Notice('Please select folders to sync or enable "Sync Whole Vault" in settings');
-            return;
+            return this.createEmptyResult();
         }
 
         new Notice('Starting Google Drive sync...');
@@ -413,148 +508,565 @@ export default class GDriveSyncPlugin extends Plugin {
         try {
             if (!this.isAuthenticated()) {
                 new Notice('Please authenticate first using the Desktop App method.');
-                return;
+                return this.createEmptyResult();
             }
 
-            if (this.settings.syncWholeVault) {
-                // 전체 vault 동기화
-                await this.syncVault();
+            let result: SyncResult;
+
+            if (this.settings.syncDirection === 'upload') {
+                result = await this.uploadToGoogleDrive();
+            } else if (this.settings.syncDirection === 'download') {
+                result = await this.downloadFromGoogleDrive();
             } else {
-                // 선택된 폴더들 동기화
-                for (const folderPath of this.settings.syncFolders) {
-                    const folder = this.app.vault.getAbstractFileByPath(folderPath);
-                    if (folder && folder instanceof TFolder) {
-                        await this.syncFolder(folder);
-                    } else {
-                        console.warn(`Folder not found: ${folderPath}`);
-                        new Notice(`⚠️ Folder not found: ${folderPath}`);
-                    }
-                }
+                // 양방향 동기화
+                result = await this.bidirectionalSync();
             }
 
-            new Notice('Google Drive sync completed');
+            this.reportSyncResult(result);
+            return result;
 
         } catch (error) {
             console.error('Sync failed:', error);
             new Notice('Google Drive sync failed');
+            return this.createEmptyResult();
         }
     }
 
-    // 전체 vault 동기화
-    async syncVault() {
-        console.log('Syncing whole vault...');
-        
+    // 업로드 전용 메서드
+    async uploadToGoogleDrive(): Promise<SyncResult> {
+        console.log('Starting upload to Google Drive...');
+        const result = this.createEmptyResult();
+
         try {
-            // Google Drive에서 Obsidian 동기화 폴더 찾기 또는 생성
             const driveFolder = await this.getOrCreateDriveFolder();
             if (!driveFolder) {
                 new Notice('❌ Failed to create or find Google Drive folder');
-                return;
+                return result;
             }
 
-            console.log(`✓ Google Drive folder ready: ${this.settings.driveFolder}`);
-
-            // vault의 모든 파일 수집
-            const allFiles = this.app.vault.getFiles();
-            const filesToSync = allFiles.filter(file => this.shouldSyncFileType(file));
-            
-            console.log(`Found ${filesToSync.length} files to sync from whole vault`);
-
-            if (filesToSync.length === 0) {
-                new Notice('No files found to sync in vault');
-                return;
+            if (this.settings.syncWholeVault) {
+                const allFiles = this.app.vault.getFiles();
+                const filesToSync = allFiles.filter(file => this.shouldSyncFileType(file));
+                
+                await this.uploadFilesToDrive(filesToSync, driveFolder.id, result);
+            } else {
+                for (const folderPath of this.settings.syncFolders) {
+                    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+                    if (folder && folder instanceof TFolder) {
+                        const filesToSync = await this.collectFilesToSync(folder, this.settings.includeSubfolders);
+                        await this.uploadFilesToDrive(filesToSync, driveFolder.id, result);
+                    }
+                }
             }
 
-            await this.syncFilesToDrive(filesToSync, driveFolder.id, 'vault');
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettings();
 
         } catch (error) {
-            console.error('Sync vault error:', error);
-            new Notice('❌ Vault sync failed. Check console for details.');
+            console.error('Upload error:', error);
+            result.errors++;
         }
+
+        return result;
+    }
+
+    // 다운로드 전용 메서드
+    async downloadFromGoogleDrive(): Promise<SyncResult> {
+        console.log('Starting download from Google Drive...');
+        const result = this.createEmptyResult();
+
+        try {
+            const driveFolder = await this.getOrCreateDriveFolder();
+            if (!driveFolder) {
+                new Notice('❌ Failed to find Google Drive folder');
+                return result;
+            }
+
+            // Google Drive에서 모든 파일 가져오기
+            const driveFiles = await this.getAllFilesFromDrive(driveFolder.id);
+            console.log(`Found ${driveFiles.length} files in Google Drive`);
+
+            for (const driveFile of driveFiles) {
+                try {
+                    await this.downloadFileFromDrive(driveFile, result);
+                } catch (error) {
+                    console.error(`Error downloading file ${driveFile.name}:`, error);
+                    result.errors++;
+                }
+            }
+
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettings();
+
+        } catch (error) {
+            console.error('Download error:', error);
+            result.errors++;
+        }
+
+        return result;
+    }
+
+    // 양방향 동기화 메서드
+    async bidirectionalSync(): Promise<SyncResult> {
+        console.log('Starting bidirectional sync...');
+        const result = this.createEmptyResult();
+
+        try {
+            const driveFolder = await this.getOrCreateDriveFolder();
+            if (!driveFolder) {
+                new Notice('❌ Failed to create or find Google Drive folder');
+                return result;
+            }
+
+            // 1. 로컬 파일 수집
+            let localFiles: TFile[] = [];
+            if (this.settings.syncWholeVault) {
+                const allFiles = this.app.vault.getFiles();
+                localFiles = allFiles.filter(file => this.shouldSyncFileType(file));
+            } else {
+                for (const folderPath of this.settings.syncFolders) {
+                    const folder = this.app.vault.getAbstractFileByPath(folderPath);
+                    if (folder && folder instanceof TFolder) {
+                        const folderFiles = await this.collectFilesToSync(folder, this.settings.includeSubfolders);
+                        localFiles.push(...folderFiles);
+                    }
+                }
+            }
+
+            // 2. 원격 파일 수집
+            const driveFiles = await this.getAllFilesFromDrive(driveFolder.id);
+
+            // 3. 파일 매핑 생성 (경로 기준)
+            const localFileMap = new Map<string, TFile>();
+            localFiles.forEach(file => localFileMap.set(file.path, file));
+
+            const driveFileMap = new Map<string, any>();
+            driveFiles.forEach(file => driveFileMap.set(file.path, file));
+
+            // 4. 모든 파일 경로 수집
+            const allPaths = new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
+
+            // 5. 각 파일에 대해 동기화 결정
+            for (const filePath of allPaths) {
+                const localFile = localFileMap.get(filePath);
+                const driveFile = driveFileMap.get(filePath);
+
+                try {
+                    if (localFile && driveFile) {
+                        // 양쪽에 존재: 충돌 해결 필요
+                        await this.resolveFileConflict(localFile, driveFile, driveFolder.id, result);
+                    } else if (localFile && !driveFile) {
+                        // 로컬에만 존재: 업로드
+                        await this.uploadSingleFile(localFile, driveFolder.id, result);
+                    } else if (!localFile && driveFile) {
+                        // 원격에만 존재: 다운로드
+                        await this.downloadFileFromDrive(driveFile, result);
+                    }
+                } catch (error) {
+                    console.error(`Error syncing file ${filePath}:`, error);
+                    result.errors++;
+                }
+            }
+
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettings();
+
+        } catch (error) {
+            console.error('Bidirectional sync error:', error);
+            result.errors++;
+        }
+
+        return result;
+    }
+
+    // Google Drive에서 파일 다운로드
+    private async downloadFileFromDrive(driveFile: any, result: SyncResult): Promise<void> {
+        try {
+            const filePath = driveFile.path;
+            const localFile = this.app.vault.getAbstractFileByPath(filePath);
+
+            // 로컬 파일이 있는 경우 수정 시간 비교
+            if (localFile instanceof TFile) {
+                const needsUpdate = await this.shouldDownloadFile(localFile, driveFile);
+                if (!needsUpdate) {
+                    result.skipped++;
+                    return;
+                }
+            }
+
+            // 파일 내용 다운로드
+            const content = await this.getFileContentFromDrive(driveFile.id);
+
+            // 로컬 폴더 생성 (필요한 경우)
+            const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
+            if (folderPath && this.settings.createMissingFolders) {
+                await this.createLocalFolderStructure(folderPath, result);
+            }
+
+            // 원격지 수정 시간 가져오기
+            const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+
+            // 파일 생성 또는 업데이트
+            if (localFile instanceof TFile) {
+                await this.app.vault.modify(localFile, content);
+                console.log(`🔄 Updated local file: ${filePath}`);
+            } else {
+                await this.app.vault.create(filePath, content);
+                console.log(`📥 Downloaded new file: ${filePath}`);
+            }
+
+            // 파일 시간 동기화 - 다운로드/생성 후 원격지 시간으로 설정
+            await this.syncFileTime(filePath, remoteModTime);
+
+            result.downloaded++;
+
+        } catch (error) {
+            console.error(`Error downloading file ${driveFile.path}:`, error);
+            throw error;
+        }
+    }
+
+    // 파일 시간 동기화 메서드 - 대안 방법들 포함
+    private async syncFileTime(filePath: string, targetTime: number): Promise<void> {
+        try {
+            const adapter = this.app.vault.adapter;
+            
+            // 방법 1: Node.js 환경(데스크톱)에서 직접 파일시스템 접근
+            if (adapter.constructor.name === 'FileSystemAdapter') {
+                try {
+                    // @ts-ignore - Node.js FileSystemAdapter 전용
+                    const fs = require('fs').promises;
+                    // @ts-ignore - Node.js path 모듈
+                    const path = require('path');
+                    // @ts-ignore - basePath 접근
+                    const fullPath = path.join(adapter.basePath, filePath);
+                    
+                    // 파일 시간을 원격지 시간으로 설정
+                    const targetDate = new Date(targetTime);
+                    await fs.utimes(fullPath, targetDate, targetDate);
+                    
+                    console.log(`⏰ Synced file time: ${filePath} -> ${targetDate.toLocaleString()}`);
+                    return; // 성공하면 여기서 종료
+                } catch (fsError) {
+                    console.warn(`⚠️ Direct filesystem access failed: ${fsError}`);
+                    // 방법 2로 fallback
+                }
+            }
+            
+            // 방법 2: Obsidian API를 통한 우회 방법 (완벽하지 않지만 차선책)
+            try {
+                const file = this.app.vault.getAbstractFileByPath(filePath);
+                if (file instanceof TFile) {
+                    // 파일의 내부 상태를 수정하여 시간 정보 업데이트 시도
+                    // @ts-ignore - 내부 속성 접근
+                    if (file.stat && file.stat.mtime !== undefined) {
+                        // @ts-ignore - mtime 수정 시도
+                        file.stat.mtime = targetTime;
+                        console.log(`⏰ Updated file stat time: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+                        return;
+                    }
+                }
+            } catch (obsidianError) {
+                console.warn(`⚠️ Obsidian API time sync failed: ${obsidianError}`);
+            }
+            
+            // 방법 3: 메타데이터 파일로 시간 정보 저장 (최후의 수단)
+            try {
+                const timeMetadata = {
+                    originalPath: filePath,
+                    remoteModifiedTime: targetTime,
+                    syncedAt: Date.now()
+                };
+                
+                // 숨김 메타데이터 파일에 시간 정보 저장
+                const metadataPath = `.obsidian/plugins/gdrive-sync/time-metadata/${filePath.replace(/[\/\\]/g, '_')}.json`;
+                const metadataDir = metadataPath.substring(0, metadataPath.lastIndexOf('/'));
+                
+                // 메타데이터 디렉토리 생성
+                try {
+                    await this.app.vault.createFolder(metadataDir);
+                } catch (e) {
+                    // 이미 존재하는 경우 무시
+                }
+                
+                await this.app.vault.create(metadataPath, JSON.stringify(timeMetadata, null, 2));
+                console.log(`⏰ Stored time metadata: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+            } catch (metadataError) {
+                console.warn(`⚠️ Metadata time storage failed: ${metadataError}`);
+            }
+            
+        } catch (error) {
+            // 시간 동기화 실패는 치명적이지 않으므로 경고만 출력
+            console.warn(`⚠️ All file time sync methods failed for ${filePath}:`, error);
+        }
+    }    
+
+    // 메타데이터에서 시간 정보를 읽어오는 헬퍼 메서드
+    private async getStoredFileTime(filePath: string): Promise<number | null> {
+        try {
+            const metadataPath = `.obsidian/plugins/gdrive-sync/time-metadata/${filePath.replace(/[\/\\]/g, '_')}.json`;
+            const metadataFile = this.app.vault.getAbstractFileByPath(metadataPath);
+            
+            if (metadataFile instanceof TFile) {
+                const content = await this.app.vault.read(metadataFile);
+                const metadata = JSON.parse(content);
+                return metadata.remoteModifiedTime || null;
+            }
+        } catch (error) {
+            // 메타데이터가 없는 경우는 정상
+        }
+        return null;
+    }    
+
+    // 로컬 폴더 구조 생성
+    private async createLocalFolderStructure(folderPath: string, result: SyncResult): Promise<void> {
+        if (!folderPath) return;
+
+        const pathParts = folderPath.split('/');
+        let currentPath = '';
+
+        for (const part of pathParts) {
+            currentPath = currentPath ? `${currentPath}/${part}` : part;
+            
+            const existingFolder = this.app.vault.getAbstractFileByPath(currentPath);
+            if (!existingFolder) {
+                try {
+                    await this.app.vault.createFolder(currentPath);
+                    console.log(`📁 Created local folder: ${currentPath}`);
+                    result.createdFolders.push(currentPath);
+                } catch (error) {
+                    // 폴더가 이미 존재하는 경우 무시
+                    if (!error.message.includes('already exists')) {
+                        throw error;
+                    }
+                }
+            }
+        }
+    }
+
+    // 파일 충돌 해결
+    private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult): Promise<void> {
+        const localModTime = localFile.stat.mtime;
+        const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+
+        let resolution: 'local' | 'remote';
+
+        switch (this.settings.conflictResolution) {
+            case 'local':
+                resolution = 'local';
+                break;
+            case 'remote':
+                resolution = 'remote';
+                break;
+            case 'newer':
+                resolution = localModTime > remoteModTime ? 'local' : 'remote';
+                break;
+            case 'ask':
+                // 사용자에게 묻기 (현재는 newer로 대체)
+                resolution = localModTime > remoteModTime ? 'local' : 'remote';
+                console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
+                break;
+        }
+
+        if (resolution === 'local') {
+            // 로컬 파일로 원격 파일 업데이트
+            await this.uploadSingleFile(localFile, rootFolderId, result);
+        } else {
+            // 원격 파일로 로컬 파일 업데이트
+            await this.downloadFileFromDrive(driveFile, result);
+        }
+
+        result.conflicts++;
+    }
+
+    // 단일 파일 업로드
+    private async uploadSingleFile(file: TFile, rootFolderId: string, result: SyncResult): Promise<void> {
+        try {
+            const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId);
+            if (syncResult === 'skipped') {
+                result.skipped++;
+            } else if (syncResult === true) {
+                result.uploaded++;
+            } else {
+                result.errors++;
+            }
+        } catch (error) {
+            console.error(`Error uploading file ${file.path}:`, error);
+            result.errors++;
+        }
+    }
+
+    // 여러 파일 업로드
+    private async uploadFilesToDrive(filesToSync: TFile[], rootFolderId: string, result: SyncResult): Promise<void> {
+        for (const file of filesToSync) {
+            await this.uploadSingleFile(file, rootFolderId, result);
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+    }
+
+    // Google Drive에서 모든 파일 가져오기 (재귀적으로 폴더 구조 포함) - public으로 변경
+    async getAllFilesFromDrive(folderId: string, basePath: string = ''): Promise<any[]> {
+        const allFiles: any[] = [];
+        
+        try {
+            let pageToken = '';
+            
+            do {
+                const query = `'${folderId}' in parents and trashed=false`;
+                const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,mimeType,modifiedTime,size,parents)&pageSize=1000${pageToken ? `&pageToken=${pageToken}` : ''}`;
+                
+                const response = await requestUrl({
+                    url: url,
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${this.settings.accessToken}`
+                    },
+                    throw: false
+                });
+
+                if (response.status !== 200) {
+                    console.error('Failed to list files:', response.status, response.json);
+                    break;
+                }
+
+                const data = response.json;
+                
+                for (const file of data.files || []) {
+                    const filePath = basePath ? `${basePath}/${file.name}` : file.name;
+                    
+                    if (file.mimeType === 'application/vnd.google-apps.folder') {
+                        // 폴더인 경우 재귀적으로 하위 파일들 수집
+                        if (this.settings.includeSubfolders) {
+                            const subFiles = await this.getAllFilesFromDrive(file.id, filePath);
+                            allFiles.push(...subFiles);
+                        }
+                    } else {
+                        // 파일인 경우 경로 정보와 함께 추가
+                        allFiles.push({
+                            ...file,
+                            path: filePath
+                        });
+                    }
+                }
+
+                pageToken = data.nextPageToken || '';
+            } while (pageToken);
+
+        } catch (error) {
+            console.error('Error getting files from Drive:', error);
+            throw error;
+        }
+
+        return allFiles;
+    }
+
+    // 파일 다운로드 필요 여부 판단
+    private async shouldDownloadFile(localFile: TFile, driveFile: any): Promise<boolean> {
+        switch (this.settings.syncMode) {
+            case 'always':
+                return true;
+
+            case 'modified':
+                const localModTime = localFile.stat.mtime;
+                const driveModTime = new Date(driveFile.modifiedTime).getTime();
+                
+                // 메타데이터에 저장된 원격 시간도 확인
+                const storedRemoteTime = await this.getStoredFileTime(localFile.path);
+                if (storedRemoteTime && storedRemoteTime === driveModTime) {
+                    // 이미 동기화된 파일
+                    return false;
+                }
+                
+                return driveModTime > localModTime;
+
+            case 'checksum':
+                try {
+                    const localContent = await this.app.vault.read(localFile);
+                    const localHash = await this.calculateFileHash(localContent);
+                    
+                    const driveContent = await this.getFileContentFromDrive(driveFile.id);
+                    const driveHash = await this.calculateFileHash(driveContent);
+                    
+                    return localHash !== driveHash;
+                } catch (error) {
+                    console.error('Error comparing file checksums:', error);
+                    return true;
+                }
+
+            default:
+                return true;
+        }
+    }
+
+    // 동기화 결과 객체 생성
+    private createEmptyResult(): SyncResult {
+        return {
+            uploaded: 0,
+            downloaded: 0,
+            skipped: 0,
+            conflicts: 0,
+            errors: 0,
+            createdFolders: []
+        };
+    }
+
+    // 동기화 결과 보고
+    private reportSyncResult(result: SyncResult): void {
+        const messages: string[] = [];
+        
+        if (result.uploaded > 0) messages.push(`${result.uploaded} uploaded`);
+        if (result.downloaded > 0) messages.push(`${result.downloaded} downloaded`);
+        if (result.skipped > 0) messages.push(`${result.skipped} skipped`);
+        if (result.conflicts > 0) messages.push(`${result.conflicts} conflicts resolved`);
+        if (result.createdFolders.length > 0) messages.push(`${result.createdFolders.length} folders created`);
+        
+        const summary = messages.length > 0 ? messages.join(', ') : 'No changes';
+        
+        if (result.errors === 0) {
+            new Notice(`✅ Sync completed: ${summary}`);
+        } else {
+            new Notice(`⚠️ Sync completed with ${result.errors} errors: ${summary}`);
+        }
+
+        // 생성된 폴더 로그
+        if (result.createdFolders.length > 0) {
+            console.log('Created folders:', result.createdFolders);
+        }
+    }
+
+    // 기존 메서드들 (syncVault, syncFolder 등은 새로운 구조에 맞게 수정)
+    async syncVault() {
+        return await this.syncWithGoogleDrive();
     }
 
     async syncFolder(folder: TFolder) {
-        console.log(`Syncing folder: ${folder.path}`);
-        console.log(`Include subfolders: ${this.settings.includeSubfolders}`);
+        // 임시로 설정을 변경하여 특정 폴더만 동기화
+        const originalSyncWholeVault = this.settings.syncWholeVault;
+        const originalSyncFolders = [...this.settings.syncFolders];
+        
+        this.settings.syncWholeVault = false;
+        this.settings.syncFolders = [folder.path];
         
         try {
-            // Google Drive에서 Obsidian 동기화 폴더 찾기 또는 생성
-            const driveFolder = await this.getOrCreateDriveFolder();
-            if (!driveFolder) {
-                new Notice('❌ Failed to create or find Google Drive folder');
-                return;
-            }
-
-            console.log(`✓ Google Drive folder ready: ${this.settings.driveFolder}`);
-
-            // 로컬 파일 수집
-            const filesToSync = await this.collectFilesToSyncPrivate(folder, this.settings.includeSubfolders);
-            console.log(`Found ${filesToSync.length} files to sync from ${folder.path}`);
-
-            if (filesToSync.length === 0) {
-                new Notice(`No files found to sync in ${folder.path}`);
-                return;
-            }
-
-            await this.syncFilesToDrive(filesToSync, driveFolder.id, folder.path);
-
-        } catch (error) {
-            console.error('Sync folder error:', error);
-            new Notice('❌ Sync failed. Check console for details.');
+            const result = await this.syncWithGoogleDrive();
+            return result;
+        } finally {
+            // 설정 복원
+            this.settings.syncWholeVault = originalSyncWholeVault;
+            this.settings.syncFolders = originalSyncFolders;
         }
     }
 
-    // 공통 파일 동기화 로직
-    private async syncFilesToDrive(filesToSync: TFile[], rootFolderId: string, sourceName: string) {
-        let successCount = 0;
-        let errorCount = 0;
-        let skippedCount = 0;
-
-        for (const file of filesToSync) {
-            try {
-                const result = await this.syncFileToGoogleDrive(file, rootFolderId);
-                if (result === 'skipped') {
-                    skippedCount++;
-                } else if (result === true) {
-                    successCount++;
-                } else {
-                    errorCount++;
-                    console.error(`✗ Failed to sync: ${file.path}`);
-                }
-            } catch (error) {
-                errorCount++;
-                console.error(`✗ Error syncing ${file.path}:`, error);
-            }
-
-            // UI 업데이트를 위한 작은 지연
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-
-        // 동기화 시간 업데이트
-        this.settings.lastSyncTime = Date.now();
-        await this.saveSettings();
-
-        // 결과 보고
-        if (errorCount === 0) {
-            new Notice(`✅ ${sourceName} sync completed: ${successCount} synced, ${skippedCount} skipped`);
-        } else {
-            new Notice(`⚠️ ${sourceName} sync completed with errors: ${successCount} synced, ${skippedCount} skipped, ${errorCount} errors`);
-        }
-    }
-
-    // Public method for settings tab
+    // 파일 수집 메서드 (기존과 동일)
     async collectFilesToSync(folder: TFolder, includeSubfolders: boolean): Promise<TFile[]> {
         const files: TFile[] = [];
 
-        // 현재 폴더의 파일들 수집
         for (const child of folder.children) {
             if (child instanceof TFile) {
-                // 특정 파일 타입만 동기화 (예: .md, .txt, .json 등)
                 if (this.shouldSyncFileType(child)) {
                     files.push(child);
                 }
             } else if (child instanceof TFolder && includeSubfolders) {
-                // 하위 폴더 재귀적으로 처리
                 const subfolderFiles = await this.collectFilesToSync(child, true);
                 files.push(...subfolderFiles);
             }
@@ -563,20 +1075,12 @@ export default class GDriveSyncPlugin extends Plugin {
         return files;
     }
 
-    // 동기화할 파일들을 수집 (하위 폴더 포함/제외 옵션)
-    private async collectFilesToSyncPrivate(folder: TFolder, includeSubfolders: boolean): Promise<TFile[]> {
-        return this.collectFilesToSync(folder, includeSubfolders);
-    }
-
-    // vault의 모든 폴더 가져오기 (루트 폴더 포함)
     getAllFolders(): TFolder[] {
         const folders: TFolder[] = [];
         
-        // 루트 폴더 추가 (전체 vault를 나타냄)
         const rootFolder = this.app.vault.getRoot();
         folders.push(rootFolder);
         
-        // 모든 하위 폴더 추가
         const allFolders = this.app.vault.getAllLoadedFiles()
             .filter(file => file instanceof TFolder) as TFolder[];
         
@@ -585,12 +1089,9 @@ export default class GDriveSyncPlugin extends Plugin {
         return folders.sort((a, b) => a.path.localeCompare(b.path));
     }
 
-    // 파일이 동기화 대상인지 확인
     shouldSyncFileType(file: TFile): boolean {
-        // 동기화할 파일 확장자 목록
         const syncExtensions = ['.md', '.txt', '.json', '.csv', '.html', '.css', '.js'];
         
-        // 제외할 파일들
         const excludePatterns = [
             /^\./, // 숨김 파일
             /\.tmp$/, // 임시 파일
@@ -598,21 +1099,17 @@ export default class GDriveSyncPlugin extends Plugin {
             /\.lock$/, // 락 파일
         ];
 
-        // 확장자 확인
         const hasValidExtension = syncExtensions.some(ext => file.name.endsWith(ext));
-        
-        // 제외 패턴 확인
         const shouldExclude = excludePatterns.some(pattern => pattern.test(file.name));
 
         return hasValidExtension && !shouldExclude;
     }
 
-    // Google Drive에서 Obsidian 동기화 폴더 찾기 또는 생성
-    private async getOrCreateDriveFolder(): Promise<{id: string, name: string} | null> {
+    // Google Drive 관련 메서드들 - public으로 변경하여 설정 탭에서 접근 가능
+    async getOrCreateDriveFolder(): Promise<{id: string, name: string} | null> {
         try {
             console.log(`Looking for Google Drive folder: ${this.settings.driveFolder}`);
 
-            // 기존 폴더 검색
             const searchResponse = await requestUrl({
                 url: `https://www.googleapis.com/drive/v3/files?q=name='${this.settings.driveFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
                 method: 'GET',
@@ -626,14 +1123,12 @@ export default class GDriveSyncPlugin extends Plugin {
                 const searchData = searchResponse.json;
                 
                 if (searchData.files && searchData.files.length > 0) {
-                    // 기존 폴더 발견
                     const folder = searchData.files[0];
                     console.log(`✓ Found existing folder: ${folder.name} (${folder.id})`);
                     return { id: folder.id, name: folder.name };
                 }
             }
 
-            // 폴더가 없으면 새로 생성
             console.log(`Creating new Google Drive folder: ${this.settings.driveFolder}`);
             
             const createResponse = await requestUrl({
@@ -665,23 +1160,16 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 개별 파일을 Google Drive에 동기화
     private async syncFileToGoogleDrive(file: TFile, rootFolderId: string): Promise<boolean | 'skipped'> {
         try {
-            // 파일의 전체 경로 사용 (full path)
             let relativePath = file.path;
             let fileName = file.name;
             
-            // 전체 vault 동기화 시에는 그대로 전체 경로 사용
-            // 개별 폴더 동기화 시에도 전체 경로 유지
-            
-            // 실제 폴더 구조 생성
             let targetFolderId = rootFolderId;
             
             if (relativePath.includes('/')) {
-                // 중첩된 폴더 생성 (전체 경로 기준)
                 const pathParts = relativePath.split('/');
-                fileName = pathParts.pop()!; // 마지막이 파일명
+                fileName = pathParts.pop()!;
                 const folderPath = pathParts.join('/');
                 
                 console.log(`Creating full folder structure: ${folderPath}`);
@@ -692,28 +1180,25 @@ export default class GDriveSyncPlugin extends Plugin {
                 }
             }
             
-            // Google Drive에서 기존 파일 검색
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
             
-            // 동기화 필요 여부 확인
             const needsSync = await this.shouldSyncFile(file, existingFile);
             
             if (!needsSync) {
                 console.log(`⏭️ Skipping ${file.path} (no changes detected)`);
-                return 'skipped'; // 건너뛰기는 'skipped' 문자열 반환
+                return 'skipped';
             }
 
-            // 파일 내용 읽기
             const content = await this.app.vault.read(file);
+            const localModTime = file.stat.mtime; // 로컬 파일의 수정 시간
+
             
             if (existingFile) {
-                // 기존 파일 업데이트
                 console.log(`🔄 Updating ${file.path}`);
-                return await this.updateFileInDrive(existingFile.id, content, file.stat.mtime);
+                return await this.updateFileInDrive(existingFile.id, content, localModTime);
             } else {
-                // 새 파일 업로드
                 console.log(`📤 Uploading ${file.path}`);
-                return await this.uploadFileToDrive(fileName, content, targetFolderId);
+                return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
             }
 
         } catch (error) {
@@ -722,43 +1207,37 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 파일 동기화 필요 여부 판단
     private async shouldSyncFile(localFile: TFile, driveFile: any): Promise<boolean> {
         switch (this.settings.syncMode) {
             case 'always':
-                // 항상 동기화
                 return true;
 
             case 'modified':
-                // 수정 시간 기반 비교
                 if (!driveFile) {
-                    return true; // 새 파일
+                    return true;
                 }
                 
                 const localModTime = localFile.stat.mtime;
                 const driveModTime = new Date(driveFile.modifiedTime).getTime();
                 
-                // 로컬 파일이 더 최근에 수정되었으면 동기화
                 return localModTime > driveModTime;
 
             case 'checksum':
-                // 파일 내용 해시 기반 비교
                 if (!driveFile) {
-                    return true; // 새 파일
+                    return true;
                 }
                 
                 try {
                     const localContent = await this.app.vault.read(localFile);
                     const localHash = await this.calculateFileHash(localContent);
                     
-                    // Google Drive에서 파일 내용 가져와서 해시 비교
                     const driveContent = await this.getFileContentFromDrive(driveFile.id);
                     const driveHash = await this.calculateFileHash(driveContent);
                     
                     return localHash !== driveHash;
                 } catch (error) {
                     console.error('Error comparing file checksums:', error);
-                    return true; // 오류 시 안전하게 동기화
+                    return true;
                 }
 
             default:
@@ -766,7 +1245,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 파일 해시 계산 (SHA-256)
     private async calculateFileHash(content: string): Promise<string> {
         const encoder = new TextEncoder();
         const data = encoder.encode(content);
@@ -775,7 +1253,6 @@ export default class GDriveSyncPlugin extends Plugin {
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // Google Drive에서 파일 내용 가져오기
     private async getFileContentFromDrive(fileId: string): Promise<string> {
         try {
             const response = await requestUrl({
@@ -788,7 +1265,6 @@ export default class GDriveSyncPlugin extends Plugin {
             });
 
             if (response.status === 200) {
-                // ArrayBuffer를 문자열로 변환
                 const decoder = new TextDecoder('utf-8');
                 return decoder.decode(response.arrayBuffer);
             } else {
@@ -800,22 +1276,19 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 중첩된 폴더 구조 생성
     private async createNestedFolders(folderPath: string, rootFolderId: string): Promise<string> {
         const pathParts = folderPath.split('/');
         let currentFolderId = rootFolderId;
 
         for (const folderName of pathParts) {
-            if (!folderName) continue; // 빈 문자열 건너뛰기
+            if (!folderName) continue;
             
-            // 현재 폴더에서 하위 폴더 찾기
             const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
             
             if (existingFolder) {
                 currentFolderId = existingFolder.id;
                 console.log(`✓ Found existing folder: ${folderName}`);
             } else {
-                // 새 폴더 생성
                 const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
                 if (!newFolder) {
                     throw new Error(`Failed to create folder: ${folderName}`);
@@ -828,7 +1301,6 @@ export default class GDriveSyncPlugin extends Plugin {
         return currentFolderId;
     }
 
-    // Google Drive에서 폴더 검색
     private async findFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
             const response = await requestUrl({
@@ -853,7 +1325,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // Google Drive에 새 폴더 생성
     private async createFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
             const response = await requestUrl({
@@ -884,7 +1355,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // Google Drive에서 파일 검색
     private async findFileInDrive(fileName: string, folderId: string): Promise<{id: string, name: string, modifiedTime: string} | null> {
         try {
             const response = await requestUrl({
@@ -909,15 +1379,15 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // Google Drive에 새 파일 업로드
-    private async uploadFileToDrive(fileName: string, content: string, folderId: string): Promise<boolean> {
+    private async uploadFileToDrive(fileName: string, content: string, folderId: string, localModTime?: number): Promise<boolean>   {     
         try {
             const metadata = {
                 name: fileName,
-                parents: [folderId]
-            };
+                parents: [folderId],
+                // 로컬 파일의 수정 시간을 Google Drive에도 반영
+                modifiedTime: localModTime ? new Date(localModTime).toISOString() : undefined
+            };            
 
-            // Multipart upload를 위한 boundary 생성
             const boundary = '-------314159265358979323846';
             const delimiter = "\r\n--" + boundary + "\r\n";
             const close_delim = "\r\n--" + boundary + "--";
@@ -946,7 +1416,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // Google Drive의 기존 파일 업데이트
     private async updateFileInDrive(fileId: string, content: string, localModTime: number): Promise<boolean> {
         try {
             const response = await requestUrl({
@@ -980,7 +1449,6 @@ export default class GDriveSyncPlugin extends Plugin {
     resetGoogleAPIState() {
         console.log('Resetting Google API state...');
         this.isGoogleApiLoaded = false;
-        
         console.log('Google API state reset completed');
     }
 
@@ -994,18 +1462,16 @@ export default class GDriveSyncPlugin extends Plugin {
 
             console.log('Testing Google Drive API connection...');
             
-            // requestUrl 사용하여 CORS 문제 해결
             const response = await requestUrl({
                 url: 'https://www.googleapis.com/drive/v3/about?fields=user',
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${this.settings.accessToken}`
                 },
-                throw: false // 수동 에러 처리
+                throw: false
             });
 
             console.log('API Response Status:', response.status);
-            console.log('API Response Headers:', response.headers);
 
             if (response.status === 200) {
                 const data = response.json;
@@ -1016,57 +1482,24 @@ export default class GDriveSyncPlugin extends Plugin {
                 console.error('Authentication failed - Token expired or invalid');
                 new Notice('❌ Authentication expired. Please sign in again.');
                 
-                // 만료된 토큰 제거
                 this.settings.accessToken = '';
                 await this.saveSettings();
                 
-                // 자동으로 재인증 시도 제안
                 new Notice('Click "1. Open Auth URL" again to re-authenticate.');
                 return false;
             } else if (response.status === 403) {
                 console.error('API access denied - Check API key and permissions');
-                try {
-                    const errorData = response.json;
-                    console.error('Error details:', errorData);
-                    
-                    if (errorData.error?.message?.includes('API key')) {
-                        new Notice('❌ Invalid API Key. Please check your API Key in settings.');
-                    } else if (errorData.error?.message?.includes('quota')) {
-                        new Notice('❌ API quota exceeded. Try again later.');
-                    } else {
-                        new Notice('❌ API access denied. Check your API Key and Drive API is enabled.');
-                    }
-                } catch (parseError) {
-                    new Notice('❌ API access denied. Check your API Key and Drive API is enabled.');
-                }
-                return false;
-            } else if (response.status === 400) {
-                console.error('Bad request - Check API parameters');
-                new Notice('❌ Bad request. Check your API configuration.');
+                new Notice('❌ API access denied. Check your API Key and Drive API is enabled.');
                 return false;
             } else {
                 console.error(`Drive API test failed: ${response.status}`);
-                try {
-                    const errorData = response.json;
-                    console.error('Error details:', errorData);
-                } catch (parseError) {
-                    console.error('Could not parse error response');
-                }
                 new Notice(`❌ Drive API connection failed (Status: ${response.status}). Check console for details.`);
                 return false;
             }
 
         } catch (error) {
             console.error('Drive API test error:', error);
-            
-            // 네트워크 오류와 다른 오류 구분
-            if (error.message?.includes('Network')) {
-                new Notice('❌ Network error. Check your internet connection.');
-            } else if (error.message?.includes('CORS')) {
-                new Notice('❌ CORS error. This should not happen with requestUrl.');
-            } else {
-                new Notice('❌ Unexpected error occurred. Check console for details.');
-            }
+            new Notice('❌ Unexpected error occurred. Check console for details.');
             return false;
         }
     }
@@ -1085,7 +1518,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
 
         containerEl.empty();
 
-        containerEl.createEl('h2', { text: 'Google Drive File Sync Settings' });
+        containerEl.createEl('h2', { text: 'Google Drive Bidirectional Sync Settings' });
 
         // Google Drive API Configuration
         containerEl.createEl('h3', { text: 'Google Drive API Configuration' });
@@ -1134,6 +1567,46 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.driveFolder)
                 .onChange(async (value) => {
                     this.plugin.settings.driveFolder = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 동기화 방향 설정 추가
+        new Setting(containerEl)
+            .setName('Sync Direction')
+            .setDesc('Choose how files should be synchronized')
+            .addDropdown(dropdown => dropdown
+                .addOption('bidirectional', '🔄 Bidirectional (Upload & Download)')
+                .addOption('upload', '📤 Upload Only (Local → Drive)')
+                .addOption('download', '📥 Download Only (Drive → Local)')
+                .setValue(this.plugin.settings.syncDirection)
+                .onChange(async (value: 'upload' | 'download' | 'bidirectional') => {
+                    this.plugin.settings.syncDirection = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 충돌 해결 방식 설정 추가
+        new Setting(containerEl)
+            .setName('Conflict Resolution')
+            .setDesc('How to handle conflicts when both local and remote files exist')
+            .addDropdown(dropdown => dropdown
+                .addOption('newer', '🕒 Use Newer File (recommended)')
+                .addOption('local', '📱 Always Use Local File')
+                .addOption('remote', '☁️ Always Use Remote File')
+                .addOption('ask', '❓ Ask User (manual resolution)')
+                .setValue(this.plugin.settings.conflictResolution)
+                .onChange(async (value: 'local' | 'remote' | 'newer' | 'ask') => {
+                    this.plugin.settings.conflictResolution = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        // 누락된 폴더 자동 생성 설정 추가
+        new Setting(containerEl)
+            .setName('Create Missing Folders')
+            .setDesc('Automatically create local folders when downloading files from Google Drive')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.createMissingFolders)
+                .onChange(async (value) => {
+                    this.plugin.settings.createMissingFolders = value;
                     await this.plugin.saveSettings();
                 }));
 
@@ -1304,8 +1777,78 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     }
                 }));
 
+        // Sync Actions - 새로운 양방향 동기화 옵션들 추가
+        containerEl.createEl('h3', { text: 'Sync Actions' });
+
+        new Setting(containerEl)
+            .setName('Full Bidirectional Sync')
+            .setDesc('Perform complete bidirectional synchronization (upload new/changed local files, download new/changed remote files)')
+            .addButton(button => button
+                .setButtonText('🔄 Sync Both Ways')
+                .setCta()
+                .onClick(async () => {
+                    const originalDirection = this.plugin.settings.syncDirection;
+                    this.plugin.settings.syncDirection = 'bidirectional';
+                    
+                    try {
+                        await this.plugin.syncWithGoogleDrive();
+                    } finally {
+                        this.plugin.settings.syncDirection = originalDirection;
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Upload to Google Drive')
+            .setDesc('Upload only: Send local files to Google Drive (one-way sync)')
+            .addButton(button => button
+                .setButtonText('📤 Upload Only')
+                .onClick(async () => {
+                    const originalDirection = this.plugin.settings.syncDirection;
+                    this.plugin.settings.syncDirection = 'upload';
+                    
+                    try {
+                        await this.plugin.syncWithGoogleDrive();
+                    } finally {
+                        this.plugin.settings.syncDirection = originalDirection;
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Download from Google Drive')
+            .setDesc('Download only: Get files from Google Drive to local vault (one-way sync)')
+            .addButton(button => button
+                .setButtonText('📥 Download Only')
+                .onClick(async () => {
+                    const originalDirection = this.plugin.settings.syncDirection;
+                    this.plugin.settings.syncDirection = 'download';
+                    
+                    try {
+                        await this.plugin.syncWithGoogleDrive();
+                    } finally {
+                        this.plugin.settings.syncDirection = originalDirection;
+                    }
+                }));
+
+        new Setting(containerEl)
+            .setName('Preview Sync')
+            .setDesc('Show what files would be synced (without actually syncing)')
+            .addButton(button => button
+                .setButtonText('Preview')
+                .onClick(async () => {
+                    await this.previewSync();
+                }));
+
         // Testing & Debugging
         containerEl.createEl('h3', { text: 'Testing & Debugging' });
+
+        new Setting(containerEl)
+            .setName('Test API Connection')
+            .setDesc('Test your current access token with Google Drive API')
+            .addButton(button => button
+                .setButtonText('Test Connection')
+                .onClick(async () => {
+                    await this.plugin.testDriveAPIConnection();
+                }));
 
         new Setting(containerEl)
             .setName('Debug Token')
@@ -1323,7 +1866,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     console.log('Token length:', this.plugin.settings.accessToken.length);
                     console.log('Token preview:', this.plugin.settings.accessToken.substring(0, 20) + '...');
                     
-                    // JWT 토큰인지 확인 (일반적으로 Google은 JWT 형식 사용)
                     const tokenParts = this.plugin.settings.accessToken.split('.');
                     console.log('Token format:', tokenParts.length === 3 ? 'JWT' : 'Bearer');
                     
@@ -1350,7 +1892,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                         return;
                     }
                     
-                    // 임시로 토큰 설정하고 테스트
                     const originalToken = this.plugin.settings.accessToken;
                     this.plugin.settings.accessToken = tempToken;
                     
@@ -1359,7 +1900,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     
                     if (testResult) {
                         new Notice('✅ Manual token works! You can save it.');
-                        // 성공하면 토큰 저장 옵션 제공
                         const saveToken = confirm('Token works! Do you want to save it to settings?');
                         if (saveToken) {
                             await this.plugin.saveSettings();
@@ -1368,44 +1908,11 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                             this.plugin.settings.accessToken = originalToken;
                         }
                     } else {
-                        // 실패하면 원래 토큰으로 복구
                         this.plugin.settings.accessToken = originalToken;
                         new Notice('❌ Manual token test failed.');
                     }
                     
-                    // 입력 필드 초기화
                     if (textInput) textInput.value = '';
-                }));
-
-        new Setting(containerEl)
-            .setName('Test API Connection')
-            .setDesc('Test your current access token with Google Drive API')
-            .addButton(button => button
-                .setButtonText('Test Connection')
-                .onClick(async () => {
-                    await this.plugin.testDriveAPIConnection();
-                }));
-
-        // Sync Actions
-        containerEl.createEl('h3', { text: 'Sync Actions' });
-
-        new Setting(containerEl)
-            .setName('Preview Sync')
-            .setDesc('Show what files would be synced (without actually syncing)')
-            .addButton(button => button
-                .setButtonText('Preview')
-                .onClick(async () => {
-                    await this.previewSync();
-                }));
-
-        new Setting(containerEl)
-            .setName('Manual Sync')
-            .setDesc('Manually trigger sync with Google Drive')
-            .addButton(button => button
-                .setButtonText('Sync Now')
-                .setCta()
-                .onClick(async () => {
-                    await this.plugin.syncWithGoogleDrive();
                 }));
 
         new Setting(containerEl)
@@ -1446,22 +1953,26 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                         '<br><small>No access token stored</small>'}
                 </div>
                 <div style="padding: 10px; border-radius: 4px; background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;">
-                    <strong>Mode:</strong> ✅ Desktop Application (Multi-folder Support)
-                    <br><small>Supports multiple folder selection and whole vault sync with preserved folder structure</small>
+                    <strong>Mode:</strong> ✅ Desktop Application (Bidirectional Sync)
+                    <br><small>Supports upload, download, and bidirectional synchronization with preserved folder structure</small>
+                    <br><small>Sync Direction: ${this.plugin.settings.syncDirection === 'bidirectional' ? '🔄 Bidirectional' : 
+                        this.plugin.settings.syncDirection === 'upload' ? '📤 Upload Only' : '📥 Download Only'}</small>
+                    <br><small>Conflict Resolution: ${this.plugin.settings.conflictResolution === 'newer' ? '🕒 Use Newer File' :
+                        this.plugin.settings.conflictResolution === 'local' ? '📱 Always Use Local' :
+                        this.plugin.settings.conflictResolution === 'remote' ? '☁️ Always Use Remote' : '❓ Ask User'}</small>
                 </div>
             `;
         };
 
         updateStatus();
 
-        // 설정 저장 시 상태 업데이트
         const originalSaveSettings = this.plugin.saveSettings.bind(this.plugin);
         this.plugin.saveSettings = async () => {
             await originalSaveSettings();
             updateStatus();
         };
 
-        // Setup Instructions
+        // Setup Instructions - 양방향 동기화에 대한 설명 추가
         containerEl.createEl('h3', { text: 'Setup Instructions' });
         const instructionsEl = containerEl.createEl('div');
         instructionsEl.innerHTML = `
@@ -1475,37 +1986,42 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     <li>생성된 <strong>Client ID</strong>와 <strong>Client Secret</strong>을 위 설정에 입력</li>
                     <li>Google Drive API가 활성화되어 있는지 확인</li>
                 </ol>
-                <p><strong>장점:</strong> Redirect URI 설정이 필요 없어 더 간단합니다!</p>
-                <p><strong>⚠️ 중요:</strong> Desktop Application에서는 Client ID와 Client Secret이 모두 필요합니다.</p>
             </div>
             <div style="background-color: #d1ecf1; border: 1px solid #bee5eb; padding: 10px; margin: 10px 0; border-radius: 4px;">
-                <p><strong>🔄 Desktop App 인증 방법:</strong></p>
-                <ol>
-                    <li><strong>"1. Open Auth URL" 클릭</strong> → 브라우저에서 Google 인증 페이지 열림</li>
-                    <li><strong>Google 계정으로 로그인</strong> → Drive API 권한 허용</li>
-                    <li><strong>Authorization Code 복사</strong> → 브라우저에 표시되는 코드 복사</li>
-                    <li><strong>코드 붙여넣기</strong> → "Authorization Code" 입력란에 붙여넣기</li>
-                    <li><strong>"2. Exchange for Token" 클릭</strong> → 토큰으로 교환 및 자동 테스트</li>
-                </ol>
+                <p><strong>🔄 양방향 동기화 기능:</strong></p>
+                <ul>
+                    <li><strong>📤 업로드 전용:</strong> 로컬 파일을 Google Drive에만 업로드</li>
+                    <li><strong>📥 다운로드 전용:</strong> Google Drive 파일을 로컬에만 다운로드</li>
+                    <li><strong>🔄 양방향 동기화:</strong> 양쪽 모두 확인하고 최신 상태로 동기화</li>
+                </ul>
+                <p><strong>🤝 충돌 해결 방식:</strong></p>
+                <ul>
+                    <li><strong>Use Newer File:</strong> 수정 시간이 더 최신인 파일 사용 (권장)</li>
+                    <li><strong>Always Use Local:</strong> 항상 로컬 파일 우선</li>
+                    <li><strong>Always Use Remote:</strong> 항상 원격 파일 우선</li>
+                    <li><strong>Ask User:</strong> 사용자에게 직접 확인 (현재는 newer로 동작)</li>
+                </ul>
+                <p><strong>📁 자동 폴더 생성:</strong></p>
+                <ul>
+                    <li>Google Drive에서 다운로드 시 로컬에 없는 폴더 자동 생성</li>
+                    <li>폴더 구조를 완전히 보존하여 동기화</li>
+                    <li>초기 설정 시 Google Drive의 전체 구조를 로컬로 복제 가능</li>
+                </ul>
             </div>
             <div style="background-color: #e7f3ff; border: 1px solid #b3d7ff; padding: 10px; margin: 10px 0; border-radius: 4px;">
-                <p><strong>📁 동기화 동작 방식 (다중 폴더 지원):</strong></p>
+                <p><strong>🚀 사용 시나리오:</strong></p>
                 <ul>
-                    <li><strong>전체 Vault 동기화:</strong> "Sync Whole Vault" 옵션 활성화 시 vault의 모든 파일을 동기화</li>
-                    <li><strong>선택적 폴더 동기화:</strong> 원하는 폴더만 선택하여 동기화 가능</li>
-                    <li><strong>하위 폴더:</strong> "Include Subfolders" 설정에 따라 재귀적으로 처리됩니다</li>
-                    <li><strong>폴더 구조:</strong> Google Drive에 원본과 동일한 실제 폴더 구조를 생성합니다</li>
-                    <li><strong>파일 타입:</strong> .md, .txt, .json, .csv, .html, .css, .js 파일만 동기화</li>
-                    <li><strong>제외 파일:</strong> 숨김 파일(.), 임시 파일(.tmp), 백업 파일(.bak) 제외</li>
-                    <li><strong>Google Drive 위치:</strong> 지정한 "Google Drive Folder" 이름으로 루트에 생성</li>
+                    <li><strong>초기 설정:</strong> "📥 Download Only"로 Google Drive 내용을 로컬에 복제</li>
+                    <li><strong>일상 작업:</strong> "🔄 Sync Both Ways"로 양방향 동기화</li>
+                    <li><strong>백업:</strong> "📤 Upload Only"로 로컬 변경사항만 업로드</li>
+                    <li><strong>복원:</strong> "📥 Download Only"로 Google Drive에서 복원</li>
                 </ul>
-                <p><strong>🔄 동기화 모드:</strong></p>
+                <p><strong>💡 팁:</strong></p>
                 <ul>
-                    <li><strong>Always sync:</strong> 모든 파일을 항상 업로드 (가장 안전하지만 느림)</li>
-                    <li><strong>Modified time:</strong> 로컬 파일이 더 최근에 수정된 경우만 동기화 (권장)</li>
-                    <li><strong>Content checksum:</strong> 파일 내용 해시를 비교하여 실제 변경된 경우만 동기화 (가장 정확하지만 느림)</li>
+                    <li>먼저 "Preview Sync"로 동기화될 파일 확인</li>
+                    <li>"Create Missing Folders" 옵션으로 폴더 구조 자동 생성</li>
+                    <li>Auto Sync 기능으로 정기적 자동 동기화</li>
                 </ul>
-                <p><strong>💡 팁:</strong> "Preview Sync" 버튼으로 동기화 대상 파일을 미리 확인하세요!</p>
             </div>
         `;
     }
@@ -1554,17 +2070,14 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         const modal = new FolderTreeModal(this.app, this.plugin, async (selectedFolder) => {
             const folderPath = selectedFolder.path;
             
-            // 중복 체크
             if (this.plugin.settings.syncFolders.includes(folderPath)) {
                 new Notice(`Folder "${folderPath || 'Vault Root'}" is already selected`);
                 return;
             }
             
-            // 폴더 추가
             this.plugin.settings.syncFolders.push(folderPath);
             await this.plugin.saveSettings();
             
-            // UI 업데이트
             const currentFoldersEl = document.querySelector('.current-folders') as HTMLElement;
             if (currentFoldersEl) {
                 this.updateCurrentFoldersDisplay(currentFoldersEl);
@@ -1576,56 +2089,146 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         modal.open();
     }
 
-    // 동기화 미리보기
+    // 동기화 미리보기 - 양방향 지원 버전
     private async previewSync() {
-        if (this.plugin.settings.syncWholeVault) {
-            // 전체 vault 미리보기
-            const allFiles = this.plugin.app.vault.getFiles();
-            const filesToSync = allFiles.filter(file => this.plugin.shouldSyncFileType(file));
-            
-            console.log('=== WHOLE VAULT SYNC PREVIEW ===');
+        if (!this.plugin.isAuthenticated()) {
+            new Notice('❌ Please authenticate first');
+            return;
+        }
+
+        try {
+            console.log('=== BIDIRECTIONAL SYNC PREVIEW ===');
             console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
-            console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
+            console.log(`Sync direction: ${this.plugin.settings.syncDirection}`);
+            console.log(`Conflict resolution: ${this.plugin.settings.conflictResolution}`);
+            console.log(`Include subfolders: ${this.plugin.settings.includeSubfolders}`);
+            console.log(`Create missing folders: ${this.plugin.settings.createMissingFolders}`);
             console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never'}`);
-            console.log(`Files to sync (${filesToSync.length}):`);
-            filesToSync.forEach(file => {
+
+            // 로컬 파일 수집
+            let localFiles: TFile[] = [];
+            if (this.plugin.settings.syncWholeVault) {
+                const allFiles = this.plugin.app.vault.getFiles();
+                localFiles = allFiles.filter(file => this.plugin.shouldSyncFileType(file));
+                console.log(`\n📱 LOCAL FILES (Whole Vault): ${localFiles.length} files`);
+            } else {
+                if (this.plugin.settings.syncFolders.length === 0) {
+                    new Notice('❌ No folders selected for sync');
+                    return;
+                }
+
+                console.log(`\n📱 LOCAL FILES (Selected Folders):`);
+                for (const folderPath of this.plugin.settings.syncFolders) {
+                    const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
+                    if (folder && folder instanceof TFolder) {
+                        const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
+                        localFiles.push(...files);
+                        console.log(`  📁 ${folderPath || 'Vault Root'}: ${files.length} files`);
+                    }
+                }
+            }
+
+            localFiles.forEach(file => {
                 const modTime = new Date(file.stat.mtime).toLocaleString();
-                console.log(`  - ${file.path} (modified: ${modTime})`);
+                console.log(`    - ${file.path} (modified: ${modTime})`);
             });
-            
-            new Notice(`📋 Found ${filesToSync.length} files to sync from whole vault. Check console for details.`);
-        } else {
-            // 선택된 폴더들 미리보기
-            if (this.plugin.settings.syncFolders.length === 0) {
-                new Notice('❌ No folders selected for sync');
+
+            // Google Drive 파일 수집
+            const driveFolder = await this.plugin.getOrCreateDriveFolder();
+            if (!driveFolder) {
+                new Notice('❌ Failed to access Google Drive folder');
                 return;
             }
 
-            let totalFiles = 0;
-            console.log('=== SELECTED FOLDERS SYNC PREVIEW ===');
-            console.log(`Google Drive folder: ${this.plugin.settings.driveFolder}`);
-            console.log(`Include subfolders: ${this.plugin.settings.includeSubfolders}`);
-            console.log(`Sync mode: ${this.plugin.settings.syncMode}`);
-            console.log(`Last sync: ${this.plugin.settings.lastSyncTime ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never'}`);
-            console.log(`Selected folders (${this.plugin.settings.syncFolders.length}):`);
+            const driveFiles = await this.plugin.getAllFilesFromDrive(driveFolder.id);
+            console.log(`\n☁️ GOOGLE DRIVE FILES: ${driveFiles.length} files`);
+            driveFiles.forEach(file => {
+                const modTime = new Date(file.modifiedTime).toLocaleString();
+                console.log(`    - ${file.path} (modified: ${modTime})`);
+            });
 
-            for (const folderPath of this.plugin.settings.syncFolders) {
-                const folder = this.plugin.app.vault.getAbstractFileByPath(folderPath);
-                if (folder && folder instanceof TFolder) {
-                    const files = await this.plugin.collectFilesToSync(folder, this.plugin.settings.includeSubfolders);
-                    totalFiles += files.length;
+            // 동기화 분석
+            const localFileMap = new Map<string, TFile>();
+            localFiles.forEach(file => localFileMap.set(file.path, file));
+
+            const driveFileMap = new Map<string, any>();
+            driveFiles.forEach(file => driveFileMap.set(file.path, file));
+
+            const allPaths = new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
+
+            let toUpload = 0;
+            let toDownload = 0;
+            let conflicts = 0;
+            let skipped = 0;
+
+            console.log(`\n🔍 SYNC ANALYSIS:`);
+            for (const filePath of allPaths) {
+                const localFile = localFileMap.get(filePath);
+                const driveFile = driveFileMap.get(filePath);
+
+                if (localFile && driveFile) {
+                    // 충돌 가능성
+                    const localModTime = localFile.stat.mtime;
+                    const driveModTime = new Date(driveFile.modifiedTime).getTime();
                     
-                    console.log(`\n📁 ${folderPath || 'Vault Root'} (${files.length} files):`);
-                    files.forEach(file => {
-                        const modTime = new Date(file.stat.mtime).toLocaleString();
-                        console.log(`  - ${file.path} (modified: ${modTime})`);
-                    });
-                } else {
-                    console.log(`\n❌ Folder not found: ${folderPath}`);
+                    if (this.plugin.settings.syncDirection === 'bidirectional') {
+                        if (localModTime !== driveModTime) {
+                            conflicts++;
+                            console.log(`  ⚠️ CONFLICT: ${filePath} (local: ${new Date(localModTime).toLocaleString()}, remote: ${new Date(driveModTime).toLocaleString()})`);
+                        } else {
+                            skipped++;
+                            console.log(`  ⏭️ SKIP: ${filePath} (same modification time)`);
+                        }
+                    } else if (this.plugin.settings.syncDirection === 'upload') {
+                        if (localModTime > driveModTime) {
+                            toUpload++;
+                            console.log(`  📤 UPLOAD: ${filePath}`);
+                        } else {
+                            skipped++;
+                            console.log(`  ⏭️ SKIP: ${filePath} (remote is newer or same)`);
+                        }
+                    } else if (this.plugin.settings.syncDirection === 'download') {
+                        if (driveModTime > localModTime) {
+                            toDownload++;
+                            console.log(`  📥 DOWNLOAD: ${filePath}`);
+                        } else {
+                            skipped++;
+                            console.log(`  ⏭️ SKIP: ${filePath} (local is newer or same)`);
+                        }
+                    }
+                } else if (localFile && !driveFile) {
+                    if (this.plugin.settings.syncDirection !== 'download') {
+                        toUpload++;
+                        console.log(`  📤 UPLOAD NEW: ${filePath}`);
+                    } else {
+                        skipped++;
+                        console.log(`  ⏭️ SKIP: ${filePath} (local only, download mode)`);
+                    }
+                } else if (!localFile && driveFile) {
+                    if (this.plugin.settings.syncDirection !== 'upload') {
+                        toDownload++;
+                        console.log(`  📥 DOWNLOAD NEW: ${filePath}`);
+                    } else {
+                        skipped++;
+                        console.log(`  ⏭️ SKIP: ${filePath} (remote only, upload mode)`);
+                    }
                 }
             }
-            
-            new Notice(`📋 Found ${totalFiles} files to sync from ${this.plugin.settings.syncFolders.length} folders. Check console for details.`);
+
+            const summary = [
+                `📤 To Upload: ${toUpload}`,
+                `📥 To Download: ${toDownload}`,
+                `⚠️ Conflicts: ${conflicts}`,
+                `⏭️ Skipped: ${skipped}`,
+                `📁 Total Files: ${allPaths.size}`
+            ].join(', ');
+
+            console.log(`\n📋 SUMMARY: ${summary}`);
+            new Notice(`📋 Sync Preview: ${summary}. Check console for details.`);
+
+        } catch (error) {
+            console.error('Preview sync error:', error);
+            new Notice('❌ Failed to preview sync. Check console for details.');
         }
     }
 }
