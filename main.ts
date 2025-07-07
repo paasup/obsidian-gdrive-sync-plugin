@@ -957,7 +957,7 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // 메인 동기화 메서드
-    async syncWithGoogleDrive(showProgress: boolean = false): Promise<SyncResult> {
+    async syncWithGoogleDrive(showProgress: boolean = true): Promise<SyncResult> {
         if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
             new Notice('Please configure Google Drive API credentials in settings');
             return this.createEmptyResult();
@@ -968,6 +968,7 @@ export default class GDriveSyncPlugin extends Plugin {
             return this.createEmptyResult();
         }
     
+        // 진행 상황을 표시하지 않는 경우에만 간단한 알림
         if (!showProgress) {
             new Notice('Starting Google Drive sync...');
         }
@@ -981,6 +982,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
             let result: SyncResult;
     
+            // 설정된 sync direction에 따라 실행
             if (this.settings.syncDirection === 'upload') {
                 result = await this.uploadToGoogleDrive(showProgress);
             } else if (this.settings.syncDirection === 'download') {
@@ -2061,7 +2063,7 @@ export default class GDriveSyncPlugin extends Plugin {
         }
 
         this.syncIntervalId = window.setInterval(() => {
-            this.syncWithGoogleDrive();
+            this.syncWithGoogleDrive(false);
         }, this.settings.syncInterval);
     }
 
@@ -2239,6 +2241,27 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     }
                 }));
 
+
+        new Setting(containerEl)
+            .setName('Test API Connection')
+            .setDesc('Test your current access token with Google Drive API')
+            .addButton(button => button
+                .setButtonText('Test Connection')
+                .onClick(async () => {
+                    await this.plugin.testDriveAPIConnection();
+                }));
+    
+        new Setting(containerEl)
+            .setName('Sign Out')
+            .setDesc('Revoke Google Drive access and sign out')
+            .addButton(button => button
+                .setButtonText('Sign Out')
+                .setWarning()
+                .onClick(async () => {
+                    await this.plugin.revokeGoogleDriveAccess();
+                    this.display(); // Refresh display
+                }));
+    
         // Sync Configuration
         containerEl.createEl('h3', { text: 'Sync Configuration' });
 
@@ -2400,83 +2423,14 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         containerEl.createEl('h3', { text: 'Sync Actions' });
 
         new Setting(containerEl)
-            .setName('Full Bidirectional Sync')
-            .setDesc('Perform complete bidirectional synchronization with detailed progress')
+            .setName('Start Sync')
+            .setDesc('Execute synchronization based on current sync direction setting')
             .addButton(button => button
-                .setButtonText('🔄 Sync Both Ways')
+                .setButtonText('🚀 Start Sync')
                 .setCta()
                 .onClick(async () => {
-                    const originalDirection = this.plugin.settings.syncDirection;
-                    this.plugin.settings.syncDirection = 'bidirectional';
-                    
-                    try {
-                        await this.plugin.bidirectionalSync(true); // 진행 상태 표시
-                    } finally {
-                        this.plugin.settings.syncDirection = originalDirection;
-                    }
-                }));
-
-        new Setting(containerEl)
-            .setName('Upload to Google Drive')
-            .setDesc('Upload only: Send local files to Google Drive with progress tracking')
-            .addButton(button => button
-                .setButtonText('📤 Upload Only')
-                .onClick(async () => {
-                    await this.plugin.uploadToGoogleDrive(true); // 진행 상태 표시
-                }));
-
-        new Setting(containerEl)
-            .setName('Download from Google Drive')
-            .setDesc('Download only: Get files from Google Drive with progress tracking')
-            .addButton(button => button
-                .setButtonText('📥 Download Only')
-                .onClick(async () => {
-                    await this.plugin.downloadFromGoogleDrive(true); // 진행 상태 표시
-                }));
-
-        new Setting(containerEl)
-            .setName('Preview Sync')
-            .setDesc('Show what files would be synced (without actually syncing)')
-            .addButton(button => button
-                .setButtonText('Preview')
-                .onClick(async () => {
-                    await this.previewSync();
-                }));
-
-        // Testing & Debugging
-        containerEl.createEl('h3', { text: 'Testing & Debugging' });
-
-        new Setting(containerEl)
-            .setName('Test API Connection')
-            .setDesc('Test your current access token with Google Drive API')
-            .addButton(button => button
-                .setButtonText('Test Connection')
-                .onClick(async () => {
-                    await this.plugin.testDriveAPIConnection();
-                }));
-
-        new Setting(containerEl)
-            .setName('Browse Google Drive Folders')
-            .setDesc('View and manage Google Drive folder structure')
-            .addButton(button => button
-                .setButtonText('Browse Folders')
-                .onClick(async () => {
-                    if (!this.plugin.isAuthenticated()) {
-                        new Notice('❌ Please authenticate with Google Drive first');
-                        return;
-                    }
-                    await this.openDriveFolderBrowser();
-                }));
-
-        new Setting(containerEl)
-            .setName('Sign Out')
-            .setDesc('Revoke Google Drive access and sign out')
-            .addButton(button => button
-                .setButtonText('Sign Out')
-                .setWarning()
-                .onClick(async () => {
-                    await this.plugin.revokeGoogleDriveAccess();
-                    this.display(); // Refresh display
+                    // 항상 진행 상황 표시
+                    await this.plugin.syncWithGoogleDrive(true);
                 }));
 
         // Authentication Status

@@ -687,7 +687,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     return !!this.settings.accessToken;
   }
   // 메인 동기화 메서드
-  async syncWithGoogleDrive(showProgress = false) {
+  async syncWithGoogleDrive(showProgress = true) {
     if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
       new import_obsidian.Notice("Please configure Google Drive API credentials in settings");
       return this.createEmptyResult();
@@ -1564,7 +1564,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       window.clearInterval(this.syncIntervalId);
     }
     this.syncIntervalId = window.setInterval(() => {
-      this.syncWithGoogleDrive();
+      this.syncWithGoogleDrive(false);
     }, this.settings.syncInterval);
   }
   resetGoogleAPIState() {
@@ -1674,6 +1674,13 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         }, 1e3);
       }
     }));
+    new import_obsidian.Setting(containerEl).setName("Test API Connection").setDesc("Test your current access token with Google Drive API").addButton((button) => button.setButtonText("Test Connection").onClick(async () => {
+      await this.plugin.testDriveAPIConnection();
+    }));
+    new import_obsidian.Setting(containerEl).setName("Sign Out").setDesc("Revoke Google Drive access and sign out").addButton((button) => button.setButtonText("Sign Out").setWarning().onClick(async () => {
+      await this.plugin.revokeGoogleDriveAccess();
+      this.display();
+    }));
     containerEl.createEl("h3", { text: "Sync Configuration" });
     new import_obsidian.Setting(containerEl).setName("Google Drive Root Folder").setDesc("Name of the root folder to create/use in Google Drive").addText((text) => text.setPlaceholder("e.g., Obsidian-Sync").setValue(this.plugin.settings.driveFolder).onChange(async (value) => {
       this.plugin.settings.driveFolder = value;
@@ -1741,38 +1748,8 @@ var GDriveSyncSettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.saveSettings();
     }));
     containerEl.createEl("h3", { text: "Sync Actions" });
-    new import_obsidian.Setting(containerEl).setName("Full Bidirectional Sync").setDesc("Perform complete bidirectional synchronization with detailed progress").addButton((button) => button.setButtonText("\u{1F504} Sync Both Ways").setCta().onClick(async () => {
-      const originalDirection = this.plugin.settings.syncDirection;
-      this.plugin.settings.syncDirection = "bidirectional";
-      try {
-        await this.plugin.bidirectionalSync(true);
-      } finally {
-        this.plugin.settings.syncDirection = originalDirection;
-      }
-    }));
-    new import_obsidian.Setting(containerEl).setName("Upload to Google Drive").setDesc("Upload only: Send local files to Google Drive with progress tracking").addButton((button) => button.setButtonText("\u{1F4E4} Upload Only").onClick(async () => {
-      await this.plugin.uploadToGoogleDrive(true);
-    }));
-    new import_obsidian.Setting(containerEl).setName("Download from Google Drive").setDesc("Download only: Get files from Google Drive with progress tracking").addButton((button) => button.setButtonText("\u{1F4E5} Download Only").onClick(async () => {
-      await this.plugin.downloadFromGoogleDrive(true);
-    }));
-    new import_obsidian.Setting(containerEl).setName("Preview Sync").setDesc("Show what files would be synced (without actually syncing)").addButton((button) => button.setButtonText("Preview").onClick(async () => {
-      await this.previewSync();
-    }));
-    containerEl.createEl("h3", { text: "Testing & Debugging" });
-    new import_obsidian.Setting(containerEl).setName("Test API Connection").setDesc("Test your current access token with Google Drive API").addButton((button) => button.setButtonText("Test Connection").onClick(async () => {
-      await this.plugin.testDriveAPIConnection();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Browse Google Drive Folders").setDesc("View and manage Google Drive folder structure").addButton((button) => button.setButtonText("Browse Folders").onClick(async () => {
-      if (!this.plugin.isAuthenticated()) {
-        new import_obsidian.Notice("\u274C Please authenticate with Google Drive first");
-        return;
-      }
-      await this.openDriveFolderBrowser();
-    }));
-    new import_obsidian.Setting(containerEl).setName("Sign Out").setDesc("Revoke Google Drive access and sign out").addButton((button) => button.setButtonText("Sign Out").setWarning().onClick(async () => {
-      await this.plugin.revokeGoogleDriveAccess();
-      this.display();
+    new import_obsidian.Setting(containerEl).setName("Start Sync").setDesc("Execute synchronization based on current sync direction setting").addButton((button) => button.setButtonText("\u{1F680} Start Sync").setCta().onClick(async () => {
+      await this.plugin.syncWithGoogleDrive(true);
     }));
     containerEl.createEl("h3", { text: "Status Information" });
     const statusEl = containerEl.createEl("div");
