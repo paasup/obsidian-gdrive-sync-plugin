@@ -537,6 +537,26 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     super(...arguments);
     this.syncIntervalId = null;
     this.isGoogleApiLoaded = false;
+    this.folderCache = {};
+  }
+  // 폴더 캐시 초기화 메서드
+  clearFolderCache() {
+    this.folderCache = {};
+    console.log("\u{1F4C1} Folder cache cleared");
+  }
+  // 캐시된 폴더 ID 가져오기 또는 생성
+  async getCachedFolderId(folderPath, rootFolderId) {
+    if (this.folderCache[folderPath]) {
+      console.log(`\u{1F680} Using cached folder ID for: ${folderPath}`);
+      return this.folderCache[folderPath];
+    }
+    console.log(`\u{1F50D} Creating/finding folder structure: ${folderPath}`);
+    const folderId = await this.createNestedFolders(folderPath, rootFolderId);
+    if (folderId) {
+      this.folderCache[folderPath] = folderId;
+      console.log(`\u{1F4BE} Cached folder ID for: ${folderPath} -> ${folderId}`);
+    }
+    return folderId;
   }
   async onload() {
     await this.loadSettings();
@@ -722,14 +742,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   }
   // 업로드 전용 메서드
   async uploadToGoogleDrive(showProgress = false) {
-    console.log("Starting upload to Google Drive...");
+    console.log("Starting optimized upload to Google Drive...");
     const result = this.createEmptyResult();
+    this.clearFolderCache();
     let progressModal = void 0;
     if (showProgress) {
       progressModal = new SyncProgressModal(this.app);
       progressModal.open();
       progressModal.addLog("\u{1F50D} Collecting files to upload...");
-      progressModal.updateStatus("Preparing upload...", "info");
+      progressModal.updateStatus("Preparing optimized upload...", "info");
     }
     try {
       let allFiles = [];
@@ -744,7 +765,8 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         folderTargets.push({
           files: allFiles,
           folderId: rootFolder.id,
-          name: rootFolder.name
+          name: rootFolder.name,
+          basePath: ""
         });
       } else {
         progressModal == null ? void 0 : progressModal.addLog("\u{1F4C2} Sync mode: Selected Folders");
@@ -753,50 +775,27 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           folderTargets.push({
             files: localFiles,
             folderId: driveFolder.id,
-            name: driveFolder.name
+            name: driveFolder.name,
+            basePath: driveFolder.path
           });
           allFiles.push(...localFiles);
         }
       }
       progressModal == null ? void 0 : progressModal.addLog(`\u{1F4CB} Found ${allFiles.length} files to process`);
-      progressModal == null ? void 0 : progressModal.updateProgress(0, allFiles.length);
-      let processedFiles = 0;
       for (const target of folderTargets) {
         if (progressModal == null ? void 0 : progressModal.shouldCancel()) {
           progressModal.markCancelled();
           return result;
         }
         progressModal == null ? void 0 : progressModal.addLog(`\u{1F4E4} Processing folder: ${target.name} (${target.files.length} files)`);
-        for (const file of target.files) {
-          if (progressModal == null ? void 0 : progressModal.shouldCancel()) {
-            progressModal.markCancelled();
-            return result;
-          }
-          try {
-            progressModal == null ? void 0 : progressModal.updateProgress(processedFiles, allFiles.length, `Uploading: ${file.name}`);
-            progressModal == null ? void 0 : progressModal.addLog(`\u{1F4E4} ${file.path}`);
-            const syncResult = await this.syncFileToGoogleDrive(file, target.folderId);
-            if (syncResult === "skipped") {
-              result.skipped++;
-              progressModal == null ? void 0 : progressModal.addLog(`\u23ED\uFE0F Skipped: ${file.name} (no changes)`);
-            } else if (syncResult === true) {
-              result.uploaded++;
-              progressModal == null ? void 0 : progressModal.addLog(`\u2705 Uploaded: ${file.name}`);
-            } else {
-              result.errors++;
-              progressModal == null ? void 0 : progressModal.addLog(`\u274C Failed: ${file.name}`);
-            }
-          } catch (error) {
-            result.errors++;
-            progressModal == null ? void 0 : progressModal.addLog(`\u274C Error uploading ${file.name}: ${error.message || "Unknown error"}`);
-          }
-          processedFiles++;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        progressModal == null ? void 0 : progressModal.addLog("\u{1F680} Pre-creating folder structure...");
+        await this.preCreateFolderStructures(target.files, target.folderId, target.basePath, progressModal);
+        progressModal == null ? void 0 : progressModal.addLog("\u{1F4E4} Starting file uploads...");
+        await this.batchUploadFiles(target.files, target.folderId, target.basePath, result, progressModal, allFiles.length);
       }
       this.settings.lastSyncTime = Date.now();
       await this.saveSettings();
-      progressModal == null ? void 0 : progressModal.addLog("\u{1F389} Upload completed successfully!");
+      progressModal == null ? void 0 : progressModal.addLog("\u{1F389} Optimized upload completed successfully!");
       if (!showProgress) {
         this.reportSyncResult(result);
       } else if (progressModal) {
@@ -815,6 +814,102 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       result.errors++;
     }
     return result;
+  }
+  // 폴더 구조 미리 생성 메서드
+  async preCreateFolderStructures(files, rootFolderId, baseFolder, progressModal) {
+    const requiredFolders = /* @__PURE__ */ new Set();
+    for (const file of files) {
+      let relativePath = file.path;
+      if (baseFolder && file.path.startsWith(baseFolder + "/")) {
+        relativePath = file.path.substring(baseFolder.length + 1);
+      } else if (!baseFolder) {
+        relativePath = file.path;
+      }
+      if (relativePath.includes("/")) {
+        const pathParts = relativePath.split("/");
+        pathParts.pop();
+        const folderPath = pathParts.join("/");
+        const parts = folderPath.split("/");
+        for (let i = 1; i <= parts.length; i++) {
+          const partialPath = parts.slice(0, i).join("/");
+          requiredFolders.add(partialPath);
+        }
+      }
+    }
+    progressModal == null ? void 0 : progressModal.addLog(`\u{1F4C1} Need to ensure ${requiredFolders.size} folder paths exist`);
+    const sortedFolders = Array.from(requiredFolders).sort((a, b) => {
+      const depthA = a.split("/").length;
+      const depthB = b.split("/").length;
+      return depthA - depthB;
+    });
+    for (const folderPath of sortedFolders) {
+      if (progressModal == null ? void 0 : progressModal.shouldCancel())
+        return;
+      if (!this.folderCache[folderPath]) {
+        await this.getCachedFolderId(folderPath, rootFolderId);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+    progressModal == null ? void 0 : progressModal.addLog(`\u2705 Folder structure ready (${Object.keys(this.folderCache).length} folders cached)`);
+  }
+  // 배치 파일 업로드 메서드
+  async batchUploadFiles(files, rootFolderId, baseFolder, result, progressModal, totalFiles = 0) {
+    let processedFiles = 0;
+    for (const file of files) {
+      if (progressModal == null ? void 0 : progressModal.shouldCancel())
+        return;
+      try {
+        progressModal == null ? void 0 : progressModal.updateProgress(processedFiles, totalFiles || files.length, `Processing: ${file.name}`);
+        const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId, baseFolder);
+        if (syncResult === "skipped") {
+          result.skipped++;
+        } else if (syncResult === true) {
+          result.uploaded++;
+          progressModal == null ? void 0 : progressModal.addLog(`\u2705 ${file.name}`);
+        } else {
+          result.errors++;
+          progressModal == null ? void 0 : progressModal.addLog(`\u274C ${file.name}`);
+        }
+      } catch (error) {
+        result.errors++;
+        progressModal == null ? void 0 : progressModal.addLog(`\u274C ${file.name}: ${error.message || "Error"}`);
+      }
+      processedFiles++;
+      if (processedFiles % 10 === 0) {
+        progressModal == null ? void 0 : progressModal.addLog(`\u{1F4CA} Progress: ${result.uploaded} uploaded, ${result.skipped} skipped, ${result.errors} errors`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  // 기존 createNestedFolders 메서드는 그대로 유지하되, 캐시 활용
+  async createNestedFolders(folderPath, rootFolderId) {
+    const pathParts = folderPath.split("/");
+    let currentFolderId = rootFolderId;
+    let currentPath = "";
+    for (const folderName of pathParts) {
+      if (!folderName)
+        continue;
+      currentPath = currentPath ? `${currentPath}/${folderName}` : folderName;
+      if (this.folderCache[currentPath]) {
+        currentFolderId = this.folderCache[currentPath];
+        continue;
+      }
+      const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
+      if (existingFolder) {
+        currentFolderId = existingFolder.id;
+        this.folderCache[currentPath] = currentFolderId;
+        console.log(`\u2713 Found and cached existing folder: ${folderName} at ${currentPath}`);
+      } else {
+        const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
+        if (!newFolder) {
+          throw new Error(`Failed to create folder: ${folderName}`);
+        }
+        currentFolderId = newFolder.id;
+        this.folderCache[currentPath] = currentFolderId;
+        console.log(`\u{1F4C1} Created and cached folder: ${folderName} at ${currentPath}`);
+      }
+    }
+    return currentFolderId;
   }
   // 다운로드 전용 메서드
   async downloadFromGoogleDrive(showProgress = false) {
@@ -948,10 +1043,14 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   async getLocalFilesForDriveFolder(driveFolder) {
     const localFiles = [];
     const localFolderPath = driveFolder.path;
+    console.log(`Looking for local files in: ${localFolderPath} (for Drive folder: ${driveFolder.name})`);
     const localFolder = this.app.vault.getAbstractFileByPath(localFolderPath);
     if (localFolder instanceof import_obsidian.TFolder) {
       const files = await this.collectFilesToSync(localFolder, this.settings.includeSubfolders);
       localFiles.push(...files);
+      console.log(`Found ${files.length} files in local folder: ${localFolderPath}`);
+    } else {
+      console.log(`Local folder not found: ${localFolderPath}`);
     }
     return localFiles;
   }
@@ -995,7 +1094,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
         } else if (!localFile && driveFile) {
           progressModal == null ? void 0 : progressModal.addLog(`\u{1F4E5} Download only: ${filePath}`);
-          await this.downloadFileFromDrive(driveFile, result, baseFolder);
+          await this.downloadFileFromDrive(driveFile, result);
         }
       } catch (error) {
         console.error(`Error syncing file ${filePath}:`, error);
@@ -1010,7 +1109,7 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
   async downloadFileFromDrive(driveFile, result, baseFolder = "") {
     try {
       let filePath = driveFile.path;
-      if (baseFolder && !filePath.startsWith(baseFolder)) {
+      if (baseFolder && !filePath.startsWith(baseFolder + "/") && filePath !== baseFolder) {
         filePath = baseFolder + "/" + filePath;
       }
       const localFile = this.app.vault.getAbstractFileByPath(filePath);
@@ -1029,15 +1128,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const remoteModTime = new Date(driveFile.modifiedTime).getTime();
       if (localFile instanceof import_obsidian.TFile) {
         await this.app.vault.modify(localFile, content);
-        console.log(`\u{1F504} Updated local file: ${filePath}`);
+        console.log(`\u{1F504} ${localFile.name}: Updated`);
       } else {
         await this.app.vault.create(filePath, content);
-        console.log(`\u{1F4E5} Downloaded new file: ${filePath}`);
+        console.log(`\u{1F4E5} ${driveFile.name}: Downloaded`);
       }
       await this.syncFileTime(filePath, remoteModTime);
       result.downloaded++;
     } catch (error) {
-      console.error(`Error downloading file ${driveFile.path}:`, error);
+      console.error(`\u274C ${driveFile.name}: Download failed - ${error.message}`);
       throw error;
     }
   }
@@ -1052,10 +1151,10 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
           const fullPath = path.join(adapter.basePath, filePath);
           const targetDate = new Date(targetTime);
           await fs.utimes(fullPath, targetDate, targetDate);
-          console.log(`\u23F0 Synced file time: ${filePath} -> ${targetDate.toLocaleString()}`);
+          console.log(`\u23F0 ${path.basename(filePath)}: Time synced to ${targetDate.toLocaleString()}`);
           return;
         } catch (fsError) {
-          console.warn(`\u26A0\uFE0F Direct filesystem access failed: ${fsError}`);
+          console.warn(`\u26A0\uFE0F ${filePath}: Direct FS time sync failed`);
         }
       }
       try {
@@ -1063,15 +1162,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         if (file instanceof import_obsidian.TFile) {
           if (file.stat && file.stat.mtime !== void 0) {
             file.stat.mtime = targetTime;
-            console.log(`\u23F0 Updated file stat time: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+            console.log(`\u23F0 ${file.name}: API time sync to ${new Date(targetTime).toLocaleString()}`);
             return;
           }
         }
       } catch (obsidianError) {
-        console.warn(`\u26A0\uFE0F Obsidian API time sync failed: ${obsidianError}`);
+        console.warn(`\u26A0\uFE0F ${filePath}: API time sync failed`);
       }
     } catch (error) {
-      console.warn(`\u26A0\uFE0F File time sync failed for ${filePath}:`, error);
+      console.warn(`\u26A0\uFE0F ${filePath}: Time sync failed - ${error.message}`);
     }
   }
   // 로컬 폴더 구조 생성
@@ -1168,7 +1267,12 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         }
         const data = response.json;
         for (const file of data.files || []) {
-          const filePath = basePath ? `${basePath}/${file.name}` : file.name;
+          let filePath;
+          if (basePath) {
+            filePath = `${basePath}/${file.name}`;
+          } else {
+            filePath = file.name;
+          }
           if (file.mimeType === "application/vnd.google-apps.folder") {
             if (this.settings.includeSubfolders) {
               const subFiles = await this.getAllFilesFromDrive(file.id, filePath);
@@ -1178,7 +1282,9 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
             allFiles.push({
               ...file,
               path: filePath
+              // 이미 완전한 경로
             });
+            console.log(`Found file: ${file.name}, assigned path: ${filePath}`);
           }
         }
         pageToken = data.nextPageToken || "";
@@ -1197,16 +1303,25 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       case "modified":
         const localModTime = localFile.stat.mtime;
         const driveModTime = new Date(driveFile.modifiedTime).getTime();
-        return driveModTime > localModTime;
+        const timeDiff = Math.abs(localModTime - driveModTime);
+        const isNewer = driveModTime > localModTime + 1e3;
+        if (isNewer) {
+          console.log(`\u{1F4E5} ${localFile.name}: Remote newer (${new Date(driveModTime).toLocaleString()} > ${new Date(localModTime).toLocaleString()})`);
+        } else {
+          console.log(`\u23ED\uFE0F ${localFile.name}: Skip (times synced)`);
+        }
+        return isNewer;
       case "checksum":
         try {
           const localContent = await this.app.vault.read(localFile);
           const localHash = await this.calculateFileHash(localContent);
           const driveContent = await this.getFileContentFromDrive(driveFile.id);
           const driveHash = await this.calculateFileHash(driveContent);
-          return localHash !== driveHash;
+          const isDifferent = localHash !== driveHash;
+          console.log(`${isDifferent ? "\u{1F4E5}" : "\u23ED\uFE0F"} ${localFile.name}: ${isDifferent ? "Content differs" : "Content same"}`);
+          return isDifferent;
         } catch (error) {
-          console.error("Error comparing file checksums:", error);
+          console.error(`\u274C ${localFile.name}: Checksum error - ${error.message}`);
           return true;
         }
       default:
@@ -1278,6 +1393,44 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
     const shouldExclude = excludePatterns.some((pattern) => pattern.test(file.name));
     return hasValidExtension && !shouldExclude;
   }
+  async shouldSyncFile(localFile, driveFile) {
+    switch (this.settings.syncMode) {
+      case "always":
+        return true;
+      case "modified":
+        if (!driveFile) {
+          return true;
+        }
+        const localModTime = localFile.stat.mtime;
+        const driveModTime = new Date(driveFile.modifiedTime).getTime();
+        const timeDiff = Math.abs(localModTime - driveModTime);
+        const isNewer = localModTime > driveModTime + 1e3;
+        if (isNewer) {
+          console.log(`\u{1F4E4} ${localFile.name}: Local newer (${new Date(localModTime).toLocaleString()} > ${new Date(driveModTime).toLocaleString()})`);
+        } else {
+          console.log(`\u23ED\uFE0F ${localFile.name}: Skip (times synced)`);
+        }
+        return isNewer;
+      case "checksum":
+        if (!driveFile) {
+          return true;
+        }
+        try {
+          const localContent = await this.app.vault.read(localFile);
+          const localHash = await this.calculateFileHash(localContent);
+          const driveContent = await this.getFileContentFromDrive(driveFile.id);
+          const driveHash = await this.calculateFileHash(driveContent);
+          const isDifferent = localHash !== driveHash;
+          console.log(`${isDifferent ? "\u{1F4E4}" : "\u23ED\uFE0F"} ${localFile.name}: ${isDifferent ? "Content differs" : "Content same"}`);
+          return isDifferent;
+        } catch (error) {
+          console.error(`\u274C ${localFile.name}: Checksum error - ${error.message}`);
+          return true;
+        }
+      default:
+        return true;
+    }
+  }
   // Google Drive 관련 메서드들
   async getOrCreateDriveFolder() {
     try {
@@ -1330,6 +1483,10 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       let relativePath = file.path;
       if (baseFolder && file.path.startsWith(baseFolder + "/")) {
         relativePath = file.path.substring(baseFolder.length + 1);
+      } else if (baseFolder && file.path === baseFolder) {
+        relativePath = file.name;
+      } else if (!baseFolder) {
+        relativePath = file.path;
       }
       let fileName = file.name;
       let targetFolderId = rootFolderId;
@@ -1337,10 +1494,9 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         const pathParts = relativePath.split("/");
         fileName = pathParts.pop();
         const folderPath = pathParts.join("/");
-        console.log(`Creating folder structure: ${folderPath}`);
-        targetFolderId = await this.createNestedFolders(folderPath, rootFolderId);
+        targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
         if (!targetFolderId) {
-          console.error(`Failed to create folder structure for: ${folderPath}`);
+          console.error(`Failed to get folder ID for: ${folderPath}`);
           return false;
         }
       }
@@ -1353,44 +1509,15 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       const content = await this.app.vault.read(file);
       const localModTime = file.stat.mtime;
       if (existingFile) {
-        console.log(`\u{1F504} Updating ${file.path}`);
+        console.log(`\u{1F504} Updating ${file.path} in Google Drive`);
         return await this.updateFileInDrive(existingFile.id, content, localModTime);
       } else {
-        console.log(`\u{1F4E4} Uploading ${file.path}`);
+        console.log(`\u{1F4E4} Uploading ${file.path} to Google Drive`);
         return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
       }
     } catch (error) {
       console.error(`Error syncing file ${file.path}:`, error);
       return false;
-    }
-  }
-  async shouldSyncFile(localFile, driveFile) {
-    switch (this.settings.syncMode) {
-      case "always":
-        return true;
-      case "modified":
-        if (!driveFile) {
-          return true;
-        }
-        const localModTime = localFile.stat.mtime;
-        const driveModTime = new Date(driveFile.modifiedTime).getTime();
-        return localModTime > driveModTime;
-      case "checksum":
-        if (!driveFile) {
-          return true;
-        }
-        try {
-          const localContent = await this.app.vault.read(localFile);
-          const localHash = await this.calculateFileHash(localContent);
-          const driveContent = await this.getFileContentFromDrive(driveFile.id);
-          const driveHash = await this.calculateFileHash(driveContent);
-          return localHash !== driveHash;
-        } catch (error) {
-          console.error("Error comparing file checksums:", error);
-          return true;
-        }
-      default:
-        return true;
     }
   }
   async calculateFileHash(content) {
@@ -1420,27 +1547,6 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
       console.error("Error downloading file from Drive:", error);
       throw error;
     }
-  }
-  async createNestedFolders(folderPath, rootFolderId) {
-    const pathParts = folderPath.split("/");
-    let currentFolderId = rootFolderId;
-    for (const folderName of pathParts) {
-      if (!folderName)
-        continue;
-      const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
-      if (existingFolder) {
-        currentFolderId = existingFolder.id;
-        console.log(`\u2713 Found existing folder: ${folderName}`);
-      } else {
-        const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
-        if (!newFolder) {
-          throw new Error(`Failed to create folder: ${folderName}`);
-        }
-        currentFolderId = newFolder.id;
-        console.log(`\u{1F4C1} Created folder: ${folderName}`);
-      }
-    }
-    return currentFolderId;
   }
   async findFolderInDrive(folderName, parentFolderId) {
     try {
@@ -1535,15 +1641,21 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         body,
         throw: false
       });
-      return response.status === 200 || response.status === 201;
+      const success = response.status === 200 || response.status === 201;
+      if (success && localModTime) {
+        console.log(`\u{1F4E4} ${fileName}: Uploaded with time ${new Date(localModTime).toLocaleString()}`);
+      } else if (success) {
+        console.log(`\u{1F4E4} ${fileName}: Uploaded`);
+      }
+      return success;
     } catch (error) {
-      console.error("Error uploading file to Drive:", error);
+      console.error(`\u274C ${fileName}: Upload failed - ${error.message}`);
       return false;
     }
   }
   async updateFileInDrive(fileId, content, localModTime) {
     try {
-      const response = await (0, import_obsidian.requestUrl)({
+      const contentResponse = await (0, import_obsidian.requestUrl)({
         url: `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
         method: "PATCH",
         headers: {
@@ -1553,9 +1665,28 @@ var GDriveSyncPlugin = class extends import_obsidian.Plugin {
         body: content,
         throw: false
       });
-      return response.status === 200;
+      if (contentResponse.status !== 200) {
+        return false;
+      }
+      const metadataResponse = await (0, import_obsidian.requestUrl)({
+        url: `https://www.googleapis.com/drive/v3/files/${fileId}`,
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${this.settings.accessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          modifiedTime: new Date(localModTime).toISOString()
+        }),
+        throw: false
+      });
+      const success = metadataResponse.status === 200;
+      if (success) {
+        console.log(`\u{1F504} File updated with time ${new Date(localModTime).toLocaleString()}`);
+      }
+      return success;
     } catch (error) {
-      console.error("Error updating file in Drive:", error);
+      console.error(`\u274C Update failed - ${error.message}`);
       return false;
     }
   }
