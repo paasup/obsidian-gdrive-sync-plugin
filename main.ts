@@ -766,10 +766,42 @@ class ConflictResolutionModal extends Modal {
     }
 }
 
+// 폴더 캐시 인터페이스
+interface FolderCache {
+    [folderPath: string]: string; // folderPath -> folderId 매핑
+}
+
 export default class GDriveSyncPlugin extends Plugin {
     settings: GDriveSyncSettings;
     syncIntervalId: number | null = null;
     public isGoogleApiLoaded = false;
+    private folderCache: FolderCache = {};
+
+    // 폴더 캐시 초기화 메서드
+    private clearFolderCache(): void {
+        this.folderCache = {};
+        console.log('📁 Folder cache cleared');
+    }
+
+    // 캐시된 폴더 ID 가져오기 또는 생성
+    private async getCachedFolderId(folderPath: string, rootFolderId: string): Promise<string> {
+        // 캐시에서 먼저 확인
+        if (this.folderCache[folderPath]) {
+            console.log(`🚀 Using cached folder ID for: ${folderPath}`);
+            return this.folderCache[folderPath];
+        }
+
+        // 캐시에 없으면 생성하고 캐시에 저장
+        console.log(`🔍 Creating/finding folder structure: ${folderPath}`);
+        const folderId = await this.createNestedFolders(folderPath, rootFolderId);
+        
+        if (folderId) {
+            this.folderCache[folderPath] = folderId;
+            console.log(`💾 Cached folder ID for: ${folderPath} -> ${folderId}`);
+        }
+        
+        return folderId;
+    }
 
     async onload() {
         await this.loadSettings();
@@ -1002,22 +1034,25 @@ export default class GDriveSyncPlugin extends Plugin {
 
     // 업로드 전용 메서드
     async uploadToGoogleDrive(showProgress: boolean = false): Promise<SyncResult> {
-        console.log('Starting upload to Google Drive...');
+        console.log('Starting optimized upload to Google Drive...');
         const result = this.createEmptyResult();
-    
+
+        // 폴더 캐시 초기화
+        this.clearFolderCache();
+
         let progressModal: SyncProgressModal | undefined = undefined;
         
         if (showProgress) {
             progressModal = new SyncProgressModal(this.app);
             progressModal.open();
             progressModal.addLog('🔍 Collecting files to upload...');
-            progressModal.updateStatus('Preparing upload...', 'info');
+            progressModal.updateStatus('Preparing optimized upload...', 'info');
         }
-    
+
         try {
             let allFiles: TFile[] = [];
             let folderTargets: Array<{files: TFile[], folderId: string, name: string, basePath: string}> = [];
-    
+
             if (this.settings.syncWholeVault) {
                 progressModal?.addLog('📁 Sync mode: Whole Vault');
                 
@@ -1025,13 +1060,13 @@ export default class GDriveSyncPlugin extends Plugin {
                 if (!rootFolder) {
                     throw new Error('Failed to create or find Google Drive folder');
                 }
-    
+
                 allFiles = this.app.vault.getFiles().filter(file => this.shouldSyncFileType(file));
                 folderTargets.push({
                     files: allFiles,
                     folderId: rootFolder.id,
                     name: rootFolder.name,
-                    basePath: '' // 전체 볼트 동기화 시 basePath 없음
+                    basePath: ''
                 });
             } else {
                 progressModal?.addLog('📂 Sync mode: Selected Folders');
@@ -1042,71 +1077,43 @@ export default class GDriveSyncPlugin extends Plugin {
                         files: localFiles,
                         folderId: driveFolder.id,
                         name: driveFolder.name,
-                        basePath: driveFolder.path // 선택된 폴더의 경로를 basePath로 사용
+                        basePath: driveFolder.path
                     });
                     allFiles.push(...localFiles);
                 }
             }
-    
+
             progressModal?.addLog(`📋 Found ${allFiles.length} files to process`);
-            progressModal?.updateProgress(0, allFiles.length);
-    
-            let processedFiles = 0;
-    
+
+            // 폴더별로 파일들을 그룹화하여 폴더 생성 최적화
             for (const target of folderTargets) {
                 if (progressModal?.shouldCancel()) {
                     progressModal.markCancelled();
                     return result;
                 }
-    
+
                 progressModal?.addLog(`📤 Processing folder: ${target.name} (${target.files.length} files)`);
-                
-                for (const file of target.files) {
-                    if (progressModal?.shouldCancel()) {
-                        progressModal.markCancelled();
-                        return result;
-                    }
-    
-                    try {
-                        progressModal?.updateProgress(processedFiles, allFiles.length, `Uploading: ${file.name}`);
-                        progressModal?.addLog(`📤 ${file.path}`);
-    
-                        const syncResult = await this.syncFileToGoogleDrive(file, target.folderId, target.basePath);
-                        
-                        if (syncResult === 'skipped') {
-                            result.skipped++;
-                            progressModal?.addLog(`⏭️ Skipped: ${file.name} (no changes)`);
-                        } else if (syncResult === true) {
-                            result.uploaded++;
-                            progressModal?.addLog(`✅ Uploaded: ${file.name}`);
-                        } else {
-                            result.errors++;
-                            progressModal?.addLog(`❌ Failed: ${file.name}`);
-                        }
-                    } catch (error) {
-                        result.errors++;
-                        progressModal?.addLog(`❌ Error uploading ${file.name}: ${error.message || 'Unknown error'}`);
-                    }
-    
-                    processedFiles++;
-                    
-                    // 작은 지연으로 UI 업데이트 허용
-                    await new Promise(resolve => setTimeout(resolve, 10));
-                }
+                progressModal?.addLog('🚀 Pre-creating folder structure...');
+
+                // 1단계: 필요한 모든 폴더 구조를 미리 생성 (배치 처리)
+                await this.preCreateFolderStructures(target.files, target.folderId, target.basePath, progressModal);
+
+                // 2단계: 파일 업로드 (폴더 구조는 이미 캐시됨)
+                progressModal?.addLog('📤 Starting file uploads...');
+                await this.batchUploadFiles(target.files, target.folderId, target.basePath, result, progressModal, allFiles.length);
             }
-    
+
             this.settings.lastSyncTime = Date.now();
             await this.saveSettings();
-    
-            progressModal?.addLog('🎉 Upload completed successfully!');
-    
-            // 진행 상태가 표시되지 않는 경우 기존 방식으로 결과 표시
+
+            progressModal?.addLog('🎉 Optimized upload completed successfully!');
+
             if (!showProgress) {
                 this.reportSyncResult(result);
             } else if (progressModal) {
                 progressModal.markCompleted(result);
             }
-    
+
         } catch (error) {
             console.error('Upload error:', error);
             const errorMessage = `Upload error: ${error.message || 'Unknown error'}`;
@@ -1121,8 +1128,142 @@ export default class GDriveSyncPlugin extends Plugin {
             
             result.errors++;
         }
-    
+
         return result;
+    }
+    // 폴더 구조 미리 생성 메서드
+    private async preCreateFolderStructures(
+        files: TFile[], 
+        rootFolderId: string, 
+        baseFolder: string, 
+        progressModal?: SyncProgressModal
+    ): Promise<void> {
+        // 필요한 모든 폴더 경로 수집
+        const requiredFolders = new Set<string>();
+        
+        for (const file of files) {
+            let relativePath = file.path;
+            
+            if (baseFolder && file.path.startsWith(baseFolder + '/')) {
+                relativePath = file.path.substring(baseFolder.length + 1);
+            } else if (!baseFolder) {
+                relativePath = file.path;
+            }
+            
+            if (relativePath.includes('/')) {
+                const pathParts = relativePath.split('/');
+                pathParts.pop(); // 파일명 제거
+                const folderPath = pathParts.join('/');
+                
+                // 중첩된 모든 폴더 경로 추가
+                const parts = folderPath.split('/');
+                for (let i = 1; i <= parts.length; i++) {
+                    const partialPath = parts.slice(0, i).join('/');
+                    requiredFolders.add(partialPath);
+                }
+            }
+        }
+
+        progressModal?.addLog(`📁 Need to ensure ${requiredFolders.size} folder paths exist`);
+
+        // 폴더 경로를 깊이순으로 정렬 (부모 폴더부터 생성)
+        const sortedFolders = Array.from(requiredFolders).sort((a, b) => {
+            const depthA = a.split('/').length;
+            const depthB = b.split('/').length;
+            return depthA - depthB;
+        });
+
+        // 폴더들을 배치로 생성
+        for (const folderPath of sortedFolders) {
+            if (progressModal?.shouldCancel()) return;
+            
+            if (!this.folderCache[folderPath]) {
+                await this.getCachedFolderId(folderPath, rootFolderId);
+                
+                // 폴더 생성 간 작은 지연
+                await new Promise(resolve => setTimeout(resolve, 50));
+            }
+        }
+
+        progressModal?.addLog(`✅ Folder structure ready (${Object.keys(this.folderCache).length} folders cached)`);
+    }
+
+    // 배치 파일 업로드 메서드
+    private async batchUploadFiles(
+        files: TFile[], 
+        rootFolderId: string, 
+        baseFolder: string, 
+        result: SyncResult, 
+        progressModal?: SyncProgressModal,
+        totalFiles: number = 0
+    ): Promise<void> {
+        let processedFiles = 0;
+        
+        for (const file of files) {
+            if (progressModal?.shouldCancel()) return;
+
+            try {
+                progressModal?.updateProgress(processedFiles, totalFiles || files.length, `Uploading: ${file.name}`);
+
+                const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId, baseFolder);
+                
+                if (syncResult === 'skipped') {
+                    result.skipped++;
+                    progressModal?.addLog(`⏭️ Skipped: ${file.name}`);
+                } else if (syncResult === true) {
+                    result.uploaded++;
+                    progressModal?.addLog(`✅ Uploaded: ${file.name}`);
+                } else {
+                    result.errors++;
+                    progressModal?.addLog(`❌ Failed: ${file.name}`);
+                }
+            } catch (error) {
+                result.errors++;
+                progressModal?.addLog(`❌ Error uploading ${file.name}: ${error.message || 'Unknown error'}`);
+            }
+
+            processedFiles++;
+            
+            // 업로드 간 작은 지연으로 API 레이트 리미트 방지
+            await new Promise(resolve => setTimeout(resolve, 10));
+        }
+    }
+
+    // 기존 createNestedFolders 메서드는 그대로 유지하되, 캐시 활용
+    private async createNestedFolders(folderPath: string, rootFolderId: string): Promise<string> {
+        const pathParts = folderPath.split('/');
+        let currentFolderId = rootFolderId;
+        let currentPath = '';
+
+        for (const folderName of pathParts) {
+            if (!folderName) continue;
+            
+            currentPath = currentPath ? `${currentPath}/${folderName}` : folderName;
+            
+            // 캐시에서 먼저 확인
+            if (this.folderCache[currentPath]) {
+                currentFolderId = this.folderCache[currentPath];
+                continue;
+            }
+            
+            const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
+            
+            if (existingFolder) {
+                currentFolderId = existingFolder.id;
+                this.folderCache[currentPath] = currentFolderId; // 캐시에 저장
+                console.log(`✓ Found and cached existing folder: ${folderName} at ${currentPath}`);
+            } else {
+                const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
+                if (!newFolder) {
+                    throw new Error(`Failed to create folder: ${folderName}`);
+                }
+                currentFolderId = newFolder.id;
+                this.folderCache[currentPath] = currentFolderId; // 캐시에 저장
+                console.log(`📁 Created and cached folder: ${folderName} at ${currentPath}`);
+            }
+        }
+
+        return currentFolderId;
     }
 
     // 다운로드 전용 메서드
@@ -1820,40 +1961,36 @@ export default class GDriveSyncPlugin extends Plugin {
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
                 relativePath = file.path.substring(baseFolder.length + 1);
             } else if (baseFolder && file.path === baseFolder) {
-                relativePath = file.name; // 파일이 baseFolder와 같은 경로에 있는 경우
+                relativePath = file.name;
             } else if (!baseFolder) {
-                // baseFolder가 없는 경우 전체 경로 사용
                 relativePath = file.path;
             }
-            
-            console.log(`Processing upload: ${file.path}, baseFolder: ${baseFolder}, relativePath: ${relativePath}`);
             
             let fileName = file.name;
             let targetFolderId = rootFolderId;
             
-            // 상대 경로에 폴더 구조가 있는 경우 처리
+            // 상대 경로에 폴더 구조가 있는 경우 캐시된 폴더 ID 사용
             if (relativePath.includes('/')) {
                 const pathParts = relativePath.split('/');
                 fileName = pathParts.pop()!;
                 const folderPath = pathParts.join('/');
                 
-                console.log(`Creating folder structure: ${folderPath} in Google Drive`);
-                targetFolderId = await this.createNestedFolders(folderPath, rootFolderId);
+                // 캐시된 폴더 ID 사용 (성능 최적화)
+                targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
                 if (!targetFolderId) {
-                    console.error(`Failed to create folder structure for: ${folderPath}`);
+                    console.error(`Failed to get folder ID for: ${folderPath}`);
                     return false;
                 }
             }
             
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
-            
             const needsSync = await this.shouldSyncFile(file, existingFile);
             
             if (!needsSync) {
                 console.log(`⏭️ Skipping ${file.path} (no changes detected)`);
                 return 'skipped';
             }
-    
+
             const content = await this.app.vault.read(file);
             const localModTime = file.stat.mtime;
             
@@ -1864,7 +2001,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 console.log(`📤 Uploading ${file.path} to Google Drive`);
                 return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
             }
-    
+
         } catch (error) {
             console.error(`Error syncing file ${file.path}:`, error);
             return false;
@@ -1939,30 +2076,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    private async createNestedFolders(folderPath: string, rootFolderId: string): Promise<string> {
-        const pathParts = folderPath.split('/');
-        let currentFolderId = rootFolderId;
-
-        for (const folderName of pathParts) {
-            if (!folderName) continue;
-            
-            const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
-            
-            if (existingFolder) {
-                currentFolderId = existingFolder.id;
-                console.log(`✓ Found existing folder: ${folderName}`);
-            } else {
-                const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
-                if (!newFolder) {
-                    throw new Error(`Failed to create folder: ${folderName}`);
-                }
-                currentFolderId = newFolder.id;
-                console.log(`📁 Created folder: ${folderName}`);
-            }
-        }
-
-        return currentFolderId;
-    }
 
     private async findFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
