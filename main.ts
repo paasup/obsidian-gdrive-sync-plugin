@@ -1327,20 +1327,29 @@ export default class GDriveSyncPlugin extends Plugin {
         const localFileMap = new Map<string, TFile>();
         localFiles.forEach(file => {
             let relativePath = file.path;
+            
+            // baseFolder가 있고 파일 경로가 baseFolder로 시작하는 경우 상대 경로로 변환
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
                 relativePath = file.path.substring(baseFolder.length + 1);
             } else if (baseFolder && file.path === baseFolder) {
                 relativePath = '';
             }
+            // baseFolder가 없거나 파일 경로가 baseFolder로 시작하지 않는 경우 그대로 사용
+            
             localFileMap.set(relativePath, file);
         });
     
         const driveFileMap = new Map<string, any>();
         driveFiles.forEach(file => {
             let relativePath = file.path;
+            
+            // Google Drive 파일의 경로가 이미 올바르게 설정되어 있으므로
+            // baseFolder 처리 시 중복 방지
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
                 relativePath = file.path.substring(baseFolder.length + 1);
             }
+            // baseFolder가 없거나 이미 상대 경로인 경우 그대로 사용
+            
             driveFileMap.set(relativePath, file);
         });
     
@@ -1369,7 +1378,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
                 } else if (!localFile && driveFile) {
                     progressModal?.addLog(`📥 Download only: ${filePath}`);
-                    await this.downloadFileFromDrive(driveFile, result, baseFolder);
+                    // driveFile에는 이미 올바른 path가 설정되어 있으므로 baseFolder는 전달하지 않음
+                    await this.downloadFileFromDrive(driveFile, result);
                 }
             } catch (error) {
                 console.error(`Error syncing file ${filePath}:`, error);
@@ -1387,15 +1397,20 @@ export default class GDriveSyncPlugin extends Plugin {
     // Google Drive에서 파일 다운로드
     private async downloadFileFromDrive(driveFile: any, result: SyncResult, baseFolder: string = ''): Promise<void> {
         try {
+            // driveFile.path가 이미 전체 경로를 포함하고 있으므로 그대로 사용
             let filePath = driveFile.path;
             
-            // baseFolder가 있으면 로컬 경로 조정
-            if (baseFolder && !filePath.startsWith(baseFolder)) {
+            // baseFolder 중복 추가 방지: driveFile.path가 이미 올바른 경로를 가지고 있는지 확인
+            // 만약 driveFile.path가 상대 경로라면 baseFolder를 앞에 추가
+            if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
+                // driveFile.path가 상대 경로인 경우에만 baseFolder 추가
                 filePath = baseFolder + '/' + filePath;
             }
             
+            console.log(`Processing download: ${driveFile.name}, original path: ${driveFile.path}, final path: ${filePath}`);
+            
             const localFile = this.app.vault.getAbstractFileByPath(filePath);
-
+    
             // 로컬 파일이 있는 경우 수정 시간 비교
             if (localFile instanceof TFile) {
                 const needsUpdate = await this.shouldDownloadFile(localFile, driveFile);
@@ -1404,19 +1419,19 @@ export default class GDriveSyncPlugin extends Plugin {
                     return;
                 }
             }
-
+    
             // 파일 내용 다운로드
             const content = await this.getFileContentFromDrive(driveFile.id);
-
+    
             // 로컬 폴더 생성 (필요한 경우)
             const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
             if (folderPath && this.settings.createMissingFolders) {
                 await this.createLocalFolderStructure(folderPath, result);
             }
-
+    
             // 원격지 수정 시간 가져오기
             const remoteModTime = new Date(driveFile.modifiedTime).getTime();
-
+    
             // 파일 생성 또는 업데이트
             if (localFile instanceof TFile) {
                 await this.app.vault.modify(localFile, content);
@@ -1425,12 +1440,12 @@ export default class GDriveSyncPlugin extends Plugin {
                 await this.app.vault.create(filePath, content);
                 console.log(`📥 Downloaded new file: ${filePath}`);
             }
-
+    
             // 파일 시간 동기화
             await this.syncFileTime(filePath, remoteModTime);
-
+    
             result.downloaded++;
-
+    
         } catch (error) {
             console.error(`Error downloading file ${driveFile.path}:`, error);
             throw error;
@@ -1587,16 +1602,25 @@ export default class GDriveSyncPlugin extends Plugin {
                     },
                     throw: false
                 });
-
+    
                 if (response.status !== 200) {
                     console.error('Failed to list files:', response.status, response.json);
                     break;
                 }
-
+    
                 const data = response.json;
                 
                 for (const file of data.files || []) {
-                    const filePath = basePath ? `${basePath}/${file.name}` : file.name;
+                    // 파일 경로를 올바르게 구성
+                    let filePath: string;
+                    
+                    if (basePath) {
+                        // basePath가 있는 경우: basePath/fileName 형태로 구성
+                        filePath = `${basePath}/${file.name}`;
+                    } else {
+                        // basePath가 없는 경우: fileName만 사용
+                        filePath = file.name;
+                    }
                     
                     if (file.mimeType === 'application/vnd.google-apps.folder') {
                         // 폴더인 경우 재귀적으로 하위 파일들 수집
@@ -1608,19 +1632,21 @@ export default class GDriveSyncPlugin extends Plugin {
                         // 파일인 경우 경로 정보와 함께 추가
                         allFiles.push({
                             ...file,
-                            path: filePath
+                            path: filePath // 이미 완전한 경로
                         });
+                        
+                        console.log(`Found file: ${file.name}, assigned path: ${filePath}`);
                     }
                 }
-
+    
                 pageToken = data.nextPageToken || '';
             } while (pageToken);
-
+    
         } catch (error) {
             console.error('Error getting files from Drive:', error);
             throw error;
         }
-
+    
         return allFiles;
     }
 
