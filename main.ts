@@ -1016,7 +1016,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
         try {
             let allFiles: TFile[] = [];
-            let folderTargets: Array<{files: TFile[], folderId: string, name: string}> = [];
+            let folderTargets: Array<{files: TFile[], folderId: string, name: string, basePath: string}> = [];
     
             if (this.settings.syncWholeVault) {
                 progressModal?.addLog('📁 Sync mode: Whole Vault');
@@ -1030,7 +1030,8 @@ export default class GDriveSyncPlugin extends Plugin {
                 folderTargets.push({
                     files: allFiles,
                     folderId: rootFolder.id,
-                    name: rootFolder.name
+                    name: rootFolder.name,
+                    basePath: '' // 전체 볼트 동기화 시 basePath 없음
                 });
             } else {
                 progressModal?.addLog('📂 Sync mode: Selected Folders');
@@ -1040,7 +1041,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     folderTargets.push({
                         files: localFiles,
                         folderId: driveFolder.id,
-                        name: driveFolder.name
+                        name: driveFolder.name,
+                        basePath: driveFolder.path // 선택된 폴더의 경로를 basePath로 사용
                     });
                     allFiles.push(...localFiles);
                 }
@@ -1069,7 +1071,7 @@ export default class GDriveSyncPlugin extends Plugin {
                         progressModal?.updateProgress(processedFiles, allFiles.length, `Uploading: ${file.name}`);
                         progressModal?.addLog(`📤 ${file.path}`);
     
-                        const syncResult = await this.syncFileToGoogleDrive(file, target.folderId);
+                        const syncResult = await this.syncFileToGoogleDrive(file, target.folderId, target.basePath);
                         
                         if (syncResult === 'skipped') {
                             result.skipped++;
@@ -1303,12 +1305,17 @@ export default class GDriveSyncPlugin extends Plugin {
         // Google Drive 폴더 경로를 로컬 경로로 변환
         const localFolderPath = driveFolder.path;
         
+        console.log(`Looking for local files in: ${localFolderPath} (for Drive folder: ${driveFolder.name})`);
+        
         // 로컬에서 해당 경로의 폴더 찾기
         const localFolder = this.app.vault.getAbstractFileByPath(localFolderPath);
         
         if (localFolder instanceof TFolder) {
             const files = await this.collectFilesToSync(localFolder, this.settings.includeSubfolders);
             localFiles.push(...files);
+            console.log(`Found ${files.length} files in local folder: ${localFolderPath}`);
+        } else {
+            console.log(`Local folder not found: ${localFolderPath}`);
         }
         
         return localFiles;
@@ -1375,6 +1382,7 @@ export default class GDriveSyncPlugin extends Plugin {
                     await this.resolveFileConflict(localFile, driveFile, rootFolderId, result);
                 } else if (localFile && !driveFile) {
                     progressModal?.addLog(`📤 Upload only: ${filePath}`);
+                    // baseFolder 전달: 업로드 시 올바른 상대 경로 계산을 위해 필요
                     await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
                 } else if (!localFile && driveFile) {
                     progressModal?.addLog(`📥 Download only: ${filePath}`);
@@ -1808,20 +1816,28 @@ export default class GDriveSyncPlugin extends Plugin {
         try {
             let relativePath = file.path;
             
-            // baseFolder가 있으면 상대 경로로 변환
+            // baseFolder가 있는 경우 상대 경로로 변환
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
                 relativePath = file.path.substring(baseFolder.length + 1);
+            } else if (baseFolder && file.path === baseFolder) {
+                relativePath = file.name; // 파일이 baseFolder와 같은 경로에 있는 경우
+            } else if (!baseFolder) {
+                // baseFolder가 없는 경우 전체 경로 사용
+                relativePath = file.path;
             }
+            
+            console.log(`Processing upload: ${file.path}, baseFolder: ${baseFolder}, relativePath: ${relativePath}`);
             
             let fileName = file.name;
             let targetFolderId = rootFolderId;
             
+            // 상대 경로에 폴더 구조가 있는 경우 처리
             if (relativePath.includes('/')) {
                 const pathParts = relativePath.split('/');
                 fileName = pathParts.pop()!;
                 const folderPath = pathParts.join('/');
                 
-                console.log(`Creating folder structure: ${folderPath}`);
+                console.log(`Creating folder structure: ${folderPath} in Google Drive`);
                 targetFolderId = await this.createNestedFolders(folderPath, rootFolderId);
                 if (!targetFolderId) {
                     console.error(`Failed to create folder structure for: ${folderPath}`);
@@ -1837,24 +1853,23 @@ export default class GDriveSyncPlugin extends Plugin {
                 console.log(`⏭️ Skipping ${file.path} (no changes detected)`);
                 return 'skipped';
             }
-
+    
             const content = await this.app.vault.read(file);
             const localModTime = file.stat.mtime;
             
             if (existingFile) {
-                console.log(`🔄 Updating ${file.path}`);
+                console.log(`🔄 Updating ${file.path} in Google Drive`);
                 return await this.updateFileInDrive(existingFile.id, content, localModTime);
             } else {
-                console.log(`📤 Uploading ${file.path}`);
+                console.log(`📤 Uploading ${file.path} to Google Drive`);
                 return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
             }
-
+    
         } catch (error) {
             console.error(`Error syncing file ${file.path}:`, error);
             return false;
         }
     }
-
     private async shouldSyncFile(localFile: TFile, driveFile: any): Promise<boolean> {
         switch (this.settings.syncMode) {
             case 'always':
