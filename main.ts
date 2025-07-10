@@ -1201,30 +1201,34 @@ export default class GDriveSyncPlugin extends Plugin {
         
         for (const file of files) {
             if (progressModal?.shouldCancel()) return;
-
+    
             try {
-                progressModal?.updateProgress(processedFiles, totalFiles || files.length, `Uploading: ${file.name}`);
-
+                progressModal?.updateProgress(processedFiles, totalFiles || files.length, `Processing: ${file.name}`);
+    
                 const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId, baseFolder);
                 
                 if (syncResult === 'skipped') {
                     result.skipped++;
-                    progressModal?.addLog(`⏭️ Skipped: ${file.name}`);
+                    // 간명한 로그: 개별 스킵 메시지는 콘솔에만, 진행 모달에는 요약만
                 } else if (syncResult === true) {
                     result.uploaded++;
-                    progressModal?.addLog(`✅ Uploaded: ${file.name}`);
+                    progressModal?.addLog(`✅ ${file.name}`);
                 } else {
                     result.errors++;
-                    progressModal?.addLog(`❌ Failed: ${file.name}`);
+                    progressModal?.addLog(`❌ ${file.name}`);
                 }
             } catch (error) {
                 result.errors++;
-                progressModal?.addLog(`❌ Error uploading ${file.name}: ${error.message || 'Unknown error'}`);
+                progressModal?.addLog(`❌ ${file.name}: ${error.message || 'Error'}`);
             }
-
+    
             processedFiles++;
             
-            // 업로드 간 작은 지연으로 API 레이트 리미트 방지
+            // 배치 상태 요약 로그 (매 10개 파일마다)
+            if (processedFiles % 10 === 0) {
+                progressModal?.addLog(`📊 Progress: ${result.uploaded} uploaded, ${result.skipped} skipped, ${result.errors} errors`);
+            }
+            
             await new Promise(resolve => setTimeout(resolve, 10));
         }
     }
@@ -1546,17 +1550,12 @@ export default class GDriveSyncPlugin extends Plugin {
     // Google Drive에서 파일 다운로드
     private async downloadFileFromDrive(driveFile: any, result: SyncResult, baseFolder: string = ''): Promise<void> {
         try {
-            // driveFile.path가 이미 전체 경로를 포함하고 있으므로 그대로 사용
             let filePath = driveFile.path;
             
-            // baseFolder 중복 추가 방지: driveFile.path가 이미 올바른 경로를 가지고 있는지 확인
-            // 만약 driveFile.path가 상대 경로라면 baseFolder를 앞에 추가
+            // baseFolder 중복 추가 방지
             if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
-                // driveFile.path가 상대 경로인 경우에만 baseFolder 추가
                 filePath = baseFolder + '/' + filePath;
             }
-            
-            console.log(`Processing download: ${driveFile.name}, original path: ${driveFile.path}, final path: ${filePath}`);
             
             const localFile = this.app.vault.getAbstractFileByPath(filePath);
     
@@ -1584,19 +1583,19 @@ export default class GDriveSyncPlugin extends Plugin {
             // 파일 생성 또는 업데이트
             if (localFile instanceof TFile) {
                 await this.app.vault.modify(localFile, content);
-                console.log(`🔄 Updated local file: ${filePath}`);
+                console.log(`🔄 ${localFile.name}: Updated`);
             } else {
                 await this.app.vault.create(filePath, content);
-                console.log(`📥 Downloaded new file: ${filePath}`);
+                console.log(`📥 ${driveFile.name}: Downloaded`);
             }
     
-            // 파일 시간 동기화
+            // 파일 시간 동기화 (중요!)
             await this.syncFileTime(filePath, remoteModTime);
     
             result.downloaded++;
     
         } catch (error) {
-            console.error(`Error downloading file ${driveFile.path}:`, error);
+            console.error(`❌ ${driveFile.name}: Download failed - ${error.message}`);
             throw error;
         }
     }
@@ -1619,10 +1618,10 @@ export default class GDriveSyncPlugin extends Plugin {
                     const targetDate = new Date(targetTime);
                     await fs.utimes(fullPath, targetDate, targetDate);
                     
-                    console.log(`⏰ Synced file time: ${filePath} -> ${targetDate.toLocaleString()}`);
+                    console.log(`⏰ ${path.basename(filePath)}: Time synced to ${targetDate.toLocaleString()}`);
                     return;
                 } catch (fsError) {
-                    console.warn(`⚠️ Direct filesystem access failed: ${fsError}`);
+                    console.warn(`⚠️ ${filePath}: Direct FS time sync failed`);
                 }
             }
             
@@ -1634,16 +1633,16 @@ export default class GDriveSyncPlugin extends Plugin {
                     if (file.stat && file.stat.mtime !== undefined) {
                         // @ts-ignore - mtime 수정 시도
                         file.stat.mtime = targetTime;
-                        console.log(`⏰ Updated file stat time: ${filePath} -> ${new Date(targetTime).toLocaleString()}`);
+                        console.log(`⏰ ${file.name}: API time sync to ${new Date(targetTime).toLocaleString()}`);
                         return;
                     }
                 }
             } catch (obsidianError) {
-                console.warn(`⚠️ Obsidian API time sync failed: ${obsidianError}`);
+                console.warn(`⚠️ ${filePath}: API time sync failed`);
             }
             
         } catch (error) {
-            console.warn(`⚠️ File time sync failed for ${filePath}:`, error);
+            console.warn(`⚠️ ${filePath}: Time sync failed - ${error.message}`);
         }
     }
 
@@ -1804,12 +1803,23 @@ export default class GDriveSyncPlugin extends Plugin {
         switch (this.settings.syncMode) {
             case 'always':
                 return true;
-
+    
             case 'modified':
                 const localModTime = localFile.stat.mtime;
                 const driveModTime = new Date(driveFile.modifiedTime).getTime();
-                return driveModTime > localModTime;
-
+                
+                // 1초 이내 차이는 동일한 것으로 간주
+                const timeDiff = Math.abs(localModTime - driveModTime);
+                const isNewer = driveModTime > localModTime + 1000; // 1초 버퍼
+                
+                if (isNewer) {
+                    console.log(`📥 ${localFile.name}: Remote newer (${new Date(driveModTime).toLocaleString()} > ${new Date(localModTime).toLocaleString()})`);
+                } else {
+                    console.log(`⏭️ ${localFile.name}: Skip (times synced)`);
+                }
+                
+                return isNewer;
+    
             case 'checksum':
                 try {
                     const localContent = await this.app.vault.read(localFile);
@@ -1818,12 +1828,15 @@ export default class GDriveSyncPlugin extends Plugin {
                     const driveContent = await this.getFileContentFromDrive(driveFile.id);
                     const driveHash = await this.calculateFileHash(driveContent);
                     
-                    return localHash !== driveHash;
+                    const isDifferent = localHash !== driveHash;
+                    console.log(`${isDifferent ? '📥' : '⏭️'} ${localFile.name}: ${isDifferent ? 'Content differs' : 'Content same'}`);
+                    
+                    return isDifferent;
                 } catch (error) {
-                    console.error('Error comparing file checksums:', error);
+                    console.error(`❌ ${localFile.name}: Checksum error - ${error.message}`);
                     return true;
                 }
-
+    
             default:
                 return true;
         }
@@ -1891,11 +1904,62 @@ export default class GDriveSyncPlugin extends Plugin {
             /\.bak$/, // 백업 파일
             /\.lock$/, // 락 파일
         ];
-
+    
         const hasValidExtension = syncExtensions.some(ext => file.name.endsWith(ext));
         const shouldExclude = excludePatterns.some(pattern => pattern.test(file.name));
-
+    
         return hasValidExtension && !shouldExclude;
+    }
+    
+    private async shouldSyncFile(localFile: TFile, driveFile: any): Promise<boolean> {
+        switch (this.settings.syncMode) {
+            case 'always':
+                return true;
+    
+            case 'modified':
+                if (!driveFile) {
+                    return true;
+                }
+                
+                const localModTime = localFile.stat.mtime;
+                const driveModTime = new Date(driveFile.modifiedTime).getTime();
+                
+                // 1초 이내 차이는 동일한 것으로 간주 (파일시스템 정밀도 고려)
+                const timeDiff = Math.abs(localModTime - driveModTime);
+                const isNewer = localModTime > driveModTime + 1000; // 1초 버퍼
+                
+                if (isNewer) {
+                    console.log(`📤 ${localFile.name}: Local newer (${new Date(localModTime).toLocaleString()} > ${new Date(driveModTime).toLocaleString()})`);
+                } else {
+                    console.log(`⏭️ ${localFile.name}: Skip (times synced)`);
+                }
+                
+                return isNewer;
+    
+            case 'checksum':
+                if (!driveFile) {
+                    return true;
+                }
+                
+                try {
+                    const localContent = await this.app.vault.read(localFile);
+                    const localHash = await this.calculateFileHash(localContent);
+                    
+                    const driveContent = await this.getFileContentFromDrive(driveFile.id);
+                    const driveHash = await this.calculateFileHash(driveContent);
+                    
+                    const isDifferent = localHash !== driveHash;
+                    console.log(`${isDifferent ? '📤' : '⏭️'} ${localFile.name}: ${isDifferent ? 'Content differs' : 'Content same'}`);
+                    
+                    return isDifferent;
+                } catch (error) {
+                    console.error(`❌ ${localFile.name}: Checksum error - ${error.message}`);
+                    return true;
+                }
+    
+            default:
+                return true;
+        }
     }
 
     // Google Drive 관련 메서드들
@@ -2005,43 +2069,6 @@ export default class GDriveSyncPlugin extends Plugin {
         } catch (error) {
             console.error(`Error syncing file ${file.path}:`, error);
             return false;
-        }
-    }
-    private async shouldSyncFile(localFile: TFile, driveFile: any): Promise<boolean> {
-        switch (this.settings.syncMode) {
-            case 'always':
-                return true;
-
-            case 'modified':
-                if (!driveFile) {
-                    return true;
-                }
-                
-                const localModTime = localFile.stat.mtime;
-                const driveModTime = new Date(driveFile.modifiedTime).getTime();
-                
-                return localModTime > driveModTime;
-
-            case 'checksum':
-                if (!driveFile) {
-                    return true;
-                }
-                
-                try {
-                    const localContent = await this.app.vault.read(localFile);
-                    const localHash = await this.calculateFileHash(localContent);
-                    
-                    const driveContent = await this.getFileContentFromDrive(driveFile.id);
-                    const driveHash = await this.calculateFileHash(driveContent);
-                    
-                    return localHash !== driveHash;
-                } catch (error) {
-                    console.error('Error comparing file checksums:', error);
-                    return true;
-                }
-
-            default:
-                return true;
         }
     }
 
@@ -2162,17 +2189,17 @@ export default class GDriveSyncPlugin extends Plugin {
                 parents: [folderId],
                 modifiedTime: localModTime ? new Date(localModTime).toISOString() : undefined
             };
-
+    
             const boundary = '-------314159265358979323846';
             const delimiter = "\r\n--" + boundary + "\r\n";
             const close_delim = "\r\n--" + boundary + "--";
-
+    
             let body = delimiter +
                 'Content-Type: application/json\r\n\r\n' +
                 JSON.stringify(metadata) + delimiter +
                 'Content-Type: text/plain\r\n\r\n' +
                 content + close_delim;
-
+    
             const response = await requestUrl({
                 url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
                 method: 'POST',
@@ -2183,17 +2210,26 @@ export default class GDriveSyncPlugin extends Plugin {
                 body: body,
                 throw: false
             });
-
-            return response.status === 200 || response.status === 201;
+    
+            const success = response.status === 200 || response.status === 201;
+            
+            if (success && localModTime) {
+                console.log(`📤 ${fileName}: Uploaded with time ${new Date(localModTime).toLocaleString()}`);
+            } else if (success) {
+                console.log(`📤 ${fileName}: Uploaded`);
+            }
+            
+            return success;
         } catch (error) {
-            console.error('Error uploading file to Drive:', error);
+            console.error(`❌ ${fileName}: Upload failed - ${error.message}`);
             return false;
         }
     }
 
     private async updateFileInDrive(fileId: string, content: string, localModTime: number): Promise<boolean> {
         try {
-            const response = await requestUrl({
+            // 파일 내용 업데이트
+            const contentResponse = await requestUrl({
                 url: `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
                 method: 'PATCH',
                 headers: {
@@ -2203,10 +2239,34 @@ export default class GDriveSyncPlugin extends Plugin {
                 body: content,
                 throw: false
             });
-
-            return response.status === 200;
+    
+            if (contentResponse.status !== 200) {
+                return false;
+            }
+    
+            // 수정 시간 업데이트
+            const metadataResponse = await requestUrl({
+                url: `https://www.googleapis.com/drive/v3/files/${fileId}`,
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${this.settings.accessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    modifiedTime: new Date(localModTime).toISOString()
+                }),
+                throw: false
+            });
+    
+            const success = metadataResponse.status === 200;
+            
+            if (success) {
+                console.log(`🔄 File updated with time ${new Date(localModTime).toLocaleString()}`);
+            }
+            
+            return success;
         } catch (error) {
-            console.error('Error updating file in Drive:', error);
+            console.error(`❌ Update failed - ${error.message}`);
             return false;
         }
     }
