@@ -1524,7 +1524,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
                 if (localFile && driveFile) {
                     progressModal?.addLog(`⚡ Conflict resolution: ${filePath}`);
-                    await this.resolveFileConflict(localFile, driveFile, rootFolderId, result);
+                    await this.resolveFileConflict(localFile, driveFile, rootFolderId, result, baseFolder);
                 } else if (localFile && !driveFile) {
                     progressModal?.addLog(`📤 Upload only: ${filePath}`);
                     // baseFolder 전달: 업로드 시 올바른 상대 경로 계산을 위해 필요
@@ -1532,7 +1532,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 } else if (!localFile && driveFile) {
                     progressModal?.addLog(`📥 Download only: ${filePath}`);
                     // driveFile에는 이미 올바른 path가 설정되어 있으므로 baseFolder는 전달하지 않음
-                    await this.downloadFileFromDrive(driveFile, result);
+                    await this.downloadFileFromDrive(driveFile, result, baseFolder);
                 }
             } catch (error) {
                 console.error(`Error syncing file ${filePath}:`, error);
@@ -1673,7 +1673,7 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // 파일 충돌 해결
-    private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult): Promise<void> {
+    private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
         const localModTime = localFile.stat.mtime;
         const remoteModTime = new Date(driveFile.modifiedTime).getTime();
 
@@ -1697,10 +1697,10 @@ export default class GDriveSyncPlugin extends Plugin {
 
         if (resolution === 'local') {
             // 로컬 파일로 원격 파일 업데이트
-            await this.uploadSingleFile(localFile, rootFolderId, result);
+            await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
         } else {
             // 원격 파일로 로컬 파일 업데이트
-            await this.downloadFileFromDrive(driveFile, result);
+            await this.downloadFileFromDrive(driveFile, result, baseFolder);
         }
 
         result.conflicts++;
@@ -1910,7 +1910,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
         return hasValidExtension && !shouldExclude;
     }
-    
+
     private async shouldSyncFile(localFile: TFile, driveFile: any): Promise<boolean> {
         switch (this.settings.syncMode) {
             case 'always':
