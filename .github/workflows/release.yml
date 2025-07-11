@@ -25,7 +25,7 @@ jobs:
 
       - name: Generate Release Notes from Commits
         run: |
-          tag="${GITHUB_REF#refs/tags/}"
+          tag="${{ github.ref_name }}"
           
           # 이전 태그 찾기
           previous_tag=$(git tag --sort=-version:refname | grep -v "^$tag$" | head -n1)
