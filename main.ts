@@ -1563,7 +1563,6 @@ export default class GDriveSyncPlugin extends Plugin {
             if (localFile instanceof TFile) {
                 const needsUpdate = await this.shouldDownloadFile(localFile, driveFile);
                 if (!needsUpdate) {
-                    result.skipped++;
                     return;
                 }
             }
@@ -1591,8 +1590,6 @@ export default class GDriveSyncPlugin extends Plugin {
     
             // 파일 시간 동기화 (중요!)
             await this.syncFileTime(filePath, remoteModTime);
-    
-            result.downloaded++;
     
         } catch (error) {
             console.error(`❌ ${driveFile.name}: Download failed - ${error.message}`);
@@ -1676,9 +1673,22 @@ export default class GDriveSyncPlugin extends Plugin {
     private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
         const localModTime = localFile.stat.mtime;
         const remoteModTime = new Date(driveFile.modifiedTime).getTime();
-
+    
+        // 1초 이내 차이는 동일한 것으로 간주 (파일시스템 정밀도 고려)
+        const timeDiff = Math.abs(localModTime - remoteModTime);
+        const TIME_TOLERANCE = 1000; // 1초
+    
+        if (timeDiff <= TIME_TOLERANCE) {
+            // 시간이 거의 같으면 충돌이 아니라 동기화된 상태
+            console.log(`⏭️ ${localFile.name}: Files are already synced (time diff: ${timeDiff}ms)`);
+            result.skipped++;
+            return;
+        }
+    
+        // 실제 충돌 상황에서만 충돌 카운트 증가
         let resolution: 'local' | 'remote';
-
+        let needsAction = true;
+    
         switch (this.settings.conflictResolution) {
             case 'local':
                 resolution = 'local';
@@ -1690,20 +1700,45 @@ export default class GDriveSyncPlugin extends Plugin {
                 resolution = localModTime > remoteModTime ? 'local' : 'remote';
                 break;
             case 'ask':
+                // 실제 사용자 입력을 받는 모달 표시 (현재는 newer로 대체)
                 resolution = localModTime > remoteModTime ? 'local' : 'remote';
                 console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
                 break;
         }
-
-        if (resolution === 'local') {
-            // 로컬 파일로 원격 파일 업데이트
-            await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
-        } else {
-            // 원격 파일로 로컬 파일 업데이트
-            await this.downloadFileFromDrive(driveFile, result, baseFolder);
+    
+        console.log(`⚡ Conflict detected: ${localFile.name}`);
+        console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
+        console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
+        console.log(`  Resolution: Use ${resolution} file`);
+    
+        try {
+            if (resolution === 'local') {
+                // 로컬 파일로 원격 파일 업데이트
+                const syncResult = await this.syncFileToGoogleDrive(localFile, rootFolderId, baseFolder);
+                if (syncResult === 'skipped') {
+                    result.skipped++;
+                    needsAction = false;
+                } else if (syncResult === true) {
+                    result.uploaded++;
+                } else {
+                    result.errors++;
+                    needsAction = false;
+                }
+            } else {
+                // 원격 파일로 로컬 파일 업데이트
+                await this.downloadFileFromDrive(driveFile, result, baseFolder);
+                result.downloaded++;
+            }
+    
+            // 실제로 액션이 수행된 경우에만 충돌로 카운트
+            if (needsAction) {
+                result.conflicts++;
+            }
+    
+        } catch (error) {
+            console.error(`Error resolving conflict for ${localFile.path}:`, error);
+            result.errors++;
         }
-
-        result.conflicts++;
     }
 
     // 단일 파일 업로드
