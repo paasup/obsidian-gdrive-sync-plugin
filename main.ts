@@ -204,7 +204,7 @@ class SyncProgressModal extends Modal {
 
     addLog(message: string) {
         if (this.isCancelled) return;
-
+    
         const timestamp = new Date().toLocaleTimeString();
         const logEntry = `[${timestamp}] ${message}`;
         this.logs.push(logEntry);
@@ -213,6 +213,19 @@ class SyncProgressModal extends Modal {
             text: logEntry,
             attr: { style: 'margin-bottom: 2px;' }
         });
+        
+        // 🎨 로그 타입별 색상 구분
+        if (message.includes('⚡ Conflict')) {
+            logLine.style.color = '#FF9800'; // 주황색
+        } else if (message.includes('✅')) {
+            logLine.style.color = '#4CAF50'; // 녹색
+        } else if (message.includes('❌')) {
+            logLine.style.color = '#F44336'; // 빨간색
+        } else if (message.includes('⏭️')) {
+            logLine.style.color = '#9E9E9E'; // 회색
+        } else if (message.includes('🔍')) {
+            logLine.style.color = '#2196F3'; // 파란색
+        }
         
         // 자동 스크롤
         this.logEl.scrollTop = this.logEl.scrollHeight;
@@ -1664,15 +1677,20 @@ export default class GDriveSyncPlugin extends Plugin {
                 progressModal?.updateProgress(processedFiles, totalFiles, `Processing: ${filePath}`);
     
                 if (localFile && driveFile) {
-                    progressModal?.addLog(`⚡ Conflict resolution: ${filePath}`);
+                    // 🔥 충돌 해결 로그를 더 정확하게
+                    progressModal?.addLog(`🔍 Checking: ${filePath}`);
                     await this.resolveFileConflict(localFile, driveFile, rootFolderId, result, baseFolder);
+                    
+                    // 결과에 따른 로그 (resolveFileConflict 이후)
+                    if (result.conflicts > 0) {
+                        // 실제 충돌이 해결된 경우에만 로그
+                        progressModal?.addLog(`⚡ Conflict resolved: ${filePath}`);
+                    }
                 } else if (localFile && !driveFile) {
                     progressModal?.addLog(`📤 Upload only: ${filePath}`);
-                    // baseFolder 전달: 업로드 시 올바른 상대 경로 계산을 위해 필요
                     await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
                 } else if (!localFile && driveFile) {
                     progressModal?.addLog(`📥 Download only: ${filePath}`);
-                    // driveFile에는 이미 올바른 path가 설정되어 있으므로 baseFolder는 전달하지 않음
                     await this.downloadFileFromDrive(driveFile, result, baseFolder);
                 }
             } catch (error) {
@@ -1682,8 +1700,6 @@ export default class GDriveSyncPlugin extends Plugin {
             }
     
             processedFiles++;
-            
-            // 작은 지연으로 UI 업데이트 허용
             await new Promise(resolve => setTimeout(resolve, 10));
         }
     }
@@ -1823,10 +1839,10 @@ export default class GDriveSyncPlugin extends Plugin {
             // 시간이 거의 같으면 충돌이 아니라 동기화된 상태
             console.log(`⏭️ ${localFile.name}: Files are already synced (time diff: ${timeDiff}ms)`);
             result.skipped++;
-            return;
+            return; // 여기서 바로 리턴 - 충돌 로그 없이
         }
     
-        // 실제 충돌 상황에서만 충돌 카운트 증가
+        // ⚠️ 여기서부터가 실제 충돌 상황 - 로그 출력 시점을 늦춤
         let resolution: 'local' | 'remote';
         let needsAction = true;
     
@@ -1841,12 +1857,12 @@ export default class GDriveSyncPlugin extends Plugin {
                 resolution = localModTime > remoteModTime ? 'local' : 'remote';
                 break;
             case 'ask':
-                // 실제 사용자 입력을 받는 모달 표시 (현재는 newer로 대체)
                 resolution = localModTime > remoteModTime ? 'local' : 'remote';
                 console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
                 break;
         }
     
+        // 🔥 실제 충돌 해결이 필요한 경우에만 로그 출력
         console.log(`⚡ Conflict detected: ${localFile.name}`);
         console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
         console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
@@ -1859,21 +1875,27 @@ export default class GDriveSyncPlugin extends Plugin {
                 if (syncResult === 'skipped') {
                     result.skipped++;
                     needsAction = false;
+                    // 🚫 스킵된 경우 충돌로 카운트하지 않음
+                    console.log(`⏭️ ${localFile.name}: Actually skipped after conflict check`);
                 } else if (syncResult === true) {
                     result.uploaded++;
+                    result.conflicts++; // ✅ 실제로 업로드된 경우에만 충돌로 카운트
                 } else {
                     result.errors++;
                     needsAction = false;
                 }
             } else {
                 // 원격 파일로 로컬 파일 업데이트
-                await this.downloadFileFromDrive(driveFile, result, baseFolder);
-                result.downloaded++;
-            }
-    
-            // 실제로 액션이 수행된 경우에만 충돌로 카운트
-            if (needsAction) {
-                result.conflicts++;
+                const shouldDownload = await this.shouldDownloadFile(localFile, driveFile);
+                if (shouldDownload) {
+                    await this.downloadFileFromDrive(driveFile, result, baseFolder);
+                    result.downloaded++;
+                    result.conflicts++; // ✅ 실제로 다운로드된 경우에만 충돌로 카운트
+                } else {
+                    result.skipped++;
+                    needsAction = false;
+                    console.log(`⏭️ ${localFile.name}: Actually skipped after download check`);
+                }
             }
     
         } catch (error) {
