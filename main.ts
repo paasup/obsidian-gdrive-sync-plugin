@@ -2663,25 +2663,33 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             .gdrive-settings {
                 max-width: 900px;
                 margin: 0 auto;
+                padding: 0 10px; /* 모바일 여백 */
             }
             
             .gdrive-header {
                 text-align: center;
-                padding: 20px 0;
+                padding: 15px 0; /* 모바일에서 패딩 축소 */
                 border-bottom: 2px solid var(--background-modifier-border);
-                margin-bottom: 20px;
+                margin-bottom: 15px;
+            }
+            
+            .gdrive-header h1 {
+                font-size: 1.5rem; /* 모바일에서 크기 조정 */
+                margin: 0;
             }
             
             .gdrive-quick-status {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                padding: 15px;
+                padding: 12px; /* 패딩 축소 */
                 background: var(--background-secondary);
-                border-radius: 10px;
-                margin-bottom: 20px;
+                border-radius: 8px;
+                margin-bottom: 15px;
                 border-left: 4px solid var(--color-green);
                 transition: all 0.3s ease;
+                flex-wrap: wrap; /* 모바일에서 줄바꿈 허용 */
+                gap: 10px;
             }
             
             .gdrive-quick-status.warning {
@@ -2695,16 +2703,19 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             .status-indicator {
                 display: flex;
                 align-items: center;
-                gap: 10px;
+                gap: 8px;
                 font-weight: bold;
+                min-width: 0; /* 텍스트 오버플로우 방지 */
+                flex: 1;
             }
             
             .status-dot {
-                width: 12px;
-                height: 12px;
+                width: 10px; /* 모바일에서 크기 축소 */
+                height: 10px;
                 border-radius: 50%;
                 background: var(--color-green);
                 animation: pulse 2s infinite;
+                flex-shrink: 0; /* 크기 고정 */
             }
             
             .status-dot.warning { background: var(--color-orange); }
@@ -2718,51 +2729,58 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             
             .quick-actions {
                 display: flex;
-                gap: 10px;
+                gap: 8px;
+                flex-wrap: wrap; /* 모바일에서 줄바꿈 */
             }
             
             .setup-wizard {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                 color: white;
-                border-radius: 10px;
-                padding: 20px;
-                margin-bottom: 20px;
+                border-radius: 8px;
+                padding: 15px; /* 패딩 축소 */
+                margin-bottom: 15px;
                 transition: max-height 0.3s ease;
                 overflow: hidden;
             }
             
             .setup-wizard.collapsed {
-                max-height: 60px;
+                max-height: 50px; /* 높이 축소 */
             }
             
             .setup-wizard:not(.collapsed) {
-                max-height: 300px;
+                max-height: 400px;
             }
             
             .wizard-header {
                 display: flex;
-                justify-content: between;
+                justify-content: space-between;
                 align-items: center;
                 cursor: pointer;
             }
             
+            .wizard-header h3 {
+                font-size: 1.2rem; /* 모바일에서 크기 조정 */
+                margin: 0;
+            }
+            
             .wizard-steps {
-                margin-top: 20px;
+                margin-top: 15px;
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 15px;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); /* 최소 크기 축소 */
+                gap: 10px;
             }
             
             .wizard-step {
                 background: rgba(255, 255, 255, 0.1);
-                padding: 15px;
-                border-radius: 8px;
+                padding: 12px; /* 패딩 축소 */
+                border-radius: 6px;
                 text-align: center;
                 transition: transform 0.2s ease;
+                font-size: 0.9rem; /* 텍스트 크기 축소 */
             }
             
             .wizard-step:hover {
-                transform: translateY(-2px);
+                transform: translateY(-1px); /* 호버 효과 축소 */
             }
             
             .wizard-step.completed {
@@ -2775,19 +2793,21 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             }
             
             .tab-container {
-                margin-bottom: 20px;
+                margin-bottom: 15px;
             }
             
             .tab-nav {
                 display: flex;
                 background: var(--background-secondary);
-                border-radius: 10px 10px 0 0;
+                border-radius: 8px 8px 0 0;
                 overflow: hidden;
+                overflow-x: auto; /* 모바일에서 스크롤 허용 */
             }
             
             .tab-button {
                 flex: 1;
-                padding: 15px 20px;
+                min-width: 120px; /* 최소 너비 설정 */
+                padding: 12px 15px; /* 패딩 축소 */
                 background: transparent;
                 border: none;
                 cursor: pointer;
@@ -2796,7 +2816,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                gap: 8px;
+                gap: 6px;
+                font-size: 0.9rem; /* 텍스트 크기 축소 */
+                white-space: nowrap; /* 텍스트 줄바꿈 방지 */
             }
             
             .tab-button:hover {
@@ -2811,53 +2833,133 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             
             .tab-content {
                 background: var(--background-primary);
-                border-radius: 0 0 10px 10px;
-                padding: 20px;
+                border-radius: 0 0 8px 8px;
+                padding: 15px; /* 패딩 축소 */
                 border: 1px solid var(--background-modifier-border);
                 border-top: none;
-                min-height: 400px;
+                min-height: 300px; /* 높이 축소 */
             }
             
             .live-preview {
                 background: var(--background-secondary);
-                border-radius: 10px;
-                padding: 20px;
-                margin-top: 20px;
+                border-radius: 8px;
+                padding: 15px; /* 패딩 축소 */
+                margin-top: 15px;
             }
             
             .sync-overview {
                 display: grid;
                 grid-template-columns: 1fr auto 1fr;
-                gap: 20px;
+                gap: 15px; /* 간격 축소 */
                 align-items: center;
-                margin-bottom: 20px;
+                margin-bottom: 15px;
+            }
+            
+            /* 모바일에서 세로 레이아웃으로 변경 */
+            @media (max-width: 768px) {
+                .gdrive-settings {
+                    padding: 0 5px;
+                }
+                
+                .gdrive-quick-status {
+                    flex-direction: column;
+                    align-items: stretch;
+                    text-align: center;
+                    gap: 10px;
+                }
+                
+                .quick-actions {
+                    justify-content: center;
+                    width: 100%;
+                }
+                
+                .sync-overview {
+                    grid-template-columns: 1fr;
+                    grid-template-rows: auto auto auto;
+                    gap: 10px;
+                    text-align: center;
+                }
+                
+                .wizard-steps {
+                    grid-template-columns: 1fr;
+                }
+                
+                .tab-nav {
+                    flex-direction: column;
+                }
+                
+                .tab-button {
+                    min-width: unset;
+                    width: 100%;
+                }
+                
+                .folder-browser {
+                    max-height: 200px; /* 모바일에서 높이 축소 */
+                }
+                
+                .action-button {
+                    width: 100%; /* 모바일에서 전체 너비 */
+                    justify-content: center;
+                    margin-bottom: 8px;
+                }
+                
+                .setting-group {
+                    padding: 12px;
+                    margin-bottom: 15px;
+                }
+            }
+            
+            /* 작은 모바일 화면 */
+            @media (max-width: 480px) {
+                .gdrive-header h1 {
+                    font-size: 1.3rem;
+                }
+                
+                .tab-content {
+                    padding: 10px;
+                }
+                
+                .live-preview {
+                    padding: 10px;
+                }
+                
+                .wizard-step {
+                    padding: 8px;
+                    font-size: 0.8rem;
+                }
+                
+                .action-button {
+                    padding: 10px 15px;
+                    font-size: 14px;
+                }
             }
             
             .file-count-box {
                 text-align: center;
-                padding: 20px;
+                padding: 15px; /* 패딩 축소 */
                 background: var(--background-primary);
-                border-radius: 8px;
+                border-radius: 6px;
                 border: 2px solid var(--background-modifier-border);
             }
             
             .sync-action-box {
                 text-align: center;
-                padding: 15px;
+                padding: 12px; /* 패딩 축소 */
                 background: linear-gradient(135deg, #4CAF50, #45a049);
                 color: white;
-                border-radius: 8px;
+                border-radius: 6px;
                 font-weight: bold;
             }
             
             .connection-status {
                 display: flex;
                 align-items: center;
-                gap: 10px;
-                padding: 15px;
+                gap: 8px;
+                padding: 12px; /* 패딩 축소 */
                 background: var(--background-secondary);
-                border-radius: 8px;
-                margin-bottom: 20px;
+                border-radius: 6px;
+                margin-bottom: 15px;
+                flex-wrap: wrap; /* 모바일 줄바꿈 */
             }
             
             .connection-status.connected {
@@ -2874,17 +2976,19 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             
             .folder-browser {
                 border: 1px solid var(--background-modifier-border);
-                border-radius: 8px;
-                max-height: 300px;
+                border-radius: 6px;
+                max-height: 250px; /* 높이 축소 */
                 overflow-y: auto;
             }
             
             .folder-item {
                 display: flex;
                 align-items: center;
-                padding: 10px 15px;
+                padding: 8px 12px; /* 패딩 축소 */
                 border-bottom: 1px solid var(--background-modifier-border);
                 transition: background 0.2s ease;
+                flex-wrap: wrap; /* 모바일 줄바꿈 */
+                gap: 8px;
             }
             
             .folder-item:hover {
@@ -2892,55 +2996,65 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             }
             
             .folder-icon {
-                margin-right: 10px;
-                font-size: 16px;
+                margin-right: 8px; /* 간격 축소 */
+                font-size: 14px;
+                flex-shrink: 0;
             }
             
             .folder-info {
                 flex-grow: 1;
+                min-width: 0; /* 텍스트 오버플로우 방지 */
+            }
+            
+            .folder-info div {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
             }
             
             .folder-actions {
                 display: flex;
-                gap: 5px;
+                gap: 4px;
+                flex-shrink: 0;
             }
             
             .btn-small {
-                padding: 4px 8px;
-                font-size: 11px;
-                border-radius: 4px;
+                padding: 3px 6px; /* 크기 축소 */
+                font-size: 10px;
+                border-radius: 3px;
             }
             
             .progress-bar {
                 width: 100%;
-                height: 6px;
+                height: 4px; /* 높이 축소 */
                 background: var(--background-modifier-border);
-                border-radius: 3px;
+                border-radius: 2px;
                 overflow: hidden;
-                margin: 10px 0;
+                margin: 8px 0; /* 여백 축소 */
             }
             
             .progress-fill {
                 height: 100%;
                 background: linear-gradient(90deg, #4CAF50, #45a049);
                 transition: width 0.3s ease;
-                border-radius: 3px;
+                border-radius: 2px;
             }
             
             .setting-group {
-                margin-bottom: 25px;
-                padding: 20px;
+                margin-bottom: 20px; /* 여백 축소 */
+                padding: 15px; /* 패딩 축소 */
                 background: var(--background-secondary);
-                border-radius: 8px;
+                border-radius: 6px;
                 border-left: 4px solid var(--text-accent);
             }
             
             .setting-group h4 {
-                margin: 0 0 15px 0;
+                margin: 0 0 12px 0; /* 여백 축소 */
                 color: var(--text-accent);
                 display: flex;
                 align-items: center;
-                gap: 8px;
+                gap: 6px;
+                font-size: 1.1rem; /* 크기 조정 */
             }
             
             .credentials-toggle {
@@ -2955,17 +3069,17 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             
             .smart-suggestions {
                 background: linear-gradient(135deg, #e3f2fd, #bbdefb);
-                border-radius: 8px;
-                padding: 15px;
-                margin-top: 15px;
+                border-radius: 6px;
+                padding: 12px; /* 패딩 축소 */
+                margin-top: 12px;
                 border-left: 4px solid #2196F3;
             }
             
             .sync-interval-value {
                 font-weight: bold;
                 color: var(--text-accent);
-                margin-left: 10px;
-                min-width: 80px;
+                margin-left: 8px; /* 간격 축소 */
+                min-width: 70px; /* 너비 축소 */
                 text-align: right;
                 display: inline-block;
             }
@@ -2973,11 +3087,13 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             .setting-item .slider {
                 display: flex;
                 align-items: center;
-                gap: 10px;
+                gap: 8px;
+                flex-wrap: wrap; /* 모바일 줄바꿈 */
             }
             
             .setting-item .slider input[type="range"] {
                 flex-grow: 1;
+                min-width: 120px; /* 최소 너비 */
             }
             
             .tooltip {
@@ -2993,26 +3109,27 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 transform: translateX(-50%);
                 background: var(--background-primary);
                 color: var(--text-normal);
-                padding: 8px 12px;
-                border-radius: 6px;
-                font-size: 12px;
+                padding: 6px 10px; /* 크기 축소 */
+                border-radius: 4px;
+                font-size: 11px; /* 폰트 크기 축소 */
                 white-space: nowrap;
                 z-index: 1000;
                 border: 1px solid var(--background-modifier-border);
-                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
             }
             
             .action-button {
                 display: inline-flex;
                 align-items: center;
-                gap: 8px;
-                padding: 10px 20px;
-                border-radius: 6px;
+                gap: 6px; /* 간격 축소 */
+                padding: 8px 16px; /* 패딩 축소 */
+                border-radius: 5px;
                 font-weight: 500;
                 transition: all 0.2s ease;
                 text-decoration: none;
                 border: none;
                 cursor: pointer;
+                font-size: 0.9rem; /* 폰트 크기 축소 */
             }
             
             .action-button.primary {
@@ -3032,7 +3149,17 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             
             .action-button:hover {
                 transform: translateY(-1px);
-                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            }
+            
+            /* 터치 디바이스에서 호버 효과 비활성화 */
+            @media (hover: none) and (pointer: coarse) {
+                .action-button:hover,
+                .wizard-step:hover,
+                .folder-item:hover {
+                    transform: none;
+                    background: var(--background-modifier-hover);
+                }
             }
         `;
         document.head.appendChild(style);
