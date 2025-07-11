@@ -23,6 +23,30 @@ jobs:
           npm install
           npm run build
 
+      - name: Generate Release Notes from Commits
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          
+          # 이전 태그 찾기
+          previous_tag=$(git tag --sort=-version:refname | grep -v "^$tag$" | head -n1)
+          
+          if [ -n "$previous_tag" ]; then
+            echo "## Release $tag" > release-notes.md
+            echo "" >> release-notes.md
+            echo "### Changes since $previous_tag" >> release-notes.md
+            echo "" >> release-notes.md
+            git log --oneline "$previous_tag".."$tag" | sed 's/^/- /' >> release-notes.md
+          else
+            echo "## Release $tag" > release-notes.md
+            echo "" >> release-notes.md
+            echo "### Initial Release" >> release-notes.md
+            echo "- First version of the plugin" >> release-notes.md
+          fi
+          
+          echo "" >> release-notes.md
+          echo "### Installation" >> release-notes.md
+          echo "Download and install via BRAT or manually extract to your plugins folder." >> release-notes.md
+      
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
