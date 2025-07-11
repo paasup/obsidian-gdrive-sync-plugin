@@ -3962,17 +3962,16 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'margin: 20px 0;' }
         });
         
-        // Header with inline refresh button
-        const headerContainer = actions.createEl('div', {
-            attr: { style: 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;' }
-        });
-        
-        headerContainer.createEl('h4', { 
+        actions.createEl('h4', { 
             text: '🎯 What will happen:',
-            attr: { style: 'margin: 0;' }
+            attr: { style: 'margin: 0 0 10px 0;' }
         });
         
-        const refreshButton = headerContainer.createEl('button', { 
+        const refreshContainer = actions.createEl('div', {
+            attr: { style: 'text-align: right; margin-bottom: 10px;' }
+        });
+        
+        const refreshButton = refreshContainer.createEl('button', { 
             cls: 'action-button secondary',
             text: '🔄 Refresh',
             attr: { style: 'padding: 6px 12px; font-size: 12px;' }
