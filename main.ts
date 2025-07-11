@@ -2519,6 +2519,9 @@ export default class GDriveSyncPlugin extends Plugin {
 
 class GDriveSyncSettingTab extends PluginSettingTab {
     plugin: GDriveSyncPlugin;
+    private currentTab: 'auth' | 'sync' | 'advanced' = 'auth';
+    private isSetupWizardCollapsed: boolean = true;
+    private statusUpdateInterval: number | null = null;
 
     constructor(app: App, plugin: GDriveSyncPlugin) {
         super(app, plugin);
@@ -2527,17 +2530,603 @@ class GDriveSyncSettingTab extends PluginSettingTab {
 
     display(): void {
         const { containerEl } = this;
-
         containerEl.empty();
 
-        containerEl.createEl('h2', { text: 'Google Drive Folder-Based Sync Settings' });
+        // Add custom CSS
+        this.addCustomCSS();
 
-        // Google Drive API Configuration
-        containerEl.createEl('h3', { text: 'Google Drive API Configuration' });
+        // Header Section
+        this.renderHeader(containerEl);
 
-        new Setting(containerEl)
+        // Quick Status Bar
+        this.renderQuickStatusBar(containerEl);
+
+        // Setup Wizard (Collapsible)
+        this.renderSetupWizard(containerEl);
+
+        // Main Configuration Tabs
+        this.renderMainTabs(containerEl);
+
+        // Live Preview Panel
+        this.renderLivePreview(containerEl);
+
+        // Start status update interval
+        this.startStatusUpdates();
+    }
+
+    private addCustomCSS(): void {
+        const style = document.createElement('style');
+        style.textContent = `
+            .gdrive-settings {
+                max-width: 900px;
+                margin: 0 auto;
+            }
+            
+            .gdrive-header {
+                text-align: center;
+                padding: 20px 0;
+                border-bottom: 2px solid var(--background-modifier-border);
+                margin-bottom: 20px;
+            }
+            
+            .gdrive-quick-status {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 15px;
+                background: var(--background-secondary);
+                border-radius: 10px;
+                margin-bottom: 20px;
+                border-left: 4px solid var(--color-green);
+                transition: all 0.3s ease;
+            }
+            
+            .gdrive-quick-status.warning {
+                border-left-color: var(--color-orange);
+            }
+            
+            .gdrive-quick-status.error {
+                border-left-color: var(--color-red);
+            }
+            
+            .status-indicator {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                font-weight: bold;
+            }
+            
+            .status-dot {
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                background: var(--color-green);
+                animation: pulse 2s infinite;
+            }
+            
+            .status-dot.warning { background: var(--color-orange); }
+            .status-dot.error { background: var(--color-red); }
+            
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            
+            .quick-actions {
+                display: flex;
+                gap: 10px;
+            }
+            
+            .setup-wizard {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border-radius: 10px;
+                padding: 20px;
+                margin-bottom: 20px;
+                transition: max-height 0.3s ease;
+                overflow: hidden;
+            }
+            
+            .setup-wizard.collapsed {
+                max-height: 60px;
+            }
+            
+            .setup-wizard:not(.collapsed) {
+                max-height: 300px;
+            }
+            
+            .wizard-header {
+                display: flex;
+                justify-content: between;
+                align-items: center;
+                cursor: pointer;
+            }
+            
+            .wizard-steps {
+                margin-top: 20px;
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+            }
+            
+            .wizard-step {
+                background: rgba(255, 255, 255, 0.1);
+                padding: 15px;
+                border-radius: 8px;
+                text-align: center;
+                transition: transform 0.2s ease;
+            }
+            
+            .wizard-step:hover {
+                transform: translateY(-2px);
+            }
+            
+            .wizard-step.completed {
+                background: rgba(76, 175, 80, 0.3);
+            }
+            
+            .wizard-step.current {
+                background: rgba(255, 193, 7, 0.3);
+                border: 2px solid rgba(255, 193, 7, 0.8);
+            }
+            
+            .tab-container {
+                margin-bottom: 20px;
+            }
+            
+            .tab-nav {
+                display: flex;
+                background: var(--background-secondary);
+                border-radius: 10px 10px 0 0;
+                overflow: hidden;
+            }
+            
+            .tab-button {
+                flex: 1;
+                padding: 15px 20px;
+                background: transparent;
+                border: none;
+                cursor: pointer;
+                transition: background 0.3s ease;
+                font-weight: 500;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+            }
+            
+            .tab-button:hover {
+                background: var(--background-modifier-hover);
+            }
+            
+            .tab-button.active {
+                background: var(--background-primary);
+                color: var(--text-accent);
+                border-bottom: 3px solid var(--text-accent);
+            }
+            
+            .tab-content {
+                background: var(--background-primary);
+                border-radius: 0 0 10px 10px;
+                padding: 20px;
+                border: 1px solid var(--background-modifier-border);
+                border-top: none;
+                min-height: 400px;
+            }
+            
+            .live-preview {
+                background: var(--background-secondary);
+                border-radius: 10px;
+                padding: 20px;
+                margin-top: 20px;
+            }
+            
+            .sync-overview {
+                display: grid;
+                grid-template-columns: 1fr auto 1fr;
+                gap: 20px;
+                align-items: center;
+                margin-bottom: 20px;
+            }
+            
+            .file-count-box {
+                text-align: center;
+                padding: 20px;
+                background: var(--background-primary);
+                border-radius: 8px;
+                border: 2px solid var(--background-modifier-border);
+            }
+            
+            .sync-action-box {
+                text-align: center;
+                padding: 15px;
+                background: linear-gradient(135deg, #4CAF50, #45a049);
+                color: white;
+                border-radius: 8px;
+                font-weight: bold;
+            }
+            
+            .connection-status {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 15px;
+                background: var(--background-secondary);
+                border-radius: 8px;
+                margin-bottom: 20px;
+            }
+            
+            .connection-status.connected {
+                border-left: 4px solid var(--color-green);
+            }
+            
+            .connection-status.warning {
+                border-left: 4px solid var(--color-orange);
+            }
+            
+            .connection-status.error {
+                border-left: 4px solid var(--color-red);
+            }
+            
+            .folder-browser {
+                border: 1px solid var(--background-modifier-border);
+                border-radius: 8px;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            
+            .folder-item {
+                display: flex;
+                align-items: center;
+                padding: 10px 15px;
+                border-bottom: 1px solid var(--background-modifier-border);
+                transition: background 0.2s ease;
+            }
+            
+            .folder-item:hover {
+                background: var(--background-modifier-hover);
+            }
+            
+            .folder-icon {
+                margin-right: 10px;
+                font-size: 16px;
+            }
+            
+            .folder-info {
+                flex-grow: 1;
+            }
+            
+            .folder-actions {
+                display: flex;
+                gap: 5px;
+            }
+            
+            .btn-small {
+                padding: 4px 8px;
+                font-size: 11px;
+                border-radius: 4px;
+            }
+            
+            .progress-bar {
+                width: 100%;
+                height: 6px;
+                background: var(--background-modifier-border);
+                border-radius: 3px;
+                overflow: hidden;
+                margin: 10px 0;
+            }
+            
+            .progress-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #4CAF50, #45a049);
+                transition: width 0.3s ease;
+                border-radius: 3px;
+            }
+            
+            .setting-group {
+                margin-bottom: 25px;
+                padding: 20px;
+                background: var(--background-secondary);
+                border-radius: 8px;
+                border-left: 4px solid var(--text-accent);
+            }
+            
+            .setting-group h4 {
+                margin: 0 0 15px 0;
+                color: var(--text-accent);
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .credentials-toggle {
+                cursor: pointer;
+                user-select: none;
+                transition: all 0.2s ease;
+            }
+            
+            .credentials-toggle:hover {
+                color: var(--text-accent);
+            }
+            
+            .smart-suggestions {
+                background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+                border-radius: 8px;
+                padding: 15px;
+                margin-top: 15px;
+                border-left: 4px solid #2196F3;
+            }
+            
+            .tooltip {
+                position: relative;
+                cursor: help;
+            }
+            
+            .tooltip:hover::after {
+                content: attr(data-tooltip);
+                position: absolute;
+                bottom: 100%;
+                left: 50%;
+                transform: translateX(-50%);
+                background: var(--background-primary);
+                color: var(--text-normal);
+                padding: 8px 12px;
+                border-radius: 6px;
+                font-size: 12px;
+                white-space: nowrap;
+                z-index: 1000;
+                border: 1px solid var(--background-modifier-border);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            }
+            
+            .action-button {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: 500;
+                transition: all 0.2s ease;
+                text-decoration: none;
+                border: none;
+                cursor: pointer;
+            }
+            
+            .action-button.primary {
+                background: var(--interactive-accent);
+                color: var(--text-on-accent);
+            }
+            
+            .action-button.secondary {
+                background: var(--background-modifier-border);
+                color: var(--text-normal);
+            }
+            
+            .action-button.warning {
+                background: var(--color-orange);
+                color: white;
+            }
+            
+            .action-button:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    private renderHeader(container: HTMLElement): void {
+        const header = container.createEl('div', { cls: 'gdrive-header' });
+        header.createEl('h1', { 
+            text: '☁️ Google Drive Sync',
+            attr: { style: 'margin: 0; color: var(--text-accent);' }
+        });
+        header.createEl('p', { 
+            text: 'Seamlessly sync your Obsidian vault with Google Drive',
+            attr: { style: 'margin: 10px 0 0 0; color: var(--text-muted);' }
+        });
+    }
+
+    private renderQuickStatusBar(container: HTMLElement): void {
+        const statusBar = container.createEl('div', { cls: 'gdrive-quick-status' });
+        
+        const statusIndicator = statusBar.createEl('div', { cls: 'status-indicator' });
+        const statusDot = statusIndicator.createEl('div', { cls: 'status-dot' });
+        const statusText = statusIndicator.createEl('span', { text: 'Checking connection...' });
+        
+        const quickActions = statusBar.createEl('div', { cls: 'quick-actions' });
+        
+        const syncButton = quickActions.createEl('button', { 
+            cls: 'action-button primary',
+            text: '🔄 Sync Now'
+        });
+        syncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
+        
+        const settingsButton = quickActions.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '⚙️ Quick Setup'
+        });
+        settingsButton.onclick = () => this.toggleSetupWizard();
+        
+        // Store references for updates
+        statusBar.dataset.statusDot = 'status-dot';
+        statusBar.dataset.statusText = 'status-text';
+        
+        this.updateQuickStatus(statusBar);
+    }
+
+    private updateQuickStatus(statusBar: HTMLElement): void {
+        const statusDot = statusBar.querySelector('.status-dot') as HTMLElement;
+        const statusText = statusBar.querySelector('.status-indicator span') as HTMLElement;
+        
+        const isAuth = this.plugin.isAuthenticated();
+        const hasRefreshToken = !!this.plugin.settings.refreshToken;
+        const tokenExpiresAt = this.plugin.settings.tokenExpiresAt;
+        
+        if (isAuth && hasRefreshToken) {
+            if (tokenExpiresAt > 0) {
+                const now = Date.now();
+                const minutesUntilExpiry = Math.round((tokenExpiresAt - now) / (1000 * 60));
+                
+                if (now >= tokenExpiresAt) {
+                    statusBar.className = 'gdrive-quick-status warning';
+                    statusDot.className = 'status-dot warning';
+                    statusText.textContent = '🔄 Token expired - will refresh automatically';
+                } else if (minutesUntilExpiry < 10) {
+                    statusBar.className = 'gdrive-quick-status warning';
+                    statusDot.className = 'status-dot warning';
+                    statusText.textContent = `⏰ Token expires in ${minutesUntilExpiry} minutes`;
+                } else {
+                    statusBar.className = 'gdrive-quick-status';
+                    statusDot.className = 'status-dot';
+                    statusText.textContent = `✅ Connected - expires ${new Date(tokenExpiresAt).toLocaleTimeString()}`;
+                }
+            } else {
+                statusBar.className = 'gdrive-quick-status';
+                statusDot.className = 'status-dot';
+                statusText.textContent = '✅ Connected with long-term authentication';
+            }
+        } else {
+            statusBar.className = 'gdrive-quick-status error';
+            statusDot.className = 'status-dot error';
+            statusText.textContent = '❌ Not authenticated - please sign in';
+        }
+    }
+
+    private renderSetupWizard(container: HTMLElement): void {
+        const wizard = container.createEl('div', { 
+            cls: `setup-wizard ${this.isSetupWizardCollapsed ? 'collapsed' : ''}`
+        });
+        
+        const wizardHeader = wizard.createEl('div', { cls: 'wizard-header' });
+        wizardHeader.onclick = () => this.toggleSetupWizard();
+        
+        wizardHeader.createEl('h3', { 
+            text: '🎯 Quick Start Guide',
+            attr: { style: 'margin: 0; flex-grow: 1;' }
+        });
+        
+        const toggleIcon = wizardHeader.createEl('span', { 
+            text: this.isSetupWizardCollapsed ? '▼' : '▲',
+            attr: { style: 'font-size: 12px; transition: transform 0.3s ease;' }
+        });
+        
+        if (!this.isSetupWizardCollapsed) {
+            const wizardSteps = wizard.createEl('div', { cls: 'wizard-steps' });
+            
+            const steps = [
+                { 
+                    title: 'Google Cloud Setup', 
+                    desc: 'Configure API credentials',
+                    completed: !!(this.plugin.settings.clientId && this.plugin.settings.clientSecret && this.plugin.settings.apiKey)
+                },
+                { 
+                    title: 'Authenticate', 
+                    desc: 'Sign in to Google Drive',
+                    completed: this.plugin.isAuthenticated()
+                },
+                { 
+                    title: 'Choose Sync Mode', 
+                    desc: 'Select folders to sync',
+                    completed: this.plugin.settings.syncWholeVault || this.plugin.settings.selectedDriveFolders.length > 0
+                },
+                { 
+                    title: 'First Sync', 
+                    desc: 'Start synchronization',
+                    completed: this.plugin.settings.lastSyncTime > 0
+                }
+            ];
+            
+            steps.forEach((step, index) => {
+                const stepEl = wizardSteps.createEl('div', { 
+                    cls: `wizard-step ${step.completed ? 'completed' : ''} ${this.getCurrentStepIndex() === index ? 'current' : ''}`
+                });
+                
+                stepEl.createEl('div', { 
+                    text: `${index + 1}. ${step.title}`,
+                    attr: { style: 'font-weight: bold; margin-bottom: 5px;' }
+                });
+                
+                stepEl.createEl('div', { 
+                    text: step.desc,
+                    attr: { style: 'font-size: 12px; opacity: 0.9;' }
+                });
+                
+                if (step.completed) {
+                    stepEl.createEl('div', { 
+                        text: '✅',
+                        attr: { style: 'font-size: 18px; margin-top: 8px;' }
+                    });
+                }
+            });
+        }
+    }
+
+    private getCurrentStepIndex(): number {
+        if (!(this.plugin.settings.clientId && this.plugin.settings.clientSecret && this.plugin.settings.apiKey)) return 0;
+        if (!this.plugin.isAuthenticated()) return 1;
+        if (!(this.plugin.settings.syncWholeVault || this.plugin.settings.selectedDriveFolders.length > 0)) return 2;
+        if (this.plugin.settings.lastSyncTime === 0) return 3;
+        return -1; // All completed
+    }
+
+    private toggleSetupWizard(): void {
+        this.isSetupWizardCollapsed = !this.isSetupWizardCollapsed;
+        this.display(); // Re-render
+    }
+
+    private renderMainTabs(container: HTMLElement): void {
+        const tabContainer = container.createEl('div', { cls: 'tab-container' });
+        
+        // Tab Navigation
+        const tabNav = tabContainer.createEl('div', { cls: 'tab-nav' });
+        
+        const tabs = [
+            { id: 'auth', label: '🔐 Authentication', icon: '🔐' },
+            { id: 'sync', label: '📂 Sync Configuration', icon: '📂' },
+            { id: 'advanced', label: '⚙️ Advanced', icon: '⚙️' }
+        ];
+        
+        tabs.forEach(tab => {
+            const tabButton = tabNav.createEl('button', { 
+                cls: `tab-button ${this.currentTab === tab.id ? 'active' : ''}`,
+                text: tab.label
+            });
+            
+            tabButton.onclick = () => {
+                this.currentTab = tab.id as any;
+                this.display();
+            };
+        });
+        
+        // Tab Content
+        const tabContent = tabContainer.createEl('div', { cls: 'tab-content' });
+        
+        switch (this.currentTab) {
+            case 'auth':
+                this.renderAuthTab(tabContent);
+                break;
+            case 'sync':
+                this.renderSyncTab(tabContent);
+                break;
+            case 'advanced':
+                this.renderAdvancedTab(tabContent);
+                break;
+        }
+    }
+
+    private renderAuthTab(container: HTMLElement): void {
+        // Connection Status
+        this.renderConnectionStatus(container);
+        
+        // Credentials Section
+        const credentialsGroup = container.createEl('div', { cls: 'setting-group' });
+        credentialsGroup.createEl('h4', { text: '🔑 API Credentials' });
+        
+        new Setting(credentialsGroup)
             .setName('Client ID')
-            .setDesc('Google Drive API Client ID (Desktop Application type)')
+            .setDesc('Google Cloud Console OAuth 2.0 Client ID')
             .addText(text => text
                 .setPlaceholder('Enter your Client ID')
                 .setValue(this.plugin.settings.clientId)
@@ -2546,9 +3135,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
+        new Setting(credentialsGroup)
             .setName('Client Secret')
-            .setDesc('Google Drive API Client Secret (from Google Cloud Console)')
+            .setDesc('Google Cloud Console OAuth 2.0 Client Secret')
             .addText(text => text
                 .setPlaceholder('Enter your Client Secret')
                 .setValue(this.plugin.settings.clientSecret)
@@ -2557,9 +3146,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
+        new Setting(credentialsGroup)
             .setName('API Key')
-            .setDesc('Google Drive API Key (from Google Cloud Console)')
+            .setDesc('Google Cloud Console API Key for Google Drive API')
             .addText(text => text
                 .setPlaceholder('Enter your API Key')
                 .setValue(this.plugin.settings.apiKey)
@@ -2567,127 +3156,222 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     this.plugin.settings.apiKey = value;
                     await this.plugin.saveSettings();
                 }));
-
-        // Authentication
-        containerEl.createEl('h3', { text: 'Authentication' });
-
-        new Setting(containerEl)
-            .setName('Check Configuration')
-            .setDesc('Verify that Client ID, Client Secret, and API Key are properly configured')
-            .addButton(button => button
-                .setButtonText('Check')
-                .onClick(() => {
-                    if (!this.plugin.settings.clientId || !this.plugin.settings.clientSecret || !this.plugin.settings.apiKey) {
-                        new Notice('❌ Please set Client ID, Client Secret, and API Key');
-                    } else {
-                        new Notice('✅ Configuration looks good! You can now authenticate.');
-                    }
-                }));
-
-        new Setting(containerEl)
-            .setName('Desktop App Authentication')
-            .setDesc('Authenticate with Google Drive using Desktop Application Client ID')
-            .addButton(button => button
-                .setButtonText('1. Open Auth URL')
-                .setCta()
-                .onClick(async () => {
-                    if (!this.plugin.settings.clientId || !this.plugin.settings.clientSecret) {
-                        new Notice('❌ Please set Client ID and Client Secret first');
-                        return;
-                    }
-                    
-                    await this.plugin.authenticateGoogleDrive();
-                }));
-                 
-        new Setting(containerEl)
-            .setName('Authorization Code')
-            .setDesc('Step 2: After authentication, paste the authorization code here')
-            .addText(text => text
-                .setPlaceholder('Paste authorization code here...')
-                .setValue('')
-                .onChange(async (value) => {
-                    // 값 저장하지 않음 (일회성)
-                }))
-            .addButton(button => button
-                .setButtonText('2. Exchange for Token')
-                .setCta()
-                .onClick(async (evt) => {
-                    const textInput = containerEl.querySelector('input[placeholder="Paste authorization code here..."]') as HTMLInputElement;
-                    const authCode = textInput?.value?.trim();
-                    
-                    if (!authCode) {
-                        new Notice('❌ Please enter authorization code first');
-                        return;
-                    }
-                    
-                    console.log('Attempting to exchange authorization code...');
-                    const success = await this.plugin.exchangeCodeForToken(authCode);
-                    
-                    if (success) {
-                        if (textInput) textInput.value = '';
+        
+        // Authentication Actions
+        const actionsGroup = container.createEl('div', { cls: 'setting-group' });
+        actionsGroup.createEl('h4', { text: '🚀 Authentication Actions' });
+        
+        const actionsContainer = actionsGroup.createEl('div', { 
+            attr: { style: 'display: flex; gap: 10px; flex-wrap: wrap;' }
+        });
+        
+        const authenticateBtn = actionsContainer.createEl('button', { 
+            cls: 'action-button primary',
+            text: '🔗 Authenticate'
+        });
+        authenticateBtn.onclick = () => this.plugin.authenticateGoogleDrive();
+        
+        const testBtn = actionsContainer.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '🧪 Test Connection'
+        });
+        testBtn.onclick = () => this.plugin.testDriveAPIConnection();
+        
+        const refreshBtn = actionsContainer.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '🔄 Refresh Token'
+        });
+        refreshBtn.onclick = async () => {
+            const success = await this.plugin.refreshAccessToken();
+            if (success) {
+                new Notice('✅ Token refreshed successfully');
+                this.display();
+            }
+        };
+        
+        const signOutBtn = actionsContainer.createEl('button', { 
+            cls: 'action-button warning',
+            text: '🚪 Sign Out'
+        });
+        signOutBtn.onclick = () => this.plugin.revokeGoogleDriveAccess();
+        
+        // Authorization Code Input
+        if (!this.plugin.isAuthenticated()) {
+            const authCodeGroup = container.createEl('div', { cls: 'setting-group' });
+            authCodeGroup.createEl('h4', { text: '🔐 Authorization Code' });
+            
+            new Setting(authCodeGroup)
+                .setName('Paste Authorization Code')
+                .setDesc('After clicking "Authenticate", paste the code here')
+                .addText(text => text
+                    .setPlaceholder('Paste authorization code...')
+                    .setValue(''))
+                .addButton(button => button
+                    .setButtonText('Exchange for Token')
+                    .setCta()
+                    .onClick(async () => {
+                        const textInput = authCodeGroup.querySelector('input') as HTMLInputElement;
+                        const authCode = textInput?.value?.trim();
                         
-                        setTimeout(async () => {
-                            await this.plugin.testDriveAPIConnection();
-                        }, 1000);
-                    }
-                }));
+                        if (!authCode) {
+                            new Notice('❌ Please enter authorization code first');
+                            return;
+                        }
+                        
+                        const success = await this.plugin.exchangeCodeForToken(authCode);
+                        if (success) {
+                            textInput.value = '';
+                            this.display();
+                        }
+                    }));
+        }
+    }
 
+    private renderConnectionStatus(container: HTMLElement): void {
+        const statusGroup = container.createEl('div', { cls: 'setting-group' });
+        statusGroup.createEl('h4', { text: '📊 Connection Status' });
+        
+        const status = statusGroup.createEl('div', { cls: 'connection-status' });
+        
+        const isAuth = this.plugin.isAuthenticated();
+        const hasRefreshToken = !!this.plugin.settings.refreshToken;
+        
+        // Connection status classes
+        if (isAuth && hasRefreshToken) {
+            status.classList.add('connected');
+            const statusContent = document.createElement('div');
+            statusContent.style.flexGrow = '1';
+            statusContent.innerHTML = `
+                <div style="font-weight: bold; margin-bottom: 5px;">✅ Connected</div>
+                <div style="font-size: 12px; opacity: 0.8;">
+                    ${this.plugin.settings.tokenExpiresAt > 0 ? 
+                        `Token expires: ${new Date(this.plugin.settings.tokenExpiresAt).toLocaleString()}` : 
+                        'Long-term authentication active'}
+                </div>
+            `;
+            status.appendChild(statusContent);
+        } else {
+            status.classList.add('error');
+            const statusContent = document.createElement('div');
+            statusContent.style.flexGrow = '1';
+            statusContent.innerHTML = `
+                <div style="font-weight: bold; margin-bottom: 5px;">❌ Not Connected</div>
+                <div style="font-size: 12px; opacity: 0.8;">Please authenticate to start syncing</div>
+            `;
+            status.appendChild(statusContent);
+        }
+    }
 
-        new Setting(containerEl)
-            .setName('Refresh Token Manually')
-            .setDesc('Manually refresh your access token using stored refresh token')
-            .addButton(button => button
-                .setButtonText('Refresh Token')
-                .onClick(async () => {
-                    if (!this.plugin.settings.refreshToken) {
-                        new Notice('❌ No refresh token available. Please re-authenticate.');
-                        return;
-                    }
-                    
-                    const success = await this.plugin.refreshAccessToken();
-                    if (success) {
-                        new Notice('✅ Access token refreshed successfully');
-                        updateStatus(); // 상태 표시 업데이트
-                    } else {
-                        new Notice('❌ Failed to refresh token. You may need to re-authenticate.');
-                    }
-                }));
-                   
-        new Setting(containerEl)
-            .setName('Test API Connection')
-            .setDesc('Test your current access token with Google Drive API')
-            .addButton(button => button
-                .setButtonText('Test Connection')
-                .onClick(async () => {
-                    await this.plugin.testDriveAPIConnection();
-                }));
-    
-        new Setting(containerEl)
-            .setName('Sign Out')
-            .setDesc('Revoke Google Drive access and sign out')
-            .addButton(button => button
-                .setButtonText('Sign Out')
-                .setWarning()
-                .onClick(async () => {
-                    await this.plugin.revokeGoogleDriveAccess();
-                    this.display(); // Refresh display
-                }));
-    
-        // Sync Configuration
-        containerEl.createEl('h3', { text: 'Sync Configuration' });
-
-        new Setting(containerEl)
-            .setName('Google Drive Root Folder')
-            .setDesc('Name of the root folder to create/use in Google Drive')
-            .addText(text => text
-                .setPlaceholder('e.g., Obsidian-Sync')
-                .setValue(this.plugin.settings.driveFolder)
+    private renderSyncTab(container: HTMLElement): void {
+        // Sync Mode Selection
+        const modeGroup = container.createEl('div', { cls: 'setting-group' });
+        modeGroup.createEl('h4', { text: '📁 Sync Mode' });
+        
+        new Setting(modeGroup)
+            .setName('Sync Whole Vault')
+            .setDesc('Sync your entire vault with Google Drive root folder')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.syncWholeVault)
                 .onChange(async (value) => {
-                    this.plugin.settings.driveFolder = value;
+                    this.plugin.settings.syncWholeVault = value;
                     await this.plugin.saveSettings();
+                    this.display();
                 }));
+        
+        // Folder Selection (only if not syncing whole vault)
+        if (!this.plugin.settings.syncWholeVault) {
+            this.renderFolderSelection(container);
+        }
+        
+        // Sync Rules
+        this.renderSyncRules(container);
+    }
 
-        new Setting(containerEl)
+    private renderFolderSelection(container: HTMLElement): void {
+        const folderGroup = container.createEl('div', { cls: 'setting-group' });
+        folderGroup.createEl('h4', { text: '📂 Google Drive Folders' });
+        
+        // Browse Google Drive Button
+        const browseContainer = folderGroup.createEl('div', { 
+            attr: { style: 'margin-bottom: 15px;' }
+        });
+        
+        const browseBtn = browseContainer.createEl('button', { 
+            cls: 'action-button primary',
+            text: '📁 Browse Google Drive'
+        });
+        browseBtn.onclick = () => this.openDriveFolderSelector();
+        
+        // Selected Folders Display
+        if (this.plugin.settings.selectedDriveFolders.length > 0) {
+            const folderList = folderGroup.createEl('div', { cls: 'folder-browser' });
+            
+            this.plugin.settings.selectedDriveFolders.forEach((folder, index) => {
+                const folderItem = folderList.createEl('div', { cls: 'folder-item' });
+                
+                folderItem.createEl('span', { 
+                    cls: 'folder-icon',
+                    text: '☁️'
+                });
+                
+                const folderInfo = folderItem.createEl('div', { cls: 'folder-info' });
+                folderInfo.createEl('div', { 
+                    text: folder.name,
+                    attr: { style: 'font-weight: bold;' }
+                });
+                folderInfo.createEl('small', { 
+                    text: `Path: ${folder.path || '/'}`,
+                    attr: { style: 'color: var(--text-muted);' }
+                });
+                
+                const folderActions = folderItem.createEl('div', { cls: 'folder-actions' });
+                
+                const removeBtn = folderActions.createEl('button', { 
+                    cls: 'btn-small action-button warning',
+                    text: '✖'
+                });
+                removeBtn.onclick = async () => {
+                    this.plugin.settings.selectedDriveFolders.splice(index, 1);
+                    await this.plugin.saveSettings();
+                    this.display();
+                    new Notice(`Removed: ${folder.name}`);
+                };
+            });
+        } else {
+            const emptyState = folderGroup.createEl('div', { 
+                attr: { 
+                    style: 'text-align: center; padding: 30px; color: var(--text-muted); border: 2px dashed var(--background-modifier-border); border-radius: 8px;'
+                }
+            });
+            emptyState.createEl('div', { 
+                text: '📂',
+                attr: { style: 'font-size: 48px; margin-bottom: 10px;' }
+            });
+            emptyState.createEl('div', { text: 'No folders selected yet' });
+            emptyState.createEl('small', { 
+                text: 'Click "Browse Google Drive" to select folders for sync',
+                attr: { style: 'display: block; margin-top: 5px;' }
+            });
+        }
+        
+        // Smart Suggestions
+        if (this.plugin.settings.selectedDriveFolders.length > 0) {
+            const suggestions = folderGroup.createEl('div', { cls: 'smart-suggestions' });
+            suggestions.createEl('strong', { text: '💡 Smart Suggestions:' });
+            const suggestionsList = suggestions.createEl('ul');
+            suggestionsList.innerHTML = `
+                <li>Selected folders will sync with local folders of the same name</li>
+                <li>Subfolders are included automatically if enabled in Advanced settings</li>
+                <li>Only .md, .txt, and other supported file types will be synced</li>
+            `;
+        }
+    }
+
+    private renderSyncRules(container: HTMLElement): void {
+        const rulesGroup = container.createEl('div', { cls: 'setting-group' });
+        rulesGroup.createEl('h4', { text: '🔄 Sync Rules' });
+        
+        new Setting(rulesGroup)
             .setName('Sync Direction')
             .setDesc('Choose how files should be synchronized')
             .addDropdown(dropdown => dropdown
@@ -2700,7 +3384,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
+        new Setting(rulesGroup)
             .setName('Conflict Resolution')
             .setDesc('How to handle conflicts when both local and remote files exist')
             .addDropdown(dropdown => dropdown
@@ -2714,70 +3398,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
-            .setName('Create Missing Folders')
-            .setDesc('Automatically create local folders when downloading files from Google Drive')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.createMissingFolders)
-                .onChange(async (value) => {
-                    this.plugin.settings.createMissingFolders = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        // Sync Whole Vault Option
-        new Setting(containerEl)
-            .setName('Sync Whole Vault')
-            .setDesc('Enable to sync the entire vault instead of selected Google Drive folders')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.syncWholeVault)
-                .onChange(async (value) => {
-                    this.plugin.settings.syncWholeVault = value;
-                    await this.plugin.saveSettings();
-                    this.display(); // Refresh the settings display
-                }));
-
-        // Google Drive Folders Section (only show when not syncing whole vault)
-        if (!this.plugin.settings.syncWholeVault) {
-            const syncFoldersSection = containerEl.createEl('div', { cls: 'sync-folders-section' });
-            syncFoldersSection.createEl('h4', { text: 'Google Drive Folders to Sync' });
-
-            // Current selected Drive folders display
-            const currentFoldersEl = syncFoldersSection.createEl('div', { cls: 'current-drive-folders' });
-            this.updateCurrentDriveFoldersDisplay(currentFoldersEl);
-
-            // Add Google Drive folder button
-            new Setting(syncFoldersSection)
-            .setName('Select Google Drive Folder')
-            .setDesc('Choose top-level folders from Google Drive to sync with local vault')  // 설명 수정
-            .addButton(button => button
-                .setButtonText('Browse Google Drive')
-                .setCta()
-                .onClick(async () => {
-                    if (!this.plugin.isAuthenticated()) {
-                        new Notice('❌ Please authenticate with Google Drive first');
-                        return;
-                    }
-                    await this.openDriveFolderSelector();
-                }));
-
-            // Clear all folders button
-            new Setting(syncFoldersSection)
-                .setName('Clear All Folders')
-                .setDesc('Remove all selected Google Drive folders')
-                .addButton(button => button
-                    .setButtonText('Clear All')
-                    .setWarning()
-                    .onClick(async () => {
-                        this.plugin.settings.selectedDriveFolders = [];
-                        await this.plugin.saveSettings();
-                        this.updateCurrentDriveFoldersDisplay(currentFoldersEl);
-                        new Notice('All Google Drive folders cleared');
-                    }));
-        }
-
-        new Setting(containerEl)
+        new Setting(rulesGroup)
             .setName('Include Subfolders')
-            .setDesc('Sync files from subfolders recursively')
+            .setDesc('Recursively sync files from subfolders')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.includeSubfolders)
                 .onChange(async (value) => {
@@ -2785,7 +3408,36 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(containerEl)
+        new Setting(rulesGroup)
+            .setName('Create Missing Folders')
+            .setDesc('Automatically create local folders when downloading from Google Drive')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.createMissingFolders)
+                .onChange(async (value) => {
+                    this.plugin.settings.createMissingFolders = value;
+                    await this.plugin.saveSettings();
+                }));
+    }
+
+    private renderAdvancedTab(container: HTMLElement): void {
+        // Performance Settings
+        const performanceGroup = container.createEl('div', { cls: 'setting-group' });
+        performanceGroup.createEl('h4', { text: '⚡ Performance' });
+        
+        new Setting(performanceGroup)
+            .setName('Sync Mode')
+            .setDesc('How to determine if files need to be synced')
+            .addDropdown(dropdown => dropdown
+                .addOption('always', 'Always sync (force upload)')
+                .addOption('modified', 'Modified time comparison (recommended)')
+                .addOption('checksum', 'Content checksum comparison (most accurate)')
+                .setValue(this.plugin.settings.syncMode)
+                .onChange(async (value: 'always' | 'modified' | 'checksum') => {
+                    this.plugin.settings.syncMode = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(performanceGroup)
             .setName('Auto Sync')
             .setDesc('Automatically sync at regular intervals')
             .addToggle(toggle => toggle
@@ -2801,7 +3453,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     }
                 }));
 
-        new Setting(containerEl)
+        new Setting(performanceGroup)
             .setName('Sync Interval')
             .setDesc('How often to sync (in minutes)')
             .addSlider(slider => slider
@@ -2816,213 +3468,286 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     }
                 }));
 
-        new Setting(containerEl)
-            .setName('Sync Mode')
-            .setDesc('How to determine if files need to be synced')
-            .addDropdown(dropdown => dropdown
-                .addOption('always', 'Always sync (force upload)')
-                .addOption('modified', 'Modified time comparison (recommended)')
-                .addOption('checksum', 'Content checksum comparison (most accurate)')
-                .setValue(this.plugin.settings.syncMode)
-                .onChange(async (value: 'always' | 'modified' | 'checksum') => {
-                    this.plugin.settings.syncMode = value;
+        // Google Drive Settings
+        const driveGroup = container.createEl('div', { cls: 'setting-group' });
+        driveGroup.createEl('h4', { text: '☁️ Google Drive Settings' });
+        
+        new Setting(driveGroup)
+            .setName('Root Folder Name')
+            .setDesc('Name of the root folder in Google Drive')
+            .addText(text => text
+                .setPlaceholder('e.g., Obsidian-Sync')
+                .setValue(this.plugin.settings.driveFolder)
+                .onChange(async (value) => {
+                    this.plugin.settings.driveFolder = value;
                     await this.plugin.saveSettings();
                 }));
 
-
-        // Sync Actions
-        containerEl.createEl('h3', { text: 'Sync Actions' });
-
-        new Setting(containerEl)
-            .setName('Start Sync')
-            .setDesc('Execute synchronization based on current sync direction setting')
-            .addButton(button => button
-                .setButtonText('🚀 Start Sync')
-                .setCta()
-                .onClick(async () => {
-                    // 항상 진행 상황 표시
-                    await this.plugin.syncWithGoogleDrive(true);
-                }));
-
-        // Authentication Status
-        containerEl.createEl('h3', { text: 'Status Information' });
-        const statusEl = containerEl.createEl('div');
-
-        const updateStatus = () => {
-            const isAuth = this.plugin.isAuthenticated();
-            const hasRefreshToken = !!this.plugin.settings.refreshToken;
-            const tokenExpiresAt = this.plugin.settings.tokenExpiresAt;
-            
-            let tokenStatusText = '';
-            let tokenStatusColor = '';
-            
-            if (isAuth && hasRefreshToken) {
-                if (tokenExpiresAt > 0) {
-                    const expiresDate = new Date(tokenExpiresAt);
-                    const now = new Date();
-                    const isExpired = now >= expiresDate;
-                    const minutesUntilExpiry = Math.round((expiresDate.getTime() - now.getTime()) / (1000 * 60));
-                    
-                    if (isExpired) {
-                        tokenStatusText = '🔄 Token expired, will auto-refresh on next use';
-                        tokenStatusColor = '#FF9800';
-                    } else if (minutesUntilExpiry < 10) {
-                        tokenStatusText = `⏰ Token expires in ${minutesUntilExpiry} minutes (will auto-refresh)`;
-                        tokenStatusColor = '#FF9800';
-                    } else {
-                        tokenStatusText = `✅ Token valid until ${expiresDate.toLocaleString()}`;
-                        tokenStatusColor = '#4CAF50';
-                    }
-                } else {
-                    tokenStatusText = '✅ Authenticated with long-term tokens';
-                    tokenStatusColor = '#4CAF50';
-                }
-            } else if (this.plugin.settings.accessToken) {
-                tokenStatusText = '⚠️ Partial authentication (missing refresh token)';
-                tokenStatusColor = '#FF9800';
-            } else {
-                tokenStatusText = '❌ Not authenticated';
-                tokenStatusColor = '#F44336';
-            }
-            
-            const selectedFoldersCount = this.plugin.settings.selectedDriveFolders.length;
-            
-            statusEl.innerHTML = `
-                <div style="padding: 10px; border-radius: 4px; margin-bottom: 10px; ${isAuth ? 
-                    'background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724;' : 
-                    'background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24;'}">
-                    <strong>Authentication:</strong> ${isAuth ? '✅ Fully Authenticated' : '❌ Not Authenticated'}
-                    <br><span style="color: ${tokenStatusColor};">${tokenStatusText}</span>
-                    <br><small>Access Token: ${this.plugin.settings.accessToken ? '✓ Available' : '✗ Missing'}</small>
-                    <br><small>Refresh Token: ${hasRefreshToken ? '✓ Available (for auto-renewal)' : '✗ Missing'}</small>
-                </div>
-                <div style="padding: 10px; border-radius: 4px; margin-bottom: 10px; background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;">
-                    <strong>Sync Mode:</strong> ${this.plugin.settings.syncWholeVault ? 
-                        '📁 Whole Vault' : 
-                        `📂 Selected Folders (${selectedFoldersCount} selected)`}
-                    <br><small>Google Drive Root: ${this.plugin.settings.driveFolder}</small>
-                    <br><small>Sync Direction: ${this.plugin.settings.syncDirection === 'bidirectional' ? '🔄 Bidirectional' : 
-                        this.plugin.settings.syncDirection === 'upload' ? '📤 Upload Only' : '📥 Download Only'}</small>
-                    <br><small>Conflict Resolution: ${this.plugin.settings.conflictResolution === 'newer' ? '🕒 Use Newer File' :
-                        this.plugin.settings.conflictResolution === 'local' ? '📱 Always Use Local' :
-                        this.plugin.settings.conflictResolution === 'remote' ? '☁️ Always Use Remote' : '❓ Ask User'}</small>
-                    ${this.plugin.settings.lastSyncTime ? 
-                        `<br><small>Last Sync: ${new Date(this.plugin.settings.lastSyncTime).toLocaleString()}</small>` : 
-                        '<br><small>Never synced</small>'}
-                </div>
-            `;
+        // Troubleshooting
+        const troubleshootGroup = container.createEl('div', { cls: 'setting-group' });
+        troubleshootGroup.createEl('h4', { text: '🔧 Troubleshooting' });
+        
+        const troubleshootActions = troubleshootGroup.createEl('div', { 
+            attr: { style: 'display: flex; gap: 10px; flex-wrap: wrap;' }
+        });
+        
+        const clearCacheBtn = troubleshootActions.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '🧹 Clear Cache'
+        });
+        clearCacheBtn.onclick = () => {
+            // Clear folder cache - using proper type assertion
+            (this.plugin as any).folderCache = {};
+            new Notice('✅ Cache cleared successfully');
         };
-
-        updateStatus();
-
-        // Setup Instructions
-        containerEl.createEl('h3', { text: 'Setup Instructions' });
-        const instructionsEl = containerEl.createEl('div');
-        instructionsEl.innerHTML = `
-        <div style="background-color: #d4edda; border: 1px solid #c3e6cb; padding: 10px; margin: 10px 0; border-radius: 4px;">
-            <p><strong>✅ Google Cloud Console 설정:</strong></p>
-            <ol>
-                <li><a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console - Credentials</a> 접속</li>
-                <li>"Create Credentials" → "OAuth client ID" 선택</li>
-                <li><strong>Application type: "Desktop application"</strong> 선택</li>
-                <li>Name 입력 후 "Create" 클릭</li>
-                <li>생성된 Client ID와 Client Secret을 위 설정에 입력</li>
-                <li>Google Drive API가 활성화되어 있는지 확인</li>
-            </ol>
-        </div>
-        <div style="background-color: #e7f3ff; border: 1px solid #b3d7ff; padding: 10px; margin: 10px 0; border-radius: 4px;">
-            <p><strong>🔄 Google Drive 기반 동기화:</strong></p>
-            <ul>
-                <li><strong>📁 Whole Vault:</strong> 전체 볼트를 Google Drive 루트 폴더와 동기화</li>
-                <li><strong>📂 Selected Folders:</strong> Google Drive에서 선택한 최상위 폴더들만 로컬과 동기화</li>
-                <li><strong>🏗️ 폴더 생성:</strong> Google Drive에서 새 최상위 폴더를 생성하고 선택 가능</li>
-                <li><strong>🗑️ 폴더 삭제:</strong> Google Drive의 최상위 폴더를 휴지통으로 이동</li>
-                <li><strong>🔍 폴더 브라우징:</strong> Google Drive 최상위 폴더 구조를 탐색하고 관리</li>
-            </ul>
-            <p><strong>💡 사용 방법:</strong></p>
-            <ol>
-                <li>Google Cloud Console에서 API 설정 완료</li>
-                <li>Desktop App Authentication으로 인증</li>
-                <li>"Browse Google Drive" 버튼으로 최상위 폴더 구조 확인</li>
-                <li>동기화할 Google Drive 최상위 폴더 선택</li>
-                <li>선택된 폴더들이 로컬 경로와 자동 매핑되어 동기화</li>
-            </ol>
-        </div>
-        <div style="background-color: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; margin: 10px 0; border-radius: 4px;">
-            <p><strong>⚠️ 중요사항:</strong></p>
-            <ul>
-                <li>최상위 폴더만 선택 가능하며, 하위 폴더는 자동으로 포함됩니다</li>
-                <li>Google Drive에서 선택한 폴더 경로가 로컬 볼트 경로와 일치해야 합니다</li>
-                <li>예: Google Drive의 "Notes" 폴더는 로컬의 "Notes" 폴더와 동기화</li>
-                <li>폴더 삭제 시 Google Drive 휴지통으로 이동되므로 복구 가능합니다</li>
-                <li>"Whole Vault" 모드에서는 모든 폴더가 동기화됩니다</li>
-            </ul>
-        </div>
-        `;
+        
+        const exportLogsBtn = troubleshootActions.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '📋 Export Logs'
+        });
+        exportLogsBtn.onclick = () => {
+            const logs = {
+                settings: this.plugin.settings,
+                isAuthenticated: this.plugin.isAuthenticated(),
+                timestamp: new Date().toISOString()
+            };
+            navigator.clipboard.writeText(JSON.stringify(logs, null, 2));
+            new Notice('📋 Settings exported to clipboard');
+        };
+        
+        // Add the DEFAULT_SETTINGS constant reference
+        const DEFAULT_SETTINGS = {
+            clientId: '',
+            clientSecret: '',
+            apiKey: '',
+            syncFolders: [],
+            syncWholeVault: false,
+            autoSync: false,
+            syncInterval: 300000,
+            accessToken: '',
+            refreshToken: '',
+            tokenExpiresAt: 0,
+            driveFolder: 'Obsidian-Sync',
+            includeSubfolders: true,
+            syncMode: 'modified' as const,
+            lastSyncTime: 0,
+            syncDirection: 'bidirectional' as const,
+            conflictResolution: 'newer' as const,
+            createMissingFolders: true,
+            selectedDriveFolders: []
+        };
+        
+        const resetBtn = troubleshootActions.createEl('button', { 
+            cls: 'action-button warning',
+            text: '🔄 Reset Settings'
+        });
+        resetBtn.onclick = async () => {
+            if (confirm('Are you sure you want to reset all settings? This cannot be undone.')) {
+                this.plugin.settings = Object.assign({}, DEFAULT_SETTINGS);
+                await this.plugin.saveSettings();
+                this.display();
+                new Notice('⚠️ Settings reset to defaults');
+            }
+        };
+        
+        // Debug Information
+        const debugGroup = container.createEl('div', { cls: 'setting-group' });
+        debugGroup.createEl('h4', { text: '🐛 Debug Information' });
+        
+        const debugInfo = debugGroup.createEl('div', { 
+            attr: { 
+                style: 'background: var(--background-primary); padding: 15px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 200px; overflow-y: auto;'
+            }
+        });
+        
+        const debugData = {
+            version: '1.0.0',
+            authenticated: this.plugin.isAuthenticated(),
+            hasRefreshToken: !!this.plugin.settings.refreshToken,
+            tokenExpires: this.plugin.settings.tokenExpiresAt > 0 ? new Date(this.plugin.settings.tokenExpiresAt).toLocaleString() : 'Unknown',
+            selectedFolders: this.plugin.settings.selectedDriveFolders.length,
+            lastSync: this.plugin.settings.lastSyncTime > 0 ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never',
+            syncMode: this.plugin.settings.syncDirection,
+            autoSync: this.plugin.settings.autoSync
+        };
+        
+        debugInfo.textContent = JSON.stringify(debugData, null, 2);
     }
 
-    // 현재 선택된 Google Drive 폴더들 표시 업데이트
-    private updateCurrentDriveFoldersDisplay(containerEl: HTMLElement) {
-        containerEl.empty();
+    private renderLivePreview(container: HTMLElement): void {
+        const preview = container.createEl('div', { cls: 'live-preview' });
+        preview.createEl('h3', { 
+            text: '📊 Sync Overview',
+            attr: { style: 'margin: 0 0 20px 0; display: flex; align-items: center; gap: 8px;' }
+        });
         
-        if (this.plugin.settings.selectedDriveFolders.length === 0) {
-            containerEl.createEl('p', { text: 'No Google Drive folders selected for sync', cls: 'setting-item-description' });
+        // Sync Overview Grid
+        const overview = preview.createEl('div', { cls: 'sync-overview' });
+        
+        // Local Files
+        const localBox = overview.createEl('div', { cls: 'file-count-box' });
+        localBox.createEl('div', { 
+            text: '📱',
+            attr: { style: 'font-size: 24px; margin-bottom: 8px;' }
+        });
+        localBox.createEl('div', { 
+            text: 'Local Files',
+            attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
+        });
+        const localCount = localBox.createEl('div', { 
+            text: 'Calculating...',
+            attr: { style: 'font-size: 18px; color: var(--text-accent);' }
+        });
+        
+        // Sync Action
+        const actionBox = overview.createEl('div', { cls: 'sync-action-box' });
+        actionBox.createEl('div', { 
+            text: '🔄',
+            attr: { style: 'font-size: 20px; margin-bottom: 5px;' }
+        });
+        actionBox.createEl('div', { text: 'Ready to Sync' });
+        
+        // Remote Files  
+        const remoteBox = overview.createEl('div', { cls: 'file-count-box' });
+        remoteBox.createEl('div', { 
+            text: '☁️',
+            attr: { style: 'font-size: 24px; margin-bottom: 8px;' }
+        });
+        remoteBox.createEl('div', { 
+            text: 'Remote Files',
+            attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
+        });
+        const remoteCount = remoteBox.createEl('div', { 
+            text: 'Calculating...',
+            attr: { style: 'font-size: 18px; color: var(--text-accent);' }
+        });
+        
+        // What will happen section
+        const actions = preview.createEl('div', { 
+            attr: { style: 'margin: 20px 0;' }
+        });
+        actions.createEl('h4', { text: '🎯 What will happen:' });
+        
+        const actionsList = actions.createEl('ul', { 
+            attr: { style: 'margin: 10px 0; padding-left: 20px;' }
+        });
+        
+        const uploadLi = actionsList.createEl('li', { text: 'Upload: 📤 Calculating...' });
+        const downloadLi = actionsList.createEl('li', { text: 'Download: 📥 Calculating...' });
+        const conflictLi = actionsList.createEl('li', { text: 'Conflicts: ⚡ Calculating...' });
+        
+        const estimatedTime = actions.createEl('div', { 
+            text: 'Estimated time: ⏱️ Calculating...',
+            attr: { style: 'margin-top: 10px; font-style: italic; color: var(--text-muted);' }
+        });
+        
+        // Start Sync Button
+        const syncButton = preview.createEl('button', { 
+            cls: 'action-button primary',
+            text: '🚀 Start Sync',
+            attr: { style: 'width: 100%; padding: 15px; font-size: 16px; margin-top: 15px;' }
+        });
+        syncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
+        
+        // Update preview with actual data
+        this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime);
+    }
+
+    private async updateLivePreview(
+        localCountEl: HTMLElement, 
+        remoteCountEl: HTMLElement,
+        uploadEl: HTMLElement,
+        downloadEl: HTMLElement,
+        conflictEl: HTMLElement,
+        timeEl: HTMLElement
+    ): Promise<void> {
+        try {
+            if (!this.plugin.isAuthenticated()) {
+                localCountEl.textContent = 'Sign in required';
+                remoteCountEl.textContent = 'Sign in required';
+                uploadEl.textContent = 'Upload: 📤 Authentication required';
+                downloadEl.textContent = 'Download: 📥 Authentication required';
+                conflictEl.textContent = 'Conflicts: ⚡ Authentication required';
+                timeEl.textContent = 'Estimated time: ⏱️ Please authenticate first';
+                return;
+            }
+
+            // Count local files
+            let localFiles: TFile[] = [];
+            if (this.plugin.settings.syncWholeVault) {
+                localFiles = this.plugin.app.vault.getFiles().filter(file => this.plugin.shouldSyncFileType(file));
+            } else {
+                for (const driveFolder of this.plugin.settings.selectedDriveFolders) {
+                    const folderFiles = await this.plugin.getLocalFilesForDriveFolder(driveFolder);
+                    localFiles.push(...folderFiles);
+                }
+            }
+            
+            localCountEl.textContent = localFiles.length.toString();
+            
+            // Count remote files (if authenticated)
+            let remoteFiles: any[] = [];
+            try {
+                if (this.plugin.settings.syncWholeVault) {
+                    const rootFolder = await this.plugin.getOrCreateDriveFolder();
+                    if (rootFolder) {
+                        remoteFiles = await this.plugin.getAllFilesFromDrive(rootFolder.id);
+                    }
+                } else {
+                    for (const driveFolder of this.plugin.settings.selectedDriveFolders) {
+                        const folderFiles = await this.plugin.getAllFilesFromDrive(driveFolder.id, driveFolder.path);
+                        remoteFiles.push(...folderFiles);
+                    }
+                }
+                
+                remoteCountEl.textContent = remoteFiles.length.toString();
+                
+                // Estimate sync actions
+                const estimatedUploads = Math.max(0, localFiles.length - remoteFiles.length);
+                const estimatedDownloads = Math.max(0, remoteFiles.length - localFiles.length);
+                const estimatedConflicts = Math.min(localFiles.length, remoteFiles.length);
+                
+                uploadEl.textContent = `Upload: 📤 ~${estimatedUploads} files`;
+                downloadEl.textContent = `Download: 📥 ~${estimatedDownloads} files`;
+                conflictEl.textContent = `Conflicts: ⚡ ~${estimatedConflicts} to check`;
+                
+                const totalActions = estimatedUploads + estimatedDownloads + estimatedConflicts;
+                const estimatedSeconds = Math.max(30, totalActions * 2); // 2 seconds per file estimate
+                timeEl.textContent = `Estimated time: ⏱️ ~${Math.round(estimatedSeconds / 60)} minutes`;
+                
+            } catch (error) {
+                remoteCountEl.textContent = 'Error loading';
+                uploadEl.textContent = 'Upload: 📤 Unable to calculate';
+                downloadEl.textContent = 'Download: 📥 Unable to calculate';
+                conflictEl.textContent = 'Conflicts: ⚡ Unable to calculate';
+                timeEl.textContent = 'Estimated time: ⏱️ Error calculating';
+            }
+            
+        } catch (error) {
+            console.error('Error updating live preview:', error);
+            localCountEl.textContent = 'Error';
+            remoteCountEl.textContent = 'Error';
+        }
+    }
+
+    private startStatusUpdates(): void {
+        // Update status every 30 seconds
+        this.statusUpdateInterval = window.setInterval(() => {
+            const statusBar = document.querySelector('.gdrive-quick-status') as HTMLElement;
+            if (statusBar) {
+                this.updateQuickStatus(statusBar);
+            }
+        }, 30000);
+    }
+
+    private async openDriveFolderSelector(): Promise<void> {
+        if (!this.plugin.isAuthenticated()) {
+            new Notice('❌ Please authenticate with Google Drive first');
             return;
         }
 
-        containerEl.createEl('p', { text: 'Selected Google Drive folders:', cls: 'setting-item-description' });
-        
-        const folderList = containerEl.createEl('div', { cls: 'sync-drive-folders-list' });
-        
-        this.plugin.settings.selectedDriveFolders.forEach((folder, index) => {
-            const folderItem = folderList.createEl('div', { 
-                cls: 'sync-drive-folder-item',
-                attr: { style: 'display: flex; align-items: center; margin-bottom: 5px; padding: 8px; background-color: var(--background-secondary); border-radius: 3px;' }
-            });
-            
-            const folderIcon = folderItem.createEl('span', { 
-                text: '☁️',
-                attr: { style: 'margin-right: 8px;' }
-            });
-            
-            const folderInfo = folderItem.createEl('div', { 
-                attr: { style: 'flex-grow: 1; margin-right: 10px;' }
-            });
-            
-            const folderName = folderInfo.createEl('div', { 
-                text: folder.name,
-                attr: { style: 'font-weight: bold;' }
-            });
-            
-            const folderPath = folderInfo.createEl('small', { 
-                text: `Path: ${folder.path || '/'}`,
-                attr: { style: 'color: var(--text-muted); font-size: 0.8em;' }
-            });
-            
-            const folderId = folderInfo.createEl('small', { 
-                text: `ID: ${folder.id}`,
-                attr: { style: 'color: var(--text-muted); font-size: 0.8em; display: block;' }
-            });
-            
-            const removeButton = folderItem.createEl('button', { 
-                text: '✖',
-                cls: 'mod-warning',
-                attr: { style: 'min-width: 24px; height: 24px; padding: 0; border-radius: 3px;' }
-            });
-            
-            removeButton.onclick = async () => {
-                this.plugin.settings.selectedDriveFolders.splice(index, 1);
-                await this.plugin.saveSettings();
-                this.updateCurrentDriveFoldersDisplay(containerEl);
-                new Notice(`Removed Google Drive folder: ${folder.name}`);
-            };
-        });
-    }
-
-    // Google Drive 폴더 선택 모달 열기
-    private async openDriveFolderSelector() {
         const modal = new DriveFolderModal(this.app, this.plugin, async (selectedFolder) => {
-            // 이미 선택된 폴더인지 확인
+            // Check if already selected
             const alreadySelected = this.plugin.settings.selectedDriveFolders.some(
                 folder => folder.id === selectedFolder.id
             );
@@ -3032,7 +3757,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 return;
             }
             
-            // 선택된 폴더 추가
+            // Add selected folder
             this.plugin.settings.selectedDriveFolders.push({
                 id: selectedFolder.id,
                 name: selectedFolder.name,
@@ -3040,90 +3765,21 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             });
             
             await this.plugin.saveSettings();
-            
-            // 디스플레이 업데이트
-            const currentFoldersEl = document.querySelector('.current-drive-folders') as HTMLElement;
-            if (currentFoldersEl) {
-                this.updateCurrentDriveFoldersDisplay(currentFoldersEl);
-            }
-            
-            new Notice(`Added Google Drive folder: ${selectedFolder.name}`);
+            this.display(); // Refresh the settings display
+            new Notice(`✅ Added Google Drive folder: ${selectedFolder.name}`);
         });
         
         modal.open();
     }
 
-    // Google Drive 폴더 브라우저 열기 (관리용)
-    private async openDriveFolderBrowser() {
-        const modal = new DriveFolderModal(this.app, this.plugin, (selectedFolder) => {
-            console.log('Selected folder for browsing:', selectedFolder);
-            new Notice(`Folder info: ${selectedFolder.name} (${selectedFolder.path})`);
-        });
+    hide(): void {
+        // Clean up interval when hiding
+        if (this.statusUpdateInterval) {
+            window.clearInterval(this.statusUpdateInterval);
+            this.statusUpdateInterval = null;
+        }
         
-        modal.open();
-    }
-
-    // 동기화 미리보기
-    private async previewSync() {
-        if (!this.plugin.isAuthenticated()) {
-            new Notice('❌ Please authenticate first');
-            return;
-        }
-
-        try {
-            console.log('=== GOOGLE DRIVE FOLDER-BASED SYNC PREVIEW ===');
-            console.log(`Google Drive root folder: ${this.plugin.settings.driveFolder}`);
-            console.log(`Sync direction: ${this.plugin.settings.syncDirection}`);
-            console.log(`Sync whole vault: ${this.plugin.settings.syncWholeVault}`);
-            console.log(`Selected Drive folders: ${this.plugin.settings.selectedDriveFolders.length}`);
-
-            if (this.plugin.settings.syncWholeVault) {
-                // 전체 볼트 미리보기
-                const localFiles = this.plugin.app.vault.getFiles().filter(file => this.plugin.shouldSyncFileType(file));
-                console.log(`\n📱 LOCAL FILES (Whole Vault): ${localFiles.length} files`);
-                
-                const rootFolder = await this.plugin.getOrCreateDriveFolder();
-                if (rootFolder) {
-                    const driveFiles = await this.plugin.getAllFilesFromDrive(rootFolder.id);
-                    console.log(`☁️ GOOGLE DRIVE FILES: ${driveFiles.length} files`);
-                    
-                    const summary = `📋 Preview: ${localFiles.length} local files, ${driveFiles.length} remote files`;
-                    new Notice(summary);
-                }
-            } else {
-                // 선택된 폴더들 미리보기
-                if (this.plugin.settings.selectedDriveFolders.length === 0) {
-                    new Notice('❌ No Google Drive folders selected');
-                    return;
-                }
-
-                let totalLocalFiles = 0;
-                let totalDriveFiles = 0;
-
-                console.log(`\n📂 SELECTED GOOGLE DRIVE FOLDERS (${this.plugin.settings.selectedDriveFolders.length}):`);
-                
-                for (const driveFolder of this.plugin.settings.selectedDriveFolders) {
-                    console.log(`\n📁 Processing: ${driveFolder.name} (${driveFolder.path})`);
-                    
-                    // 로컬 파일 수집
-                    const localFiles = await this.plugin.getLocalFilesForDriveFolder(driveFolder);
-                    totalLocalFiles += localFiles.length;
-                    console.log(`  📱 Local files: ${localFiles.length}`);
-                    
-                    // Google Drive 파일 수집
-                    const driveFiles = await this.plugin.getAllFilesFromDrive(driveFolder.id, driveFolder.path);
-                    totalDriveFiles += driveFiles.length;
-                    console.log(`  ☁️ Drive files: ${driveFiles.length}`);
-                }
-
-                const summary = `📋 Preview: ${totalLocalFiles} local files, ${totalDriveFiles} remote files in ${this.plugin.settings.selectedDriveFolders.length} folders`;
-                console.log(`\n${summary}`);
-                new Notice(summary + '. Check console for details.');
-            }
-
-        } catch (error) {
-            console.error('Preview sync error:', error);
-            new Notice('❌ Failed to preview sync. Check console for details.');
-        }
+        // Call parent hide method - PluginSettingTab may not have hide method
+        // so we just clean up our resources here
     }
 }
