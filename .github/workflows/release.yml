@@ -12,6 +12,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # 중요: 전체 히스토리 가져오기
+          fetch-tags: true
 
       - name: Use Node.js
         uses: actions/setup-node@v3
@@ -26,6 +29,9 @@ jobs:
       - name: Generate Release Notes from Commits
         run: |
           tag="${{ github.ref_name }}"
+
+          # 태그 정보 업데이트
+          git fetch --tags
           
           # 이전 태그 찾기
           previous_tag=$(git tag --sort=-version:refname | grep -v "^$tag$" | head -n1)
