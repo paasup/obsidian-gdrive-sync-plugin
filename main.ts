@@ -805,7 +805,7 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log('No refresh token available');
             return false;
         }
-
+    
         try {
             console.log('Refreshing access token...');
             
@@ -823,7 +823,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 }).toString(),
                 throw: false
             });
-
+    
             if (response.status === 200) {
                 const tokenData = response.json;
                 console.log('Token refresh successful');
@@ -871,7 +871,13 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log('No access token available');
             return false;
         }
-
+    
+        // Refresh token이 없으면 재인증 필요
+        if (!this.settings.refreshToken) {
+            console.log('No refresh token available - need to re-authenticate');
+            return false;
+        }
+    
         // 토큰 만료 시간이 설정되어 있고, 만료 5분 전이면 갱신
         const now = Date.now();
         const fiveMinutes = 5 * 60 * 1000;
@@ -882,10 +888,10 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log('Access token will expire soon, refreshing...');
             return await this.refreshAccessToken();
         }
-
+    
         // 토큰 만료 시간이 설정되지 않았거나 아직 유효한 경우
         return true;
-    }      
+    }   
 
     // 캐시된 폴더 ID 가져오기 또는 생성
     private async getCachedFolderId(folderPath: string, rootFolderId: string): Promise<string> {
@@ -915,6 +921,7 @@ export default class GDriveSyncPlugin extends Plugin {
         });
         ribbonIconEl.addClass('gdrive-sync-ribbon-class');
 
+        // Commands 추가
         this.addCommand({
             id: 'sync-with-gdrive',
             name: 'Sync with Google Drive',
@@ -939,19 +946,52 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
 
+        // Auto Sync 디버그 명령어 추가
+        this.addCommand({
+            id: 'debug-auto-sync',
+            name: 'Debug Auto Sync Status',
+            callback: () => {
+                this.debugAutoSyncStatus();
+            }
+        });
+
         this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
 
         console.log('Plugin loaded - Google Drive folder-based sync');
+        console.log(`Initial auto sync setting: ${this.settings.autoSync}`);
 
+        // Auto Sync 초기 설정
         if (this.settings.autoSync) {
+            console.log('Initializing auto sync on plugin load...');
             this.setupAutoSync();
+        } else {
+            console.log('Auto sync disabled on plugin load');
         }
     }
 
+    debugAutoSyncStatus() {
+        const debugInfo = {
+            autoSyncSetting: this.settings.autoSync,
+            syncIntervalId: this.syncIntervalId,
+            isAutoSyncActive: this.isAutoSyncActive(),
+            syncInterval: this.settings.syncInterval,
+            syncIntervalMinutes: this.settings.syncInterval / 60000,
+            currentTime: new Date().toLocaleString(),
+            lastSyncTime: this.settings.lastSyncTime > 0 ? new Date(this.settings.lastSyncTime).toLocaleString() : 'Never'
+        };
+
+        console.log('=== AUTO SYNC DEBUG INFO ===');
+        console.table(debugInfo);
+        
+        new Notice(`Auto Sync: ${this.isAutoSyncActive() ? '✅ Active' : '❌ Inactive'} (Check console for details)`);
+        
+        return debugInfo;
+    }
+
     onunload() {
-        if (this.syncIntervalId) {
-            window.clearInterval(this.syncIntervalId);
-        }
+        console.log('Unloading plugin...');
+        this.stopAutoSync();
+        console.log('Plugin unloaded');
     }
 
     async loadSettings() {
@@ -965,10 +1005,33 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    async saveSettings() {
-        await this.saveData(this.settings);
+    public isAutoSyncActive(): boolean {
+        return this.settings.autoSync && this.syncIntervalId !== null;
     }
-
+    async saveSettings() {
+        console.log(`Saving settings... Auto sync: ${this.settings.autoSync}`);
+        await this.saveData(this.settings);
+        
+        // 설정 변경 후 Auto Sync 상태 재동기화
+        if (this.settings.autoSync && !this.isAutoSyncActive()) {
+            console.log('Auto sync enabled but not active - setting up...');
+            this.setupAutoSync();
+        } else if (!this.settings.autoSync && this.isAutoSyncActive()) {
+            console.log('Auto sync disabled but still active - stopping...');
+            this.stopAutoSync();
+        }
+    }
+    stopAutoSync() {
+        console.log('=== Stopping Auto Sync ===');
+        if (this.syncIntervalId) {
+            console.log(`Clearing interval: ${this.syncIntervalId}`);
+            window.clearInterval(this.syncIntervalId);
+            this.syncIntervalId = null;
+            console.log('✅ Auto sync stopped');
+        } else {
+            console.log('ℹ️ No auto sync interval to clear');
+        }
+    }
     // 인증 관련 메서드들
     async authenticateGoogleDrive(): Promise<boolean> {
         console.log('=== Starting Google Drive Desktop Authentication ===');
@@ -2466,13 +2529,31 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     setupAutoSync() {
+        console.log('=== Setting up Auto Sync ===');
+        console.log(`Auto sync enabled: ${this.settings.autoSync}`);
+        console.log(`Sync interval: ${this.settings.syncInterval}ms (${this.settings.syncInterval / 60000} minutes)`);
+        
+        // 기존 interval 정리
         if (this.syncIntervalId) {
+            console.log(`Clearing existing interval: ${this.syncIntervalId}`);
             window.clearInterval(this.syncIntervalId);
+            this.syncIntervalId = null;
         }
 
-        this.syncIntervalId = window.setInterval(() => {
-            this.syncWithGoogleDrive(false);
-        }, this.settings.syncInterval);
+        // Auto sync가 활성화된 경우에만 새 interval 설정
+        if (this.settings.autoSync) {
+            console.log(`Setting new auto sync interval: ${this.settings.syncInterval}ms`);
+            this.syncIntervalId = window.setInterval(() => {
+                console.log(`🔄 Auto sync triggered at ${new Date().toLocaleString()}`);
+                this.syncWithGoogleDrive(false);
+            }, this.settings.syncInterval);
+            
+            console.log(`✅ Auto sync active with interval ID: ${this.syncIntervalId}`);
+        } else {
+            console.log('❌ Auto sync is disabled - no interval set');
+        }
+        
+        console.log(`Final auto sync status: ${this.isAutoSyncActive()}`);
     }
 
     resetGoogleAPIState() {
@@ -2878,6 +2959,25 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 padding: 15px;
                 margin-top: 15px;
                 border-left: 4px solid #2196F3;
+            }
+            
+            .sync-interval-value {
+                font-weight: bold;
+                color: var(--text-accent);
+                margin-left: 10px;
+                min-width: 80px;
+                text-align: right;
+                display: inline-block;
+            }
+            
+            .setting-item .slider {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            
+            .setting-item .slider input[type="range"] {
+                flex-grow: 1;
             }
             
             .tooltip {
@@ -3459,36 +3559,90 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
-        new Setting(performanceGroup)
-            .setName('Auto Sync')
-            .setDesc('Automatically sync at regular intervals')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.autoSync)
-                .onChange(async (value) => {
-                    this.plugin.settings.autoSync = value;
-                    await this.plugin.saveSettings();
-                    if (value) {
-                        this.plugin.setupAutoSync();
-                    } else if (this.plugin.syncIntervalId) {
-                        window.clearInterval(this.plugin.syncIntervalId);
-                        this.plugin.syncIntervalId = null;
-                    }
-                }));
+                new Setting(performanceGroup)
+                .setName('Auto Sync')
+                .setDesc('Automatically sync at regular intervals')
+                .addToggle(toggle => toggle
+                    .setValue(this.plugin.settings.autoSync)
+                    .onChange(async (value) => {
+                        console.log(`Auto sync toggle changed to: ${value}`);
+                        
+                        this.plugin.settings.autoSync = value;
+                        await this.plugin.saveSettings();
+                        
+                        if (value) {
+                            console.log('Auto sync enabled - setting up interval...');
+                            this.plugin.setupAutoSync();
+                            new Notice('✅ Auto sync enabled');
+                        } else {
+                            console.log('Auto sync disabled - stopping interval...');
+                            this.plugin.stopAutoSync();
+                            new Notice('❌ Auto sync disabled');
+                        }
+                        
+                        // UI 업데이트
+                        setTimeout(() => this.updateAutoSyncStatus(), 100);
+                    }))
+                .then(setting => {
+                    // Auto Sync 상태 표시 추가
+                    const statusEl = setting.descEl.createEl('div', {
+                        cls: 'auto-sync-status',
+                        attr: { style: 'margin-top: 8px; font-size: 12px;' }
+                    });
+                    this.updateAutoSyncStatus(statusEl);
+                });
 
-        new Setting(performanceGroup)
-            .setName('Sync Interval')
-            .setDesc('How often to sync (in minutes)')
-            .addSlider(slider => slider
-                .setLimits(1, 60, 1)
-                .setValue(this.plugin.settings.syncInterval / 60000)
-                .setDynamicTooltip()
-                .onChange(async (value) => {
-                    this.plugin.settings.syncInterval = value * 60000;
-                    await this.plugin.saveSettings();
-                    if (this.plugin.settings.autoSync) {
-                        this.plugin.setupAutoSync();
+                new Setting(performanceGroup)
+                .setName('Sync Interval')
+                .setDesc('How often to sync (in minutes)')
+                .addSlider(slider => {
+                    const currentValue = this.plugin.settings.syncInterval / 60000;
+                    return slider
+                        .setLimits(1, 60, 1)
+                        .setValue(currentValue)
+                        .setDynamicTooltip()
+                        .onChange(async (value) => {
+                            console.log(`Sync interval changed to: ${value} minutes`);
+                            
+                            this.plugin.settings.syncInterval = value * 60000;
+                            await this.plugin.saveSettings();
+                            
+                            // Update the display text
+                            const sliderContainer = slider.sliderEl.parentElement;
+                            if (sliderContainer) {
+                                let valueDisplay = sliderContainer.querySelector('.sync-interval-value') as HTMLElement;
+                                if (!valueDisplay) {
+                                    valueDisplay = sliderContainer.createEl('span', { 
+                                        cls: 'sync-interval-value',
+                                        attr: { style: 'margin-left: 10px; font-weight: bold; color: var(--text-accent);' }
+                                    });
+                                }
+                                valueDisplay.textContent = `${value} minute${value !== 1 ? 's' : ''}`;
+                            }
+                            
+                            // Auto Sync가 활성화되어 있으면 새 간격으로 재설정
+                            if (this.plugin.settings.autoSync) {
+                                console.log('Restarting auto sync with new interval...');
+                                this.plugin.setupAutoSync();
+                                new Notice(`Auto sync interval updated to ${value} minute${value !== 1 ? 's' : ''}`);
+                            }
+                            
+                            // UI 상태 업데이트
+                            setTimeout(() => this.updateAutoSyncStatus(), 100);
+                        });
+                })
+                .then(setting => {
+                    // Add initial value display
+                    const sliderContainer = setting.controlEl.querySelector('.slider') as HTMLElement;
+                    if (sliderContainer) {
+                        const currentValue = this.plugin.settings.syncInterval / 60000;
+                        const valueDisplay = sliderContainer.createEl('span', { 
+                            cls: 'sync-interval-value',
+                            text: `${currentValue} minute${currentValue !== 1 ? 's' : ''}`,
+                            attr: { style: 'margin-left: 10px; font-weight: bold; color: var(--text-accent);' }
+                        });
                     }
-                }));
+                });
 
         // Google Drive Settings
         const driveGroup = container.createEl('div', { cls: 'setting-group' });
@@ -3590,12 +3744,44 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             selectedFolders: this.plugin.settings.selectedDriveFolders.length,
             lastSync: this.plugin.settings.lastSyncTime > 0 ? new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never',
             syncMode: this.plugin.settings.syncDirection,
-            autoSync: this.plugin.settings.autoSync
+            autoSyncEnabled: this.plugin.settings.autoSync,
+            autoSyncActive: this.plugin.isAutoSyncActive(),
+            syncIntervalMinutes: this.plugin.settings.syncInterval / 60000,
+            syncIntervalId: this.plugin.syncIntervalId
         };
         
         debugInfo.textContent = JSON.stringify(debugData, null, 2);
+        // Auto Sync 수동 테스트 버튼 추가
+        const autoSyncTest = debugGroup.createEl('div', { 
+            attr: { style: 'margin-top: 15px;' }
+        });
+        
+        const testButton = autoSyncTest.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '🔍 Debug Auto Sync'
+        });
+        testButton.onclick = () => {
+            this.plugin.debugAutoSyncStatus();
+        };        
     }
+    private updateAutoSyncStatus(statusEl?: HTMLElement): void {
+        if (!statusEl) {
+            statusEl = document.querySelector('.auto-sync-status') as HTMLElement;
+        }
+        
+        if (!statusEl) return;
 
+        const isActive = this.plugin.isAutoSyncActive();
+        const intervalMinutes = this.plugin.settings.syncInterval / 60000;
+        
+        if (this.plugin.settings.autoSync && isActive) {
+            statusEl.innerHTML = `<span style="color: var(--color-green);">✅ Active - syncing every ${intervalMinutes} minute${intervalMinutes !== 1 ? 's' : ''}</span>`;
+        } else if (this.plugin.settings.autoSync && !isActive) {
+            statusEl.innerHTML = `<span style="color: var(--color-orange);">⚠️ Enabled but not running - check console</span>`;
+        } else {
+            statusEl.innerHTML = `<span style="color: var(--text-muted);">❌ Disabled</span>`;
+        }
+    }
     private renderLivePreview(container: HTMLElement): void {
         const preview = container.createEl('div', { cls: 'live-preview' });
         preview.createEl('h3', { 
@@ -3617,8 +3803,8 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
         });
         const localCount = localBox.createEl('div', { 
-            text: 'Calculating...',
-            attr: { style: 'font-size: 18px; color: var(--text-accent);' }
+            text: 'Click "Refresh Preview" to calculate',
+            attr: { style: 'font-size: 14px; color: var(--text-muted);' }
         });
         
         // Sync Action
@@ -3640,39 +3826,86 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
         });
         const remoteCount = remoteBox.createEl('div', { 
-            text: 'Calculating...',
-            attr: { style: 'font-size: 18px; color: var(--text-accent);' }
+            text: 'Click "Refresh Preview" to calculate',
+            attr: { style: 'font-size: 14px; color: var(--text-muted);' }
         });
         
         // What will happen section
         const actions = preview.createEl('div', { 
             attr: { style: 'margin: 20px 0;' }
         });
-        actions.createEl('h4', { text: '🎯 What will happen:' });
+        
+        // Header with inline refresh button
+        const headerContainer = actions.createEl('div', {
+            attr: { style: 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;' }
+        });
+        
+        headerContainer.createEl('h4', { 
+            text: '🎯 What will happen:',
+            attr: { style: 'margin: 0;' }
+        });
+        
+        const refreshButton = headerContainer.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '🔄 Refresh',
+            attr: { style: 'padding: 6px 12px; font-size: 12px;' }
+        });
+        refreshButton.onclick = () => {
+            // Show loading state
+            localCount.textContent = 'Calculating...';
+            remoteCount.textContent = 'Calculating...';
+            uploadLi.textContent = 'Upload: 📤 Calculating...';
+            downloadLi.textContent = 'Download: 📥 Calculating...';
+            conflictLi.textContent = 'Conflicts: ⚡ Calculating...';
+            estimatedTime.textContent = 'Estimated time: ⏱️ Calculating...';
+            
+            // Update preview with actual data
+            this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime);
+        };
         
         const actionsList = actions.createEl('ul', { 
             attr: { style: 'margin: 10px 0; padding-left: 20px;' }
         });
         
-        const uploadLi = actionsList.createEl('li', { text: 'Upload: 📤 Calculating...' });
-        const downloadLi = actionsList.createEl('li', { text: 'Download: 📥 Calculating...' });
-        const conflictLi = actionsList.createEl('li', { text: 'Conflicts: ⚡ Calculating...' });
+        const uploadLi = actionsList.createEl('li', { text: 'Upload: 📤 Click refresh to calculate' });
+        const downloadLi = actionsList.createEl('li', { text: 'Download: 📥 Click refresh to calculate' });
+        const conflictLi = actionsList.createEl('li', { text: 'Conflicts: ⚡ Click refresh to calculate' });
         
         const estimatedTime = actions.createEl('div', { 
-            text: 'Estimated time: ⏱️ Calculating...',
+            text: 'Estimated time: ⏱️ Click refresh to calculate',
             attr: { style: 'margin-top: 10px; font-style: italic; color: var(--text-muted);' }
         });
         
-        // Start Sync Button
-        const syncButton = preview.createEl('button', { 
+        // Single prominent Start Sync Button
+        const syncButtonContainer = preview.createEl('div', {
+            attr: { style: 'margin-top: 25px; text-align: center;' }
+        });
+        
+        const syncButton = syncButtonContainer.createEl('button', { 
             cls: 'action-button primary',
             text: '🚀 Start Sync',
-            attr: { style: 'width: 100%; padding: 15px; font-size: 16px; margin-top: 15px;' }
+            attr: { style: 'padding: 15px 40px; font-size: 16px; font-weight: bold; min-width: 200px;' }
         });
         syncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
         
-        // Update preview with actual data
-        this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime);
+        // Optional: Add a smaller secondary action
+        const secondaryActions = syncButtonContainer.createEl('div', {
+            attr: { style: 'margin-top: 10px; display: flex; justify-content: center; gap: 10px;' }
+        });
+        
+        const uploadOnlyBtn = secondaryActions.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '📤 Upload Only',
+            attr: { style: 'padding: 8px 16px; font-size: 13px;' }
+        });
+        uploadOnlyBtn.onclick = () => this.plugin.uploadToGoogleDrive(true);
+        
+        const downloadOnlyBtn = secondaryActions.createEl('button', { 
+            cls: 'action-button secondary',
+            text: '📥 Download Only',
+            attr: { style: 'padding: 8px 16px; font-size: 13px;' }
+        });
+        downloadOnlyBtn.onclick = () => this.plugin.downloadFromGoogleDrive(true);
     }
 
     private async updateLivePreview(
@@ -3693,7 +3926,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 timeEl.textContent = 'Estimated time: ⏱️ Please authenticate first';
                 return;
             }
-
+    
             // Count local files
             let localFiles: TFile[] = [];
             if (this.plugin.settings.syncWholeVault) {
@@ -3724,20 +3957,50 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 
                 remoteCountEl.textContent = remoteFiles.length.toString();
                 
-                // Estimate sync actions
-                const estimatedUploads = Math.max(0, localFiles.length - remoteFiles.length);
-                const estimatedDownloads = Math.max(0, remoteFiles.length - localFiles.length);
-                const estimatedConflicts = Math.min(localFiles.length, remoteFiles.length);
+                // 간단한 파일명 기반 매핑으로 변경
+                const localFileNames = new Set(localFiles.map(file => file.name));
+                const remoteFileNames = new Set(remoteFiles.map(file => file.name));
+                
+                // 교집합 계산 (양쪽에 모두 있는 파일 = 잠재적 충돌)
+                const commonFiles = new Set([...localFileNames].filter(name => remoteFileNames.has(name)));
+                
+                // 실제 동기화 작업 계산
+                const estimatedUploads = localFiles.length - commonFiles.size; // 로컬에만 있는 파일
+                const estimatedDownloads = remoteFiles.length - commonFiles.size; // 원격에만 있는 파일
+                const estimatedConflicts = commonFiles.size; // 양쪽에 모두 있는 파일
                 
                 uploadEl.textContent = `Upload: 📤 ~${estimatedUploads} files`;
                 downloadEl.textContent = `Download: 📥 ~${estimatedDownloads} files`;
-                conflictEl.textContent = `Conflicts: ⚡ ~${estimatedConflicts} to check`;
+                if (estimatedUploads === 0 && estimatedDownloads === 0 && estimatedConflicts > 0) {
+                    conflictEl.textContent = `Status check: ⚡ ~${estimatedConflicts} files (likely already synced)`;
+                } else {
+                    conflictEl.textContent = `Conflicts: ⚡ ~${estimatedConflicts} to check`;
+                }
                 
                 const totalActions = estimatedUploads + estimatedDownloads + estimatedConflicts;
-                const estimatedSeconds = Math.max(30, totalActions * 2); // 2 seconds per file estimate
-                timeEl.textContent = `Estimated time: ⏱️ ~${Math.round(estimatedSeconds / 60)} minutes`;
+                
+                if (totalActions === 0) {
+                    timeEl.textContent = 'Estimated time: ⏱️ All files are in sync';
+                } else {
+                    const estimatedSeconds = Math.max(10, totalActions * 2);
+                    const minutes = Math.max(1, Math.round(estimatedSeconds / 60));
+                    timeEl.textContent = `Estimated time: ⏱️ ~${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                }
+                
+                // 디버그 정보 로그
+                console.log('Sync Preview Debug:', {
+                    localFiles: localFiles.length,
+                    remoteFiles: remoteFiles.length,
+                    localFileNames: Array.from(localFileNames),
+                    remoteFileNames: Array.from(remoteFileNames),
+                    commonFiles: Array.from(commonFiles),
+                    estimatedUploads,
+                    estimatedDownloads,
+                    estimatedConflicts
+                });
                 
             } catch (error) {
+                console.error('Error calculating sync preview:', error);
                 remoteCountEl.textContent = 'Error loading';
                 uploadEl.textContent = 'Upload: 📤 Unable to calculate';
                 downloadEl.textContent = 'Download: 📥 Unable to calculate';
