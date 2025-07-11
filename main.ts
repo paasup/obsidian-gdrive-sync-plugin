@@ -9,6 +9,8 @@ interface GDriveSyncSettings {
     autoSync: boolean;
     syncInterval: number;
     accessToken: string;
+    refreshToken: string; 
+    tokenExpiresAt: number;
     driveFolder: string;
     includeSubfolders: boolean;
     syncMode: 'always' | 'modified' | 'checksum';
@@ -28,6 +30,8 @@ const DEFAULT_SETTINGS: GDriveSyncSettings = {
     autoSync: false,
     syncInterval: 300000,
     accessToken: '',
+    refreshToken: '',
+    tokenExpiresAt: 0,
     driveFolder: 'Obsidian-Sync',
     includeSubfolders: true,
     syncMode: 'modified',
@@ -783,6 +787,93 @@ export default class GDriveSyncPlugin extends Plugin {
         console.log('📁 Folder cache cleared');
     }
 
+    async refreshAccessToken(): Promise<boolean> {
+        if (!this.settings.refreshToken) {
+            console.log('No refresh token available');
+            return false;
+        }
+
+        try {
+            console.log('Refreshing access token...');
+            
+            const response = await requestUrl({
+                url: 'https://oauth2.googleapis.com/token',
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    client_id: this.settings.clientId,
+                    client_secret: this.settings.clientSecret,
+                    refresh_token: this.settings.refreshToken,
+                    grant_type: 'refresh_token'
+                }).toString(),
+                throw: false
+            });
+
+            if (response.status === 200) {
+                const tokenData = response.json;
+                console.log('Token refresh successful');
+                
+                this.settings.accessToken = tokenData.access_token;
+                
+                // 새로운 refresh token이 있으면 업데이트 (선택사항)
+                if (tokenData.refresh_token) {
+                    this.settings.refreshToken = tokenData.refresh_token;
+                }
+                
+                // 토큰 만료 시간 설정 (현재 시간 + expires_in 초)
+                const expiresIn = tokenData.expires_in || 3600; // 기본 1시간
+                this.settings.tokenExpiresAt = Date.now() + (expiresIn * 1000);
+                
+                await this.saveSettings();
+                
+                console.log(`✓ Access token refreshed, expires at: ${new Date(this.settings.tokenExpiresAt).toLocaleString()}`);
+                return true;
+            } else {
+                console.error('Token refresh failed:', response.status, response.json);
+                
+                // Refresh token이 만료된 경우
+                if (response.status === 400 || response.status === 401) {
+                    console.log('Refresh token expired, need to re-authenticate');
+                    this.settings.accessToken = '';
+                    this.settings.refreshToken = '';
+                    this.settings.tokenExpiresAt = 0;
+                    await this.saveSettings();
+                    
+                    new Notice('🔄 Login expired. Please authenticate again.');
+                }
+                
+                return false;
+            }
+        } catch (error) {
+            console.error('Token refresh error:', error);
+            return false;
+        }
+    }
+
+    async ensureValidToken(): Promise<boolean> {
+        // 토큰이 없으면 인증 필요
+        if (!this.settings.accessToken) {
+            console.log('No access token available');
+            return false;
+        }
+
+        // 토큰 만료 시간이 설정되어 있고, 만료 5분 전이면 갱신
+        const now = Date.now();
+        const fiveMinutes = 5 * 60 * 1000;
+        
+        if (this.settings.tokenExpiresAt > 0 && 
+            now >= (this.settings.tokenExpiresAt - fiveMinutes)) {
+            
+            console.log('Access token will expire soon, refreshing...');
+            return await this.refreshAccessToken();
+        }
+
+        // 토큰 만료 시간이 설정되지 않았거나 아직 유효한 경우
+        return true;
+    }      
+
     // 캐시된 폴더 ID 가져오기 또는 생성
     private async getCachedFolderId(folderPath: string, rootFolderId: string): Promise<string> {
         // 캐시에서 먼저 확인
@@ -918,7 +1009,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
     async exchangeCodeForToken(authCode: string): Promise<boolean> {
         try {
-            console.log('Exchanging authorization code for access token...');
+            console.log('Exchanging authorization code for tokens...');
             
             const response = await requestUrl({
                 url: 'https://oauth2.googleapis.com/token',
@@ -940,14 +1031,25 @@ export default class GDriveSyncPlugin extends Plugin {
                 const tokenData = response.json;
                 console.log('Token exchange successful');
                 
+                // Access token과 refresh token 저장
                 this.settings.accessToken = tokenData.access_token;
+                this.settings.refreshToken = tokenData.refresh_token; // 중요!
+                
+                // 토큰 만료 시간 계산
+                const expiresIn = tokenData.expires_in || 3600; // 기본 1시간
+                this.settings.tokenExpiresAt = Date.now() + (expiresIn * 1000);
+                
                 await this.saveSettings();
                 
-                new Notice('✅ Desktop App authentication successful!');
+                console.log(`✓ Tokens saved successfully`);
+                console.log(`  Access token expires at: ${new Date(this.settings.tokenExpiresAt).toLocaleString()}`);
+                console.log(`  Refresh token available: ${!!this.settings.refreshToken}`);
+                
+                new Notice('✅ Authentication successful! Tokens saved for long-term use.');
                 return true;
             } else {
                 console.error('Token exchange failed:', response.status, response.json);
-                new Notice('❌ Failed to exchange authorization code for token.');
+                new Notice('❌ Failed to exchange authorization code for tokens.');
                 return false;
             }
         } catch (error) {
@@ -961,13 +1063,27 @@ export default class GDriveSyncPlugin extends Plugin {
         try {
             console.log('Revoking Google Drive access...');
 
-            if (!this.settings.accessToken) {
-                console.log('No access token to revoke');
-                new Notice('No active session to revoke');
-                return true;
+            if (this.settings.refreshToken) {
+                try {
+                    // Google에 토큰 무효화 요청
+                    await requestUrl({
+                        url: `https://oauth2.googleapis.com/revoke?token=${this.settings.refreshToken}`,
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded'
+                        },
+                        throw: false
+                    });
+                    console.log('✓ Tokens revoked from Google');
+                } catch (error) {
+                    console.warn('Failed to revoke tokens from Google:', error);
+                }
             }
 
+            // 로컬에서 토큰 제거
             this.settings.accessToken = '';
+            this.settings.refreshToken = '';
+            this.settings.tokenExpiresAt = 0;
             await this.saveSettings();
 
             console.log('✓ Google Drive access revoked successfully');
@@ -976,16 +1092,41 @@ export default class GDriveSyncPlugin extends Plugin {
 
         } catch (error) {
             console.error('Failed to revoke access:', error);
-            new Notice('Failed to revoke access. Token cleared locally.');
+            new Notice('Failed to revoke access. Tokens cleared locally.');
             
+            // 에러가 발생해도 로컬 토큰은 제거
             this.settings.accessToken = '';
+            this.settings.refreshToken = '';
+            this.settings.tokenExpiresAt = 0;
             await this.saveSettings();
             return false;
         }
     }
 
     isAuthenticated(): boolean {
-        return !!(this.settings.accessToken);
+        return !!(this.settings.accessToken && this.settings.refreshToken);
+    }
+
+    // API 호출 전에 토큰 검증을 추가하는 헬퍼 메서드
+    async makeAuthenticatedRequest(url: string, options: any = {}): Promise<any> {
+        // 토큰 유효성 확인 및 자동 갱신
+        const tokenValid = await this.ensureValidToken();
+        if (!tokenValid) {
+            throw new Error('Authentication required. Please sign in again.');
+        }
+
+        // 기본 헤더에 Authorization 추가
+        const headers = {
+            'Authorization': `Bearer ${this.settings.accessToken}`,
+            ...options.headers
+        };
+
+        return await requestUrl({
+            ...options,
+            url,
+            headers,
+            throw: false
+        });
     }
 
     // 메인 동기화 메서드
@@ -2002,14 +2143,10 @@ export default class GDriveSyncPlugin extends Plugin {
         try {
             console.log(`Looking for Google Drive folder: ${this.settings.driveFolder}`);
 
-            const searchResponse = await requestUrl({
-                url: `https://www.googleapis.com/drive/v3/files?q=name='${this.settings.driveFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`
-                },
-                throw: false
-            });
+            const searchResponse = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files?q=name='${this.settings.driveFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+                { method: 'GET' }
+            );
 
             if (searchResponse.status === 200) {
                 const searchData = searchResponse.json;
@@ -2023,19 +2160,19 @@ export default class GDriveSyncPlugin extends Plugin {
 
             console.log(`Creating new Google Drive folder: ${this.settings.driveFolder}`);
             
-            const createResponse = await requestUrl({
-                url: 'https://www.googleapis.com/drive/v3/files',
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    name: this.settings.driveFolder,
-                    mimeType: 'application/vnd.google-apps.folder'
-                }),
-                throw: false
-            });
+            const createResponse = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/drive/v3/files',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        name: this.settings.driveFolder,
+                        mimeType: 'application/vnd.google-apps.folder'
+                    })
+                }
+            );
 
             if (createResponse.status === 200 || createResponse.status === 201) {
                 const folderData = createResponse.json;
@@ -2324,39 +2461,44 @@ export default class GDriveSyncPlugin extends Plugin {
 
     async testDriveAPIConnection(): Promise<boolean> {
         try {
-            if (!this.settings.accessToken) {
-                console.log('No access token available for testing');
+            if (!this.isAuthenticated()) {
+                console.log('No tokens available for testing');
                 new Notice('❌ Please authenticate first');
                 return false;
             }
 
             console.log('Testing Google Drive API connection...');
             
-            const response = await requestUrl({
-                url: 'https://www.googleapis.com/drive/v3/about?fields=user',
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`
-                },
-                throw: false
-            });
+            const response = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/drive/v3/about?fields=user',
+                { method: 'GET' }
+            );
 
             console.log('API Response Status:', response.status);
 
             if (response.status === 200) {
                 const data = response.json;
                 console.log('Drive API test successful:', data);
-                new Notice(`✅ Drive API connection successful. User: ${data.user?.displayName || 'Unknown'}`);
+                
+                const expiresAt = this.settings.tokenExpiresAt;
+                const expiresText = expiresAt > 0 ? 
+                    `Token expires: ${new Date(expiresAt).toLocaleString()}` : 
+                    'Token expiration unknown';
+                
+                new Notice(`✅ Drive API connection successful. User: ${data.user?.displayName || 'Unknown'}. ${expiresText}`);
                 return true;
             } else if (response.status === 401) {
-                console.error('Authentication failed - Token expired or invalid');
-                new Notice('❌ Authentication expired. Please sign in again.');
+                console.error('Authentication failed - Attempting token refresh...');
                 
-                this.settings.accessToken = '';
-                await this.saveSettings();
-                
-                new Notice('Click "1. Open Auth URL" again to re-authenticate.');
-                return false;
+                // 토큰 갱신 시도
+                const refreshed = await this.refreshAccessToken();
+                if (refreshed) {
+                    new Notice('🔄 Token refreshed successfully. Please try again.');
+                    return await this.testDriveAPIConnection(); // 재귀 호출
+                } else {
+                    new Notice('❌ Authentication expired and refresh failed. Please sign in again.');
+                    return false;
+                }
             } else if (response.status === 403) {
                 console.error('API access denied - Check API key and permissions');
                 new Notice('❌ API access denied. Check your API Key and Drive API is enabled.');
@@ -2456,7 +2598,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     
                     await this.plugin.authenticateGoogleDrive();
                 }));
-
+                 
         new Setting(containerEl)
             .setName('Authorization Code')
             .setDesc('Step 2: After authentication, paste the authorization code here')
@@ -2491,6 +2633,26 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 }));
 
 
+        new Setting(containerEl)
+            .setName('Refresh Token Manually')
+            .setDesc('Manually refresh your access token using stored refresh token')
+            .addButton(button => button
+                .setButtonText('Refresh Token')
+                .onClick(async () => {
+                    if (!this.plugin.settings.refreshToken) {
+                        new Notice('❌ No refresh token available. Please re-authenticate.');
+                        return;
+                    }
+                    
+                    const success = await this.plugin.refreshAccessToken();
+                    if (success) {
+                        new Notice('✅ Access token refreshed successfully');
+                        updateStatus(); // 상태 표시 업데이트
+                    } else {
+                        new Notice('❌ Failed to refresh token. You may need to re-authenticate.');
+                    }
+                }));
+                   
         new Setting(containerEl)
             .setName('Test API Connection')
             .setDesc('Test your current access token with Google Drive API')
@@ -2688,16 +2850,51 @@ class GDriveSyncSettingTab extends PluginSettingTab {
 
         const updateStatus = () => {
             const isAuth = this.plugin.isAuthenticated();
+            const hasRefreshToken = !!this.plugin.settings.refreshToken;
+            const tokenExpiresAt = this.plugin.settings.tokenExpiresAt;
+            
+            let tokenStatusText = '';
+            let tokenStatusColor = '';
+            
+            if (isAuth && hasRefreshToken) {
+                if (tokenExpiresAt > 0) {
+                    const expiresDate = new Date(tokenExpiresAt);
+                    const now = new Date();
+                    const isExpired = now >= expiresDate;
+                    const minutesUntilExpiry = Math.round((expiresDate.getTime() - now.getTime()) / (1000 * 60));
+                    
+                    if (isExpired) {
+                        tokenStatusText = '🔄 Token expired, will auto-refresh on next use';
+                        tokenStatusColor = '#FF9800';
+                    } else if (minutesUntilExpiry < 10) {
+                        tokenStatusText = `⏰ Token expires in ${minutesUntilExpiry} minutes (will auto-refresh)`;
+                        tokenStatusColor = '#FF9800';
+                    } else {
+                        tokenStatusText = `✅ Token valid until ${expiresDate.toLocaleString()}`;
+                        tokenStatusColor = '#4CAF50';
+                    }
+                } else {
+                    tokenStatusText = '✅ Authenticated with long-term tokens';
+                    tokenStatusColor = '#4CAF50';
+                }
+            } else if (this.plugin.settings.accessToken) {
+                tokenStatusText = '⚠️ Partial authentication (missing refresh token)';
+                tokenStatusColor = '#FF9800';
+            } else {
+                tokenStatusText = '❌ Not authenticated';
+                tokenStatusColor = '#F44336';
+            }
+            
             const selectedFoldersCount = this.plugin.settings.selectedDriveFolders.length;
             
             statusEl.innerHTML = `
                 <div style="padding: 10px; border-radius: 4px; margin-bottom: 10px; ${isAuth ? 
                     'background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724;' : 
                     'background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24;'}">
-                    <strong>Authentication:</strong> ${isAuth ? '✅ Authenticated' : '❌ Not Authenticated'}
-                    ${this.plugin.settings.accessToken ? 
-                        '<br><small>Access token is stored</small>' : 
-                        '<br><small>No access token stored</small>'}
+                    <strong>Authentication:</strong> ${isAuth ? '✅ Fully Authenticated' : '❌ Not Authenticated'}
+                    <br><span style="color: ${tokenStatusColor};">${tokenStatusText}</span>
+                    <br><small>Access Token: ${this.plugin.settings.accessToken ? '✓ Available' : '✗ Missing'}</small>
+                    <br><small>Refresh Token: ${hasRefreshToken ? '✓ Available (for auto-renewal)' : '✗ Missing'}</small>
                 </div>
                 <div style="padding: 10px; border-radius: 4px; margin-bottom: 10px; background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460;">
                     <strong>Sync Mode:</strong> ${this.plugin.settings.syncWholeVault ? 
