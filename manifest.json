@@ -5,8 +5,7 @@
   "minAppVersion": "0.15.0",
   "description": "Synchronize Obsidian folders with Google Drive using Google Identity Services",
   "author": "GunSik Choi",
-  "authorUrl": "https://github.com/paasup/obsidian-gdrive-sync-plugin"
-  "fundingUrl": "https://buymeacoffee.com/yourname",
+  "authorUrl": "https://github.com/paasup/obsidian-gdrive-sync-plugin",
   "isDesktopOnly": false,
   "hasSettings": true
 }
