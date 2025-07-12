@@ -638,17 +638,19 @@ class DriveFolderModal extends Modal {
 
     private async onSelectFolder(folderItem: FolderListItem): Promise<void> {
         try {
-            // 설정에 추가
             this.plugin.settings.selectedDriveFolders.push({
                 id: folderItem.id,
                 name: folderItem.name,
                 path: folderItem.path
             });
-    
+
             await this.plugin.saveSettings();
             
             // UI 새로고침
             this.refreshFolderList();
+            
+            // 🔥 플러그인에 설정 변경 알림
+            this.plugin.notifySettingsChanged();
             
             new Notice(`✅ Added folder: ${folderItem.name}`);
             
@@ -660,14 +662,16 @@ class DriveFolderModal extends Modal {
     
     private async onRemoveFolder(folderItem: FolderListItem): Promise<void> {
         try {
-            // 설정에서 제거
             this.plugin.settings.selectedDriveFolders = this.plugin.settings.selectedDriveFolders
                 .filter(f => f.id !== folderItem.id);
-    
+
             await this.plugin.saveSettings();
             
             // UI 새로고침
             this.refreshFolderList();
+            
+            // 🔥 플러그인에 설정 변경 알림
+            this.plugin.notifySettingsChanged();
             
             new Notice(`✅ Removed folder: ${folderItem.name}`);
             
@@ -675,7 +679,8 @@ class DriveFolderModal extends Modal {
             console.error('Error removing folder:', error);
             new Notice(`❌ Failed to remove folder: ${folderItem.name}`);
         }
-    }    
+    }
+     
     private async loadDriveFolders() {
         try {
             const rootFolder = await this.plugin.getOrCreateDriveFolder();
@@ -926,7 +931,17 @@ export default class GDriveSyncPlugin extends Plugin {
     syncIntervalId: number | null = null;
     public isGoogleApiLoaded = false;
     private folderCache: FolderCache = {};
-    private settingTab: GDriveSyncSettingTab | null = null;
+    public settingTab: GDriveSyncSettingTab | null = null;
+
+    public notifySettingsChanged(): void {
+        if (this.settingTab) {
+            console.log('Notifying settings tab of changes...');
+            // 약간의 지연을 두어 안정성 확보
+            setTimeout(() => {
+                this.settingTab?.refreshDisplay();
+            }, 50);
+        }
+    }
 
     // 폴더 캐시 초기화 메서드
     private clearFolderCache(): void {
@@ -2848,6 +2863,11 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     constructor(app: App, plugin: GDriveSyncPlugin) {
         super(app, plugin);
         this.plugin = plugin;
+        this.plugin.settingTab = this;
+    }
+    public refreshDisplay(): void {
+        console.log('Refreshing settings display...');
+        this.display();
     }
 
     display(): void {
@@ -4610,7 +4630,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             });
             
             await this.plugin.saveSettings();
-            this.display(); // Refresh the settings display
+            this.refreshDisplay();
             new Notice(`✅ Added Google Drive folder: ${selectedFolder.name}`);
         });
         
@@ -4618,6 +4638,9 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     }
 
     hide(): void {
+        if (this.plugin.settingTab === this) {
+            this.plugin.settingTab = null;
+        }        
         // Clean up interval when hiding
         if (this.statusUpdateInterval) {
             window.clearInterval(this.statusUpdateInterval);
