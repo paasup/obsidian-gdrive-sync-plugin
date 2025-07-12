@@ -60,6 +60,10 @@ interface DriveFolder {
     mimeType: string;
     parents?: string[];
 }
+interface FolderListItem extends DriveFolder {
+    isSelected: boolean;     // 현재 동기화 대상 여부
+    canSelect: boolean;      // 선택 가능 여부
+}
 
 // 진행상태 모달
 class SyncProgressModal extends Modal {
@@ -383,8 +387,8 @@ class DriveFolderModal extends Modal {
     private plugin: GDriveSyncPlugin;
     private onChoose: (folder: DriveFolder) => void;
     private folders: DriveFolder[] = [];
-    private expandedFolders: Set<string> = new Set();
-
+    private folderListItems: FolderListItem[] = []; // 새로 추가
+    
     constructor(app: App, plugin: GDriveSyncPlugin, onChoose: (folder: DriveFolder) => void) {
         super(app);
         this.plugin = plugin;
@@ -394,7 +398,7 @@ class DriveFolderModal extends Modal {
     async onOpen() {
         const { contentEl } = this;
         contentEl.empty();
-
+    
         contentEl.createEl('h2', { text: 'Select Google Drive Folder' });
         
         const loadingEl = contentEl.createEl('div', { text: 'Loading Google Drive folders...' });
@@ -402,29 +406,276 @@ class DriveFolderModal extends Modal {
         try {
             await this.loadDriveFolders();
             loadingEl.remove();
-            this.renderFolderTree(contentEl);
+            this.renderFolderList(contentEl); // 메서드명 변경
         } catch (error) {
             loadingEl.textContent = 'Failed to load folders. Please check your authentication.';
             console.error('Error loading Drive folders:', error);
         }
-
+    
         const buttonContainer = contentEl.createEl('div', { 
             attr: { style: 'text-align: right; margin-top: 15px; border-top: 1px solid var(--background-modifier-border); padding-top: 15px;' }
         });
-
+    
         const createFolderButton = buttonContainer.createEl('button', { 
-            text: 'Create New Folder',
+            text: '+ Create New Folder',
             cls: 'mod-cta',
             attr: { style: 'margin-right: 10px;' }
         });
         createFolderButton.onclick = () => this.showCreateFolderDialog();
-
+    
+        const refreshButton = buttonContainer.createEl('button', { 
+            text: '🔄 Refresh',
+            attr: { style: 'margin-right: 10px;' }
+        });
+        refreshButton.onclick = () => this.refreshFolders();
+    
         const cancelButton = buttonContainer.createEl('button', { 
             text: 'Cancel'
         });
         cancelButton.onclick = () => this.close();
     }
 
+    private createFolderListItems(): FolderListItem[] {
+        const selectedFolderIds = new Set(
+            this.plugin.settings.selectedDriveFolders.map(f => f.id)
+        );
+    
+        return this.folders.map(folder => ({
+            ...folder,
+            isSelected: selectedFolderIds.has(folder.id),
+            canSelect: !selectedFolderIds.has(folder.id)
+        }));
+    }
+    
+    private async refreshFolders(): Promise<void> {
+        try {
+            const loadingEl = document.querySelector('.folder-list-container .loading');
+            if (loadingEl) {
+                loadingEl.textContent = 'Refreshing...';
+            }
+    
+            await this.loadDriveFolders();
+            this.refreshFolderList();
+    
+            if (loadingEl) {
+                loadingEl.remove();
+            }
+    
+            new Notice('✅ Folder list refreshed');
+        } catch (error) {
+            console.error('Error refreshing folders:', error);
+            new Notice('❌ Failed to refresh folders');
+        }
+    }
+
+    private renderFolderList(container: HTMLElement) {
+        const listContainer = container.createEl('div', { 
+            cls: 'folder-list-container',
+            attr: { 
+                style: 'max-height: 400px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; padding: 10px; margin: 10px 0;' 
+            }
+        });
+    
+        this.folderListItems = this.createFolderListItems();
+    
+        if (this.folderListItems.length === 0) {
+            listContainer.createEl('p', { 
+                text: 'No folders found in Google Drive root folder.',
+                attr: { style: 'text-align: center; color: var(--text-muted); margin: 20px 0;' }
+            });
+            return;
+        }
+    
+        // 폴더 상태별 정렬: 선택된 폴더 먼저, 그 다음 이름순
+        const sortedFolders = this.folderListItems.sort((a, b) => {
+            if (a.isSelected && !b.isSelected) return -1;
+            if (!a.isSelected && b.isSelected) return 1;
+            return a.name.localeCompare(b.name);
+        });
+    
+        sortedFolders.forEach(folderItem => {
+            this.renderFolderItem(listContainer, folderItem);
+        });
+    }
+    
+    private refreshFolderList(): void {
+        const existingContainer = document.querySelector('.folder-list-container');
+        if (existingContainer) {
+            existingContainer.remove();
+        }
+        
+        const contentEl = this.containerEl.querySelector('.modal-content') as HTMLElement;
+        const buttonsContainer = contentEl.querySelector('div[style*="text-align: right"]') as HTMLElement;
+        
+        this.renderFolderList(contentEl);
+        
+        // 버튼을 다시 마지막에 추가
+        if (buttonsContainer) {
+            contentEl.appendChild(buttonsContainer);
+        }
+    }
+
+    private renderFolderItem(container: HTMLElement, folderItem: FolderListItem) {
+        const itemEl = container.createEl('div', { 
+            cls: `folder-list-item ${folderItem.isSelected ? 'selected' : 'available'}`,
+            attr: { 
+                style: `
+                    display: flex; 
+                    align-items: center; 
+                    padding: 12px; 
+                    border-bottom: 1px solid var(--background-modifier-border); 
+                    transition: background 0.2s ease;
+                    ${folderItem.isSelected ? 'background: rgba(76, 175, 80, 0.1);' : ''}
+                ` 
+            }
+        });
+    
+        itemEl.addEventListener('mouseenter', () => {
+            if (!folderItem.isSelected) {
+                itemEl.style.backgroundColor = 'var(--background-modifier-hover)';
+            }
+        });
+        itemEl.addEventListener('mouseleave', () => {
+            if (!folderItem.isSelected) {
+                itemEl.style.backgroundColor = 'transparent';
+            }
+        });
+    
+        // 폴더 아이콘
+        const folderIcon = itemEl.createEl('span', { 
+            text: folderItem.isSelected ? '✅' : '📁',
+            attr: { style: 'margin-right: 12px; font-size: 16px; flex-shrink: 0;' }
+        });
+    
+        // 폴더 정보
+        const folderInfo = itemEl.createEl('div', { 
+            cls: 'folder-info',
+            attr: { style: 'flex-grow: 1; min-width: 0;' }
+        });
+        
+        folderInfo.createEl('div', { 
+            text: folderItem.name,
+            cls: 'folder-name',
+            attr: { 
+                style: `
+                    font-weight: ${folderItem.isSelected ? 'bold' : 'normal'}; 
+                    color: ${folderItem.isSelected ? 'var(--color-green)' : 'var(--text-normal)'};
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                ` 
+            }
+        });
+        
+        folderInfo.createEl('small', { 
+            text: `Path: ${folderItem.path || '/'}`,
+            attr: { 
+                style: 'color: var(--text-muted); font-size: 0.8em; display: block; margin-top: 2px;' 
+            }
+        });
+    
+        // 액션 버튼 컨테이너
+        const buttonContainer = itemEl.createEl('div', {
+            attr: { style: 'display: flex; gap: 8px; flex-shrink: 0;' }
+        });
+    
+        if (folderItem.isSelected) {
+            // 이미 선택된 폴더
+            const selectedBtn = buttonContainer.createEl('button', { 
+                text: '✅ Selected',
+                cls: 'mod-small',
+                attr: { 
+                    style: 'padding: 4px 8px; font-size: 11px; opacity: 0.7; cursor: not-allowed;',
+                    disabled: 'true'
+                }
+            });
+    
+            const removeBtn = buttonContainer.createEl('button', { 
+                text: '❌ Remove',
+                cls: 'mod-small mod-warning',
+                attr: { 
+                    style: 'padding: 4px 8px; font-size: 11px;' 
+                }
+            });
+            removeBtn.onclick = (e) => {
+                e.stopPropagation();
+                this.onRemoveFolder(folderItem);
+            };
+    
+        } else {
+            // 미선택 폴더
+            const selectBtn = buttonContainer.createEl('button', { 
+                text: '➕ Select',
+                cls: 'mod-small mod-cta',
+                attr: { 
+                    style: 'padding: 4px 8px; font-size: 11px;' 
+                }
+            });
+            selectBtn.onclick = (e) => {
+                e.stopPropagation();
+                this.onSelectFolder(folderItem);
+            };
+    
+            // 삭제 버튼 (서버에서 삭제)
+            const deleteBtn = buttonContainer.createEl('button', { 
+                text: '🗑️',
+                cls: 'mod-small mod-warning',
+                attr: { 
+                    style: 'padding: 4px 6px; font-size: 11px;',
+                    title: 'Delete from Google Drive'
+                }
+            });
+            deleteBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const success = await this.deleteDriveFolder(folderItem.id, folderItem.name);
+                if (success) {
+                    await this.loadDriveFolders();
+                    this.refreshFolderList();
+                }
+            };
+        }
+    }
+
+    private async onSelectFolder(folderItem: FolderListItem): Promise<void> {
+        try {
+            // 설정에 추가
+            this.plugin.settings.selectedDriveFolders.push({
+                id: folderItem.id,
+                name: folderItem.name,
+                path: folderItem.path
+            });
+    
+            await this.plugin.saveSettings();
+            
+            // UI 새로고침
+            this.refreshFolderList();
+            
+            new Notice(`✅ Added folder: ${folderItem.name}`);
+            
+        } catch (error) {
+            console.error('Error selecting folder:', error);
+            new Notice(`❌ Failed to add folder: ${folderItem.name}`);
+        }
+    }
+    
+    private async onRemoveFolder(folderItem: FolderListItem): Promise<void> {
+        try {
+            // 설정에서 제거
+            this.plugin.settings.selectedDriveFolders = this.plugin.settings.selectedDriveFolders
+                .filter(f => f.id !== folderItem.id);
+    
+            await this.plugin.saveSettings();
+            
+            // UI 새로고침
+            this.refreshFolderList();
+            
+            new Notice(`✅ Removed folder: ${folderItem.name}`);
+            
+        } catch (error) {
+            console.error('Error removing folder:', error);
+            new Notice(`❌ Failed to remove folder: ${folderItem.name}`);
+        }
+    }    
     private async loadDriveFolders() {
         try {
             const rootFolder = await this.plugin.getOrCreateDriveFolder();
@@ -522,123 +773,6 @@ class DriveFolderModal extends Modal {
             return false;
         }
     }
-    
-    private renderFolderTree(container: HTMLElement) {
-        const treeContainer = container.createEl('div', { 
-            cls: 'drive-folder-tree-container',
-            attr: { 
-                style: 'max-height: 400px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; padding: 10px; margin: 10px 0;' 
-            }
-        });
-    
-        // 최상위 폴더만 표시 (모든 폴더가 최상위이므로 단순 정렬 후 렌더링)
-        const sortedFolders = this.folders.sort((a, b) => a.name.localeCompare(b.name));
-    
-        if (sortedFolders.length === 0) {
-            treeContainer.createEl('p', { 
-                text: 'No folders found in Google Drive root folder.',
-                attr: { style: 'text-align: center; color: var(--text-muted); margin: 20px 0;' }
-            });
-            return;
-        }
-    
-        sortedFolders.forEach(folder => {
-            this.renderFolderNode(treeContainer, folder, 0);
-        });
-    }
-
-    private renderFolderNode(container: HTMLElement, folder: DriveFolder, depth: number) {
-        const nodeEl = container.createEl('div', { 
-            cls: 'drive-folder-tree-node',
-            attr: { 
-                style: `margin-left: ${depth * 20}px; cursor: pointer; padding: 4px 8px; border-radius: 4px; margin-bottom: 2px;` 
-            }
-        });
-    
-        nodeEl.addEventListener('mouseenter', () => {
-            nodeEl.style.backgroundColor = 'var(--background-modifier-hover)';
-        });
-        nodeEl.addEventListener('mouseleave', () => {
-            nodeEl.style.backgroundColor = 'transparent';
-        });
-    
-        // 하위 폴더 찾기는 제거 (최상위만 표시하므로)
-        const hasChildren = false; // 항상 false로 설정
-        const isExpanded = false; // 확장 기능 비활성화
-    
-        const folderContent = nodeEl.createEl('div', { 
-            attr: { style: 'display: flex; align-items: center;' }
-        });
-    
-        // 확장 아이콘 제거 (최상위만 표시하므로 불필요)
-        const folderIcon = folderContent.createEl('span', { 
-            text: '📁',
-            attr: { style: 'margin-right: 8px;' }
-        });
-    
-        const folderName = folderContent.createEl('span', { 
-            text: folder.name,
-            cls: 'folder-name',
-            attr: { style: 'flex-grow: 1; cursor: pointer;' }
-        });
-    
-        const folderPath = folderContent.createEl('small', { 
-            text: `(${folder.path || 'root'})`,
-            attr: { style: 'margin-left: 10px; color: var(--text-muted); font-size: 0.8em;' }
-        });
-    
-        // 버튼 컨테이너
-        const buttonContainer = folderContent.createEl('div', {
-            attr: { style: 'margin-left: 10px; display: flex; gap: 5px;' }
-        });
-    
-        const selectBtn = buttonContainer.createEl('button', { 
-            text: 'Select',
-            cls: 'mod-small mod-cta',
-            attr: { 
-                style: 'padding: 2px 8px; font-size: 11px;' 
-            }
-        });
-    
-        // 삭제 버튼 추가
-        const deleteBtn = buttonContainer.createEl('button', { 
-            text: 'Delete',
-            cls: 'mod-small mod-warning',
-            attr: { 
-                style: 'padding: 2px 8px; font-size: 11px;' 
-            }
-        });
-    
-        // 이벤트 핸들러들
-        selectBtn.onclick = (e) => {
-            e.stopPropagation();
-            this.onChoose(folder);
-            this.close();
-        };
-    
-        // 삭제 버튼 이벤트 핸들러
-        deleteBtn.onclick = async (e) => {
-            e.stopPropagation();
-            
-            const success = await this.deleteDriveFolder(folder.id, folder.name);
-            if (success) {
-                // 폴더 목록 새로고침
-                await this.loadDriveFolders();
-                this.refreshTree();
-            }
-        };
-    }
-
-    private refreshTree() {
-        const { contentEl } = this;
-        const existingContainer = contentEl.querySelector('.drive-folder-tree-container');
-        if (existingContainer) {
-            existingContainer.remove();
-        }
-        
-        // 트리 다시 그리기
-        this.renderFolderTree(contentEl);
-    }
 
     private async showCreateFolderDialog() {
         const createModal = new CreateFolderModal(this.app, async (folderName: string) => {
@@ -648,13 +782,12 @@ class DriveFolderModal extends Modal {
                     new Notice('❌ Failed to access root folder');
                     return;
                 }
-
+    
                 const newFolder = await this.createDriveFolder(folderName, rootFolder.id);
                 if (newFolder) {
                     new Notice(`✅ Created folder: ${folderName}`);
                     // 폴더 목록 새로고침
-                    await this.loadDriveFolders();
-                    this.onOpen();
+                    await this.refreshFolders();
                 }
             } catch (error) {
                 console.error('Error creating folder:', error);
@@ -1076,7 +1209,7 @@ export default class GDriveSyncPlugin extends Plugin {
         const params = new URLSearchParams({
             client_id: this.settings.clientId,
             redirect_uri: 'urn:ietf:wg:oauth:2.0:oob',
-            scope: 'https://www.googleapis.com/auth/drive.file',
+            scope: 'https://www.googleapis.com/auth/drive',
             response_type: 'code',
             access_type: 'offline',
             prompt: 'consent'
@@ -3327,6 +3460,54 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 cursor: not-allowed;
                 transform: none !important;
             }
+
+            .folder-list-container {
+                background: var(--background-primary);
+            }
+
+            .folder-list-item {
+                border-radius: 6px;
+                margin-bottom: 4px;
+            }
+
+            .folder-list-item.selected {
+                border-left: 4px solid var(--color-green);
+            }
+
+            .folder-list-item.available {
+                border-left: 4px solid transparent;
+            }
+
+            .folder-list-item:last-child {
+                border-bottom: none;
+                margin-bottom: 0;
+            }
+
+            .folder-info {
+                line-height: 1.4;
+            }
+
+            .folder-name {
+                font-size: 14px;
+            }
+
+            /* 모바일 대응 */
+            @media (max-width: 768px) {
+                .folder-list-item {
+                    flex-direction: column;
+                    align-items: stretch;
+                    gap: 8px;
+                }
+                
+                .folder-info {
+                    text-align: center;
+                }
+                
+                .folder-list-item div[style*="display: flex"] {
+                    justify-content: center;
+                    width: 100%;
+                }
+            }                        
         `;
         document.head.appendChild(style);
     }
