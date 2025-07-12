@@ -793,6 +793,7 @@ export default class GDriveSyncPlugin extends Plugin {
     syncIntervalId: number | null = null;
     public isGoogleApiLoaded = false;
     private folderCache: FolderCache = {};
+    private settingTab: GDriveSyncSettingTab | null = null;
 
     // 폴더 캐시 초기화 메서드
     private clearFolderCache(): void {
@@ -955,7 +956,8 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
 
-        this.addSettingTab(new GDriveSyncSettingTab(this.app, this));
+        this.settingTab = new GDriveSyncSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
 
         console.log('Plugin loaded - Google Drive folder-based sync');
         console.log(`Initial auto sync setting: ${this.settings.autoSync}`);
@@ -1138,7 +1140,7 @@ export default class GDriveSyncPlugin extends Plugin {
     async revokeGoogleDriveAccess(): Promise<boolean> {
         try {
             console.log('Revoking Google Drive access...');
-
+    
             if (this.settings.refreshToken) {
                 try {
                     // Google에 토큰 무효화 요청
@@ -1155,17 +1157,21 @@ export default class GDriveSyncPlugin extends Plugin {
                     console.warn('Failed to revoke tokens from Google:', error);
                 }
             }
-
+    
             // 로컬에서 토큰 제거
             this.settings.accessToken = '';
             this.settings.refreshToken = '';
             this.settings.tokenExpiresAt = 0;
             await this.saveSettings();
-
+    
             console.log('✓ Google Drive access revoked successfully');
             new Notice('Google Drive access revoked successfully');
+            
+            // 🔥 설정 화면 즉시 업데이트
+            this.triggerSettingsRefresh();
+            
             return true;
-
+    
         } catch (error) {
             console.error('Failed to revoke access:', error);
             new Notice('Failed to revoke access. Tokens cleared locally.');
@@ -1175,10 +1181,37 @@ export default class GDriveSyncPlugin extends Plugin {
             this.settings.refreshToken = '';
             this.settings.tokenExpiresAt = 0;
             await this.saveSettings();
+            
+            // 🔥 설정 화면 즉시 업데이트
+            this.triggerSettingsRefresh();
+            
             return false;
         }
     }
-
+    private triggerSettingsRefresh(): void {
+        // 설정 탭이 열려있는지 확인하고 새로고침
+        const settingsModal = document.querySelector('.modal.mod-settings');
+        if (settingsModal) {
+            // 현재 열린 설정 탭 찾기
+            const pluginSettings = settingsModal.querySelector('.setting-tab-content');
+            if (pluginSettings) {
+                // 설정 탭 새로고침 이벤트 발생
+                setTimeout(() => {
+                    // 설정 탭 인스턴스에 접근하여 display() 메서드 호출
+                    const app = this.app as any;
+                    if (app.setting && app.setting.activeTab && app.setting.activeTab.plugin === this) {
+                        app.setting.activeTab.display();
+                    }
+                }, 100);
+            }
+        }
+        if (this.settingTab) {
+            // 100ms 후 설정 탭 새로고침
+            setTimeout(() => {
+                this.settingTab?.display();
+            }, 100);
+        }
+    }
     isAuthenticated(): boolean {
         return !!(this.settings.accessToken && this.settings.refreshToken);
     }
@@ -3495,38 +3528,44 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             cls: 'action-button warning',
             text: '🚪 Sign Out'
         });
-        signOutBtn.onclick = () => this.plugin.revokeGoogleDriveAccess();
+        signOutBtn.onclick = async () => {
+            await this.plugin.revokeGoogleDriveAccess();
+        };
+        this.renderAuthCodeSection(container);
+    }
+    private renderAuthCodeSection(container: HTMLElement): void {
+        const authCodeGroup = container.createEl('div', { 
+            cls: 'setting-group',
+            attr: { 
+                style: this.plugin.isAuthenticated() ? 'display: none;' : 'display: block;'
+            }
+        });
+        authCodeGroup.createEl('h4', { text: '🔐 Authorization Code' });
         
-        // Authorization Code Input
-        if (!this.plugin.isAuthenticated()) {
-            const authCodeGroup = container.createEl('div', { cls: 'setting-group' });
-            authCodeGroup.createEl('h4', { text: '🔐 Authorization Code' });
-            
-            new Setting(authCodeGroup)
-                .setName('Paste Authorization Code')
-                .setDesc('After clicking "Authenticate", paste the code here')
-                .addText(text => text
-                    .setPlaceholder('Paste authorization code...')
-                    .setValue(''))
-                .addButton(button => button
-                    .setButtonText('Exchange for Token')
-                    .setCta()
-                    .onClick(async () => {
-                        const textInput = authCodeGroup.querySelector('input') as HTMLInputElement;
-                        const authCode = textInput?.value?.trim();
-                        
-                        if (!authCode) {
-                            new Notice('❌ Please enter authorization code first');
-                            return;
-                        }
-                        
-                        const success = await this.plugin.exchangeCodeForToken(authCode);
-                        if (success) {
-                            textInput.value = '';
-                            this.display();
-                        }
-                    }));
-        }
+        new Setting(authCodeGroup)
+            .setName('Paste Authorization Code')
+            .setDesc('After clicking "Authenticate", paste the code here')
+            .addText(text => text
+                .setPlaceholder('Paste authorization code...')
+                .setValue(''))
+            .addButton(button => button
+                .setButtonText('Exchange for Token')
+                .setCta()
+                .onClick(async () => {
+                    const textInput = authCodeGroup.querySelector('input') as HTMLInputElement;
+                    const authCode = textInput?.value?.trim();
+                    
+                    if (!authCode) {
+                        new Notice('❌ Please enter authorization code first');
+                        return;
+                    }
+                    
+                    const success = await this.plugin.exchangeCodeForToken(authCode);
+                    if (success) {
+                        textInput.value = '';
+                        this.display(); // 🔥 성공 시 즉시 화면 새로고침
+                    }
+                }));
     }
 
     private renderConnectionStatus(container: HTMLElement): void {
