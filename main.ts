@@ -1185,24 +1185,68 @@ export default class GDriveSyncPlugin extends Plugin {
 
     // API 호출 전에 토큰 검증을 추가하는 헬퍼 메서드
     async makeAuthenticatedRequest(url: string, options: any = {}): Promise<any> {
-        // 토큰 유효성 확인 및 자동 갱신
-        const tokenValid = await this.ensureValidToken();
-        if (!tokenValid) {
-            throw new Error('Authentication required. Please sign in again.');
+        let retryCount = 0;
+        const maxRetries = 2;
+    
+        while (retryCount <= maxRetries) {
+            try {
+                // 토큰 유효성 확인 및 자동 갱신
+                const tokenValid = await this.ensureValidToken();
+                if (!tokenValid) {
+                    throw new Error('Authentication failed. Please sign in again.');
+                }
+    
+                // 기본 헤더에 Authorization 추가
+                const headers = {
+                    'Authorization': `Bearer ${this.settings.accessToken}`,
+                    ...options.headers
+                };
+    
+                const response = await requestUrl({
+                    ...options,
+                    url,
+                    headers,
+                    throw: false
+                });
+    
+                // 401 에러인 경우 토큰 갱신 후 재시도
+                if (response.status === 401 && retryCount < maxRetries) {
+                    console.log(`🔄 Token expired during request, attempting refresh (retry ${retryCount + 1}/${maxRetries})`);
+                    
+                    const refreshed = await this.refreshAccessToken();
+                    if (!refreshed) {
+                        throw new Error('Failed to refresh access token. Please sign in again.');
+                    }
+                    
+                    retryCount++;
+                    continue; // 재시도
+                }
+    
+                // 403 에러인 경우 (API 할당량 초과 등)
+                if (response.status === 403) {
+                    const errorData = response.json || {};
+                    if (errorData.error?.message?.includes('quota')) {
+                        throw new Error('Google Drive API quota exceeded. Please try again later.');
+                    }
+                }
+    
+                return response;
+    
+            } catch (error) {
+                if (retryCount >= maxRetries) {
+                    console.error(`❌ Request failed after ${maxRetries} retries:`, error);
+                    throw error;
+                }
+                
+                retryCount++;
+                console.log(`⚠️ Request failed, retrying (${retryCount}/${maxRetries}):`, error.message);
+                
+                // 재시도 전 잠시 대기
+                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+            }
         }
-
-        // 기본 헤더에 Authorization 추가
-        const headers = {
-            'Authorization': `Bearer ${this.settings.accessToken}`,
-            ...options.headers
-        };
-
-        return await requestUrl({
-            ...options,
-            url,
-            headers,
-            throw: false
-        });
+    
+        throw new Error('Request failed after all retries');
     }
 
     // 메인 동기화 메서드
@@ -1740,20 +1784,24 @@ export default class GDriveSyncPlugin extends Plugin {
                 progressModal?.updateProgress(processedFiles, totalFiles, `Processing: ${filePath}`);
     
                 if (localFile && driveFile) {
-                    // 🔥 충돌 해결 로그를 더 정확하게
+                    // 🔍 충돌 검사 로그를 더 정확하게
                     progressModal?.addLog(`🔍 Checking: ${filePath}`);
+                    
+                    const initialConflicts = result.conflicts; // 충돌 수 추적
                     await this.resolveFileConflict(localFile, driveFile, rootFolderId, result, baseFolder);
                     
-                    // 결과에 따른 로그 (resolveFileConflict 이후)
-                    if (result.conflicts > 0) {
-                        // 실제 충돌이 해결된 경우에만 로그
+                    // 실제 충돌이 해결된 경우에만 로그 (충돌 수가 증가한 경우)
+                    if (result.conflicts > initialConflicts) {
                         progressModal?.addLog(`⚡ Conflict resolved: ${filePath}`);
+                    } else {
+                        // 충돌이 아니었던 경우
+                        progressModal?.addLog(`✅ Already synced: ${filePath}`);
                     }
                 } else if (localFile && !driveFile) {
-                    progressModal?.addLog(`📤 Upload only: ${filePath}`);
+                    progressModal?.addLog(`📤 Upload: ${filePath}`);
                     await this.uploadSingleFile(localFile, rootFolderId, result, baseFolder);
                 } else if (!localFile && driveFile) {
-                    progressModal?.addLog(`📥 Download only: ${filePath}`);
+                    progressModal?.addLog(`📥 Download: ${filePath}`);
                     await this.downloadFileFromDrive(driveFile, result, baseFolder);
                 }
             } catch (error) {
@@ -1890,82 +1938,86 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // 파일 충돌 해결
-    private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
-        const localModTime = localFile.stat.mtime;
-        const remoteModTime = new Date(driveFile.modifiedTime).getTime();
-    
-        // 1초 이내 차이는 동일한 것으로 간주 (파일시스템 정밀도 고려)
-        const timeDiff = Math.abs(localModTime - remoteModTime);
-        const TIME_TOLERANCE = 1000; // 1초
-    
-        if (timeDiff <= TIME_TOLERANCE) {
-            // 시간이 거의 같으면 충돌이 아니라 동기화된 상태
-            console.log(`⏭️ ${localFile.name}: Files are already synced (time diff: ${timeDiff}ms)`);
-            result.skipped++;
-            return; // 여기서 바로 리턴 - 충돌 로그 없이
-        }
-    
-        // ⚠️ 여기서부터가 실제 충돌 상황 - 로그 출력 시점을 늦춤
-        let resolution: 'local' | 'remote';
-        let needsAction = true;
-    
-        switch (this.settings.conflictResolution) {
-            case 'local':
-                resolution = 'local';
-                break;
-            case 'remote':
-                resolution = 'remote';
-                break;
-            case 'newer':
-                resolution = localModTime > remoteModTime ? 'local' : 'remote';
-                break;
-            case 'ask':
-                resolution = localModTime > remoteModTime ? 'local' : 'remote';
-                console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
-                break;
-        }
-    
-        // 🔥 실제 충돌 해결이 필요한 경우에만 로그 출력
-        console.log(`⚡ Conflict detected: ${localFile.name}`);
-        console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
-        console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
-        console.log(`  Resolution: Use ${resolution} file`);
-    
-        try {
-            if (resolution === 'local') {
-                // 로컬 파일로 원격 파일 업데이트
-                const syncResult = await this.syncFileToGoogleDrive(localFile, rootFolderId, baseFolder);
-                if (syncResult === 'skipped') {
-                    result.skipped++;
-                    needsAction = false;
-                    // 🚫 스킵된 경우 충돌로 카운트하지 않음
-                    console.log(`⏭️ ${localFile.name}: Actually skipped after conflict check`);
-                } else if (syncResult === true) {
-                    result.uploaded++;
-                    result.conflicts++; // ✅ 실제로 업로드된 경우에만 충돌로 카운트
-                } else {
-                    result.errors++;
-                    needsAction = false;
-                }
-            } else {
-                // 원격 파일로 로컬 파일 업데이트
-                const shouldDownload = await this.shouldDownloadFile(localFile, driveFile);
-                if (shouldDownload) {
-                    await this.downloadFileFromDrive(driveFile, result, baseFolder);
-                    result.downloaded++;
-                    result.conflicts++; // ✅ 실제로 다운로드된 경우에만 충돌로 카운트
-                } else {
-                    result.skipped++;
-                    needsAction = false;
-                    console.log(`⏭️ ${localFile.name}: Actually skipped after download check`);
-                }
-            }
-    
-        } catch (error) {
-            console.error(`Error resolving conflict for ${localFile.path}:`, error);
-            result.errors++;
-        }
+// 파일 충돌 해결
+private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
+    const localModTime = localFile.stat.mtime;
+    const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+
+    // 1초 이내 차이는 동일한 것으로 간주 (파일시스템 정밀도 고려)
+    const timeDiff = Math.abs(localModTime - remoteModTime);
+    const TIME_TOLERANCE = 1000; // 1초
+
+    if (timeDiff <= TIME_TOLERANCE) {
+        // 시간이 거의 같으면 충돌이 아니라 동기화된 상태
+        console.log(`⏭️ ${localFile.name}: Files are already synced (time diff: ${timeDiff}ms)`);
+        result.skipped++;
+        return; // 충돌로 카운트하지 않음
     }
+
+    // ⚠️ 여기서부터가 실제 충돌 상황
+    let resolution: 'local' | 'remote';
+    let isActualConflict = false; // 실제 충돌 여부 추적
+
+    switch (this.settings.conflictResolution) {
+        case 'local':
+            resolution = 'local';
+            break;
+        case 'remote':
+            resolution = 'remote';
+            break;
+        case 'newer':
+            resolution = localModTime > remoteModTime ? 'local' : 'remote';
+            break;
+        case 'ask':
+            resolution = localModTime > remoteModTime ? 'local' : 'remote';
+            console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
+            break;
+    }
+
+    // 🔥 실제 충돌 해결이 필요한 경우에만 로그 출력
+    console.log(`⚡ Conflict detected: ${localFile.name}`);
+    console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
+    console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
+    console.log(`  Resolution: Use ${resolution} file`);
+
+    try {
+        if (resolution === 'local') {
+            // 로컬 파일로 원격 파일 업데이트
+            const syncResult = await this.syncFileToGoogleDrive(localFile, rootFolderId, baseFolder);
+            if (syncResult === 'skipped') {
+                result.skipped++;
+                console.log(`⏭️ ${localFile.name}: Actually skipped after conflict check`);
+            } else if (syncResult === true) {
+                result.uploaded++;
+                result.conflicts++; // ✅ 실제로 업로드된 경우에만 충돌로 카운트
+                isActualConflict = true;
+            } else {
+                result.errors++;
+            }
+        } else {
+            // 원격 파일로 로컬 파일 업데이트
+            const shouldDownload = await this.shouldDownloadFile(localFile, driveFile);
+            if (shouldDownload) {
+                await this.downloadFileFromDrive(driveFile, result, baseFolder);
+                result.downloaded++;
+                result.conflicts++; // ✅ 실제로 다운로드된 경우에만 충돌로 카운트
+                isActualConflict = true;
+            } else {
+                result.skipped++;
+                console.log(`⏭️ ${localFile.name}: Actually skipped after download check`);
+            }
+        }
+
+        // 실제 충돌이 해결된 경우에만 해결 로그 출력
+        if (isActualConflict) {
+            console.log(`✅ Conflict resolved: ${localFile.name} (used ${resolution} version)`);
+        }
+
+    } catch (error) {
+        console.error(`Error resolving conflict for ${localFile.path}:`, error);
+        result.errors++;
+    }
+}
 
     // 단일 파일 업로드
     private async uploadSingleFile(file: TFile, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
@@ -2275,58 +2327,71 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     private async syncFileToGoogleDrive(file: TFile, rootFolderId: string, baseFolder: string = ''): Promise<boolean | 'skipped'> {
-        try {
-            let relativePath = file.path;
-            
-            // baseFolder가 있는 경우 상대 경로로 변환
-            if (baseFolder && file.path.startsWith(baseFolder + '/')) {
-                relativePath = file.path.substring(baseFolder.length + 1);
-            } else if (baseFolder && file.path === baseFolder) {
-                relativePath = file.name;
-            } else if (!baseFolder) {
-                relativePath = file.path;
-            }
-            
-            let fileName = file.name;
-            let targetFolderId = rootFolderId;
-            
-            // 상대 경로에 폴더 구조가 있는 경우 캐시된 폴더 ID 사용
-            if (relativePath.includes('/')) {
-                const pathParts = relativePath.split('/');
-                fileName = pathParts.pop()!;
-                const folderPath = pathParts.join('/');
+        let retryCount = 0;
+        const maxRetries = 3;
+    
+        while (retryCount <= maxRetries) {
+            try {
+                let relativePath = file.path;
                 
-                // 캐시된 폴더 ID 사용 (성능 최적화)
-                targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
-                if (!targetFolderId) {
-                    console.error(`Failed to get folder ID for: ${folderPath}`);
+                // baseFolder 처리 로직...
+                if (baseFolder && file.path.startsWith(baseFolder + '/')) {
+                    relativePath = file.path.substring(baseFolder.length + 1);
+                } else if (baseFolder && file.path === baseFolder) {
+                    relativePath = file.name;
+                } else if (!baseFolder) {
+                    relativePath = file.path;
+                }
+                
+                let fileName = file.name;
+                let targetFolderId = rootFolderId;
+                
+                // 폴더 구조 처리...
+                if (relativePath.includes('/')) {
+                    const pathParts = relativePath.split('/');
+                    fileName = pathParts.pop()!;
+                    const folderPath = pathParts.join('/');
+                    
+                    targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
+                    if (!targetFolderId) {
+                        throw new Error(`Failed to get folder ID for: ${folderPath}`);
+                    }
+                }
+                
+                const existingFile = await this.findFileInDrive(fileName, targetFolderId);
+                const needsSync = await this.shouldSyncFile(file, existingFile);
+                
+                if (!needsSync) {
+                    console.log(`⏭️ Skipping ${file.path} (no changes detected)`);
+                    return 'skipped';
+                }
+    
+                const content = await this.app.vault.read(file);
+                const localModTime = file.stat.mtime;
+                
+                if (existingFile) {
+                    console.log(`🔄 Updating ${file.path} in Google Drive`);
+                    return await this.updateFileInDrive(existingFile.id, content, localModTime);
+                } else {
+                    console.log(`📤 Uploading ${file.path} to Google Drive`);
+                    return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
+                }
+    
+            } catch (error) {
+                if (retryCount >= maxRetries) {
+                    console.error(`❌ Failed to sync ${file.path} after ${maxRetries} retries:`, error);
                     return false;
                 }
+                
+                retryCount++;
+                console.log(`⚠️ Sync failed for ${file.path}, retrying (${retryCount}/${maxRetries}):`, error.message);
+                
+                // 재시도 전 잠시 대기
+                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
             }
-            
-            const existingFile = await this.findFileInDrive(fileName, targetFolderId);
-            const needsSync = await this.shouldSyncFile(file, existingFile);
-            
-            if (!needsSync) {
-                console.log(`⏭️ Skipping ${file.path} (no changes detected)`);
-                return 'skipped';
-            }
-
-            const content = await this.app.vault.read(file);
-            const localModTime = file.stat.mtime;
-            
-            if (existingFile) {
-                console.log(`🔄 Updating ${file.path} in Google Drive`);
-                return await this.updateFileInDrive(existingFile.id, content, localModTime);
-            } else {
-                console.log(`📤 Uploading ${file.path} to Google Drive`);
-                return await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
-            }
-
-        } catch (error) {
-            console.error(`Error syncing file ${file.path}:`, error);
-            return false;
         }
+    
+        return false;
     }
 
     private async calculateFileHash(content: string): Promise<string> {
@@ -2339,15 +2404,11 @@ export default class GDriveSyncPlugin extends Plugin {
 
     private async getFileContentFromDrive(fileId: string): Promise<string> {
         try {
-            const response = await requestUrl({
-                url: `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`
-                },
-                throw: false
-            });
-
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+                { method: 'GET' }
+            );
+    
             if (response.status === 200) {
                 const decoder = new TextDecoder('utf-8');
                 return decoder.decode(response.arrayBuffer);
@@ -2363,15 +2424,11 @@ export default class GDriveSyncPlugin extends Plugin {
 
     private async findFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
-            const response = await requestUrl({
-                url: `https://www.googleapis.com/drive/v3/files?q=name='${folderName}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`,
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`
-                },
-                throw: false
-            });
-
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files?q=name='${folderName}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false&fields=files(id,name)`,
+                { method: 'GET' }
+            );
+    
             if (response.status === 200) {
                 const data = response.json;
                 if (data.files && data.files.length > 0) {
@@ -2381,27 +2438,27 @@ export default class GDriveSyncPlugin extends Plugin {
             return null;
         } catch (error) {
             console.error('Error searching folder in Drive:', error);
-            return null;
+            throw error; // 에러를 상위로 전파
         }
     }
 
     private async createFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
-            const response = await requestUrl({
-                url: 'https://www.googleapis.com/drive/v3/files',
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    name: folderName,
-                    mimeType: 'application/vnd.google-apps.folder',
-                    parents: [parentFolderId]
-                }),
-                throw: false
-            });
-
+            const response = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/drive/v3/files',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        name: folderName,
+                        mimeType: 'application/vnd.google-apps.folder',
+                        parents: [parentFolderId]
+                    })
+                }
+            );
+    
             if (response.status === 200 || response.status === 201) {
                 const folderData = response.json;
                 return { id: folderData.id, name: folderData.name };
@@ -2411,21 +2468,17 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         } catch (error) {
             console.error('Error creating folder in Drive:', error);
-            return null;
+            throw error;
         }
     }
 
     private async findFileInDrive(fileName: string, folderId: string): Promise<{id: string, name: string, modifiedTime: string} | null> {
         try {
-            const response = await requestUrl({
-                url: `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id,name,modifiedTime)`,
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`
-                },
-                throw: false
-            });
-
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files?q=name='${fileName}' and '${folderId}' in parents and trashed=false&fields=files(id,name,modifiedTime)`,
+                { method: 'GET' }
+            );
+    
             if (response.status === 200) {
                 const data = response.json;
                 if (data.files && data.files.length > 0) {
@@ -2435,7 +2488,7 @@ export default class GDriveSyncPlugin extends Plugin {
             return null;
         } catch (error) {
             console.error('Error searching file in Drive:', error);
-            return null;
+            throw error;
         }
     }
 
@@ -2457,16 +2510,16 @@ export default class GDriveSyncPlugin extends Plugin {
                 'Content-Type: text/plain\r\n\r\n' +
                 content + close_delim;
     
-            const response = await requestUrl({
-                url: 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    'Content-Type': `multipart/related; boundary="${boundary}"`
-                },
-                body: body,
-                throw: false
-            });
+            const response = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': `multipart/related; boundary="${boundary}"`
+                    },
+                    body: body
+                }
+            );
     
             const success = response.status === 200 || response.status === 201;
             
@@ -2479,41 +2532,41 @@ export default class GDriveSyncPlugin extends Plugin {
             return success;
         } catch (error) {
             console.error(`❌ ${fileName}: Upload failed - ${error.message}`);
-            return false;
+            throw error; // 에러를 상위로 전파하여 재시도 로직에서 처리
         }
     }
 
     private async updateFileInDrive(fileId: string, content: string, localModTime: number): Promise<boolean> {
         try {
             // 파일 내용 업데이트
-            const contentResponse = await requestUrl({
-                url: `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    'Content-Type': 'text/plain'
-                },
-                body: content,
-                throw: false
-            });
+            const contentResponse = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+                {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'text/plain'
+                    },
+                    body: content
+                }
+            );
     
             if (contentResponse.status !== 200) {
                 return false;
             }
     
             // 수정 시간 업데이트
-            const metadataResponse = await requestUrl({
-                url: `https://www.googleapis.com/drive/v3/files/${fileId}`,
-                method: 'PATCH',
-                headers: {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    modifiedTime: new Date(localModTime).toISOString()
-                }),
-                throw: false
-            });
+            const metadataResponse = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${fileId}`,
+                {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        modifiedTime: new Date(localModTime).toISOString()
+                    })
+                }
+            );
     
             const success = metadataResponse.status === 200;
             
@@ -2524,7 +2577,7 @@ export default class GDriveSyncPlugin extends Plugin {
             return success;
         } catch (error) {
             console.error(`❌ Update failed - ${error.message}`);
-            return false;
+            throw error;
         }
     }
 
