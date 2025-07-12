@@ -1,6 +1,6 @@
 {
   "name": "obsidian-gdrive-file-sync",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "description": "Google Drive File Sync Plugin for Obsidian using Google Identity Services",
   "main": "main.js",
   "scripts": {

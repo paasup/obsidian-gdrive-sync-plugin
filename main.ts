@@ -680,7 +680,7 @@ class DriveFolderModal extends Modal {
             new Notice(`❌ Failed to remove folder: ${folderItem.name}`);
         }
     }
-     
+
     private async loadDriveFolders() {
         try {
             const rootFolder = await this.plugin.getOrCreateDriveFolder();
@@ -2889,9 +2889,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         // Main Configuration Tabs
         this.renderMainTabs(containerEl);
 
-        // Live Preview Panel
-        this.renderLivePreview(containerEl);
-
         // Start status update interval
         this.startStatusUpdates();
     }
@@ -3079,21 +3076,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 min-height: 300px; /* 높이 축소 */
             }
             
-            .live-preview {
-                background: var(--background-secondary);
-                border-radius: 8px;
-                padding: 15px; /* 패딩 축소 */
-                margin-top: 15px;
-            }
-            
-            .sync-overview {
-                display: grid;
-                grid-template-columns: 1fr auto 1fr;
-                gap: 15px; /* 간격 축소 */
-                align-items: center;
-                margin-bottom: 15px;
-            }
-            
+
             /* 모바일에서 세로 레이아웃으로 변경 */
             @media (max-width: 768px) {
                 .gdrive-settings {
@@ -3112,12 +3095,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     width: 100%;
                 }
                 
-                .sync-overview {
-                    grid-template-columns: 1fr;
-                    grid-template-rows: auto auto auto;
-                    gap: 10px;
-                    text-align: center;
-                }
+
                 
                 .wizard-steps {
                     grid-template-columns: 1fr;
@@ -3172,24 +3150,8 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     font-size: 14px;
                 }
             }
-            
-            .file-count-box {
-                text-align: center;
-                padding: 15px; /* 패딩 축소 */
-                background: var(--background-primary);
-                border-radius: 6px;
-                border: 2px solid var(--background-modifier-border);
-            }
-            
-            .sync-action-box {
-                text-align: center;
-                padding: 12px; /* 패딩 축소 */
-                background: linear-gradient(135deg, #4CAF50, #45a049);
-                color: white;
-                border-radius: 6px;
-                font-weight: bold;
-            }
-            
+ 
+   
             .connection-status {
                 display: flex;
                 align-items: center;
@@ -3398,64 +3360,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .folder-item:hover {
                     transform: none;
                     background: var(--background-modifier-hover);
-                }
-            }
-
-            .sync-actions-container {
-                margin-top: 25px;
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-            }
-
-            .sync-primary-button {
-                width: 100%;
-                padding: 15px 20px;
-                font-size: 16px;
-                font-weight: bold;
-                border-radius: 8px;
-                transition: all 0.2s ease;
-            }
-
-            .sync-primary-button:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            }
-
-            .sync-secondary-actions {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
-            }
-
-            .sync-secondary-button {
-                padding: 10px 16px;
-                font-size: 14px;
-                border-radius: 6px;
-                text-align: center;
-                transition: all 0.2s ease;
-            }
-
-            .sync-secondary-button:hover {
-                transform: translateY(-1px);
-                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            }
-
-            /* 모바일 대응 */
-            @media (max-width: 480px) {
-                .sync-secondary-actions {
-                    grid-template-columns: 1fr;
-                    gap: 8px;
-                }
-                
-                .sync-primary-button {
-                    padding: 12px 16px;
-                    font-size: 15px;
-                }
-                
-                .sync-secondary-button {
-                    padding: 8px 12px;
-                    font-size: 13px;
                 }
             }
 
@@ -4334,264 +4238,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             statusEl.innerHTML = `<span style="color: var(--color-orange);">⚠️ Enabled but not running - check console</span>`;
         } else {
             statusEl.innerHTML = `<span style="color: var(--text-muted);">❌ Disabled</span>`;
-        }
-    }
-    private renderLivePreview(container: HTMLElement): void {
-        const preview = container.createEl('div', { cls: 'live-preview' });
-        preview.createEl('h3', { 
-            text: '📊 Sync Overview',
-            attr: { style: 'margin: 0 0 20px 0; display: flex; align-items: center; gap: 8px;' }
-        });
-        
-        // Sync Overview Grid
-        const overview = preview.createEl('div', { cls: 'sync-overview' });
-        
-        // Local Files
-        const localBox = overview.createEl('div', { cls: 'file-count-box' });
-        localBox.createEl('div', { 
-            text: '📱',
-            attr: { style: 'font-size: 24px; margin-bottom: 8px;' }
-        });
-        localBox.createEl('div', { 
-            text: 'Local Files',
-            attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
-        });
-        const localCount = localBox.createEl('div', { 
-            text: 'Click "Refresh" to calculate',
-            attr: { style: 'font-size: 14px; color: var(--text-muted);' }
-        });
-        
-        // Sync Action
-        const actionBox = overview.createEl('div', { cls: 'sync-action-box' });
-        actionBox.createEl('div', { 
-            text: '🔄',
-            attr: { style: 'font-size: 20px; margin-bottom: 5px;' }
-        });
-        actionBox.createEl('div', { text: 'Ready to Sync' });
-        
-        // Remote Files  
-        const remoteBox = overview.createEl('div', { cls: 'file-count-box' });
-        remoteBox.createEl('div', { 
-            text: '☁️',
-            attr: { style: 'font-size: 24px; margin-bottom: 8px;' }
-        });
-        remoteBox.createEl('div', { 
-            text: 'Remote Files',
-            attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
-        });
-        const remoteCount = remoteBox.createEl('div', { 
-            text: 'Click "Refresh" to calculate',
-            attr: { style: 'font-size: 14px; color: var(--text-muted);' }
-        });
-        
-        // What will happen section
-        const actions = preview.createEl('div', { 
-            attr: { style: 'margin: 20px 0;' }
-        });
-        
-        // Header with inline refresh button - 개선된 레이아웃
-        const headerContainer = actions.createEl('div', {
-            attr: { 
-                style: 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;'
-            }
-        });
-        
-        const headerTitle = headerContainer.createEl('h4', { 
-            text: '🎯 What will happen:',
-            attr: { style: 'margin: 0; flex-grow: 1;' }
-        });
-        
-        const refreshButton = headerContainer.createEl('button', { 
-            cls: 'action-button secondary',
-            text: '🔄 Refresh',
-            attr: { 
-                style: 'padding: 6px 12px; font-size: 12px; min-width: 80px; flex-shrink: 0;'
-            }
-        });
-        
-        const actionsList = actions.createEl('ul', { 
-            attr: { style: 'margin: 10px 0; padding-left: 20px;' }
-        });
-        
-        const uploadLi = actionsList.createEl('li', { text: 'Upload: 📤 Click refresh to calculate' });
-        const downloadLi = actionsList.createEl('li', { text: 'Download: 📥 Click refresh to calculate' });
-        const conflictLi = actionsList.createEl('li', { text: 'Conflicts: ⚡ Click refresh to calculate' });
-        
-        const estimatedTime = actions.createEl('div', { 
-            text: 'Estimated time: ⏱️ Click refresh to calculate',
-            attr: { style: 'margin-top: 10px; font-style: italic; color: var(--text-muted);' }
-        });
-        
-        // Refresh button event handler
-        refreshButton.onclick = () => {
-            // Show loading state
-            refreshButton.disabled = true;
-            refreshButton.textContent = '🔄 Loading...';
-            
-            localCount.textContent = 'Calculating...';
-            remoteCount.textContent = 'Calculating...';
-            uploadLi.textContent = 'Upload: 📤 Calculating...';
-            downloadLi.textContent = 'Download: 📥 Calculating...';
-            conflictLi.textContent = 'Conflicts: ⚡ Calculating...';
-            estimatedTime.textContent = 'Estimated time: ⏱️ Calculating...';
-            
-            // Update preview with actual data
-            this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime)
-                .finally(() => {
-                    refreshButton.disabled = false;
-                    refreshButton.textContent = '🔄 Refresh';
-                });
-        };
-        
-        // 🔥 개선된 버튼 레이아웃
-        const syncActionsContainer = preview.createEl('div', {
-            cls: 'sync-actions-container',
-            attr: { 
-                style: 'margin-top: 25px; display: flex; flex-direction: column; gap: 12px;'
-            }
-        });
-        
-        // Primary Sync Button
-        const primarySyncButton = syncActionsContainer.createEl('button', { 
-            cls: 'action-button primary sync-primary-button',
-            text: '🚀 Start Sync',
-            attr: { 
-                style: 'width: 100%; padding: 15px 20px; font-size: 16px; font-weight: bold; border-radius: 8px;'
-            }
-        });
-        primarySyncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
-        
-        // Secondary Actions Container
-        const secondaryActions = syncActionsContainer.createEl('div', {
-            cls: 'sync-secondary-actions',
-            attr: { 
-                style: 'display: grid; grid-template-columns: 1fr 1fr; gap: 10px;'
-            }
-        });
-        
-        const uploadOnlyBtn = secondaryActions.createEl('button', { 
-            cls: 'action-button secondary sync-secondary-button',
-            text: '📤 Upload Only',
-            attr: { 
-                style: 'padding: 10px 16px; font-size: 14px; border-radius: 6px; text-align: center;'
-            }
-        });
-        uploadOnlyBtn.onclick = () => this.plugin.uploadToGoogleDrive(true);
-        
-        const downloadOnlyBtn = secondaryActions.createEl('button', { 
-            cls: 'action-button secondary sync-secondary-button',
-            text: '📥 Download Only',
-            attr: { 
-                style: 'padding: 10px 16px; font-size: 14px; border-radius: 6px; text-align: center;'
-            }
-        });
-        downloadOnlyBtn.onclick = () => this.plugin.downloadFromGoogleDrive(true);
-    }
-
-    private async updateLivePreview(
-        localCountEl: HTMLElement, 
-        remoteCountEl: HTMLElement,
-        uploadEl: HTMLElement,
-        downloadEl: HTMLElement,
-        conflictEl: HTMLElement,
-        timeEl: HTMLElement
-    ): Promise<void> {
-        try {
-            if (!this.plugin.isAuthenticated()) {
-                localCountEl.textContent = 'Sign in required';
-                remoteCountEl.textContent = 'Sign in required';
-                uploadEl.textContent = 'Upload: 📤 Authentication required';
-                downloadEl.textContent = 'Download: 📥 Authentication required';
-                conflictEl.textContent = 'Conflicts: ⚡ Authentication required';
-                timeEl.textContent = 'Estimated time: ⏱️ Please authenticate first';
-                return;
-            }
-    
-            // Count local files
-            let localFiles: TFile[] = [];
-            if (this.plugin.settings.syncWholeVault) {
-                localFiles = this.plugin.app.vault.getFiles().filter(file => this.plugin.shouldSyncFileType(file));
-            } else {
-                for (const driveFolder of this.plugin.settings.selectedDriveFolders) {
-                    const folderFiles = await this.plugin.getLocalFilesForDriveFolder(driveFolder);
-                    localFiles.push(...folderFiles);
-                }
-            }
-            
-            localCountEl.textContent = localFiles.length.toString();
-            
-            // Count remote files (if authenticated)
-            let remoteFiles: any[] = [];
-            try {
-                if (this.plugin.settings.syncWholeVault) {
-                    const rootFolder = await this.plugin.getOrCreateDriveFolder();
-                    if (rootFolder) {
-                        remoteFiles = await this.plugin.getAllFilesFromDrive(rootFolder.id);
-                    }
-                } else {
-                    for (const driveFolder of this.plugin.settings.selectedDriveFolders) {
-                        const folderFiles = await this.plugin.getAllFilesFromDrive(driveFolder.id, driveFolder.path);
-                        remoteFiles.push(...folderFiles);
-                    }
-                }
-                
-                remoteCountEl.textContent = remoteFiles.length.toString();
-                
-                // 간단한 파일명 기반 매핑으로 변경
-                const localFileNames = new Set(localFiles.map(file => file.name));
-                const remoteFileNames = new Set(remoteFiles.map(file => file.name));
-                
-                // 교집합 계산 (양쪽에 모두 있는 파일 = 잠재적 충돌)
-                const commonFiles = new Set([...localFileNames].filter(name => remoteFileNames.has(name)));
-                
-                // 실제 동기화 작업 계산
-                const estimatedUploads = localFiles.length - commonFiles.size; // 로컬에만 있는 파일
-                const estimatedDownloads = remoteFiles.length - commonFiles.size; // 원격에만 있는 파일
-                const estimatedConflicts = commonFiles.size; // 양쪽에 모두 있는 파일
-                
-                uploadEl.textContent = `Upload: 📤 ~${estimatedUploads} files`;
-                downloadEl.textContent = `Download: 📥 ~${estimatedDownloads} files`;
-                if (estimatedUploads === 0 && estimatedDownloads === 0 && estimatedConflicts > 0) {
-                    conflictEl.textContent = `Status check: ⚡ ~${estimatedConflicts} files (likely already synced)`;
-                } else {
-                    conflictEl.textContent = `Conflicts: ⚡ ~${estimatedConflicts} to check`;
-                }
-                
-                const totalActions = estimatedUploads + estimatedDownloads + estimatedConflicts;
-                
-                if (totalActions === 0) {
-                    timeEl.textContent = 'Estimated time: ⏱️ All files are in sync';
-                } else {
-                    const estimatedSeconds = Math.max(10, totalActions * 2);
-                    const minutes = Math.max(1, Math.round(estimatedSeconds / 60));
-                    timeEl.textContent = `Estimated time: ⏱️ ~${minutes} minute${minutes !== 1 ? 's' : ''}`;
-                }
-                
-                // 디버그 정보 로그
-                console.log('Sync Preview Debug:', {
-                    localFiles: localFiles.length,
-                    remoteFiles: remoteFiles.length,
-                    localFileNames: Array.from(localFileNames),
-                    remoteFileNames: Array.from(remoteFileNames),
-                    commonFiles: Array.from(commonFiles),
-                    estimatedUploads,
-                    estimatedDownloads,
-                    estimatedConflicts
-                });
-                
-            } catch (error) {
-                console.error('Error calculating sync preview:', error);
-                remoteCountEl.textContent = 'Error loading';
-                uploadEl.textContent = 'Upload: 📤 Unable to calculate';
-                downloadEl.textContent = 'Download: 📥 Unable to calculate';
-                conflictEl.textContent = 'Conflicts: ⚡ Unable to calculate';
-                timeEl.textContent = 'Estimated time: ⏱️ Error calculating';
-            }
-            
-        } catch (error) {
-            console.error('Error updating live preview:', error);
-            localCountEl.textContent = 'Error';
-            remoteCountEl.textContent = 'Error';
         }
     }
 
