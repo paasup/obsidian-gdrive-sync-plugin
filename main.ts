@@ -3247,6 +3247,86 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     background: var(--background-modifier-hover);
                 }
             }
+
+            .sync-actions-container {
+                margin-top: 25px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+
+            .sync-primary-button {
+                width: 100%;
+                padding: 15px 20px;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 8px;
+                transition: all 0.2s ease;
+            }
+
+            .sync-primary-button:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            }
+
+            .sync-secondary-actions {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+            }
+
+            .sync-secondary-button {
+                padding: 10px 16px;
+                font-size: 14px;
+                border-radius: 6px;
+                text-align: center;
+                transition: all 0.2s ease;
+            }
+
+            .sync-secondary-button:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            }
+
+            /* 모바일 대응 */
+            @media (max-width: 480px) {
+                .sync-secondary-actions {
+                    grid-template-columns: 1fr;
+                    gap: 8px;
+                }
+                
+                .sync-primary-button {
+                    padding: 12px 16px;
+                    font-size: 15px;
+                }
+                
+                .sync-secondary-button {
+                    padding: 8px 12px;
+                    font-size: 13px;
+                }
+            }
+
+            /* Authorization Code 섹션 개선 */
+            #auth-code-section input {
+                width: 100%;
+                padding: 8px 12px;
+                border: 1px solid var(--background-modifier-border);
+                border-radius: 6px;
+                font-size: 14px;
+                transition: border-color 0.2s ease;
+            }
+
+            #auth-code-section input:focus {
+                outline: none;
+                border-color: var(--interactive-accent);
+                box-shadow: 0 0 0 2px rgba(var(--interactive-accent-rgb), 0.2);
+            }
+
+            #auth-code-section button:disabled {
+                opacity: 0.6;
+                cursor: not-allowed;
+                transform: none !important;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -3534,38 +3614,92 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         this.renderAuthCodeSection(container);
     }
     private renderAuthCodeSection(container: HTMLElement): void {
+        // 기존 Authorization Code 섹션이 있으면 제거
+        const existingAuthCode = container.querySelector('#auth-code-section');
+        if (existingAuthCode) {
+            existingAuthCode.remove();
+        }
+        
         const authCodeGroup = container.createEl('div', { 
             cls: 'setting-group',
             attr: { 
+                id: 'auth-code-section',
                 style: this.plugin.isAuthenticated() ? 'display: none;' : 'display: block;'
             }
         });
         authCodeGroup.createEl('h4', { text: '🔐 Authorization Code' });
         
-        new Setting(authCodeGroup)
-            .setName('Paste Authorization Code')
-            .setDesc('After clicking "Authenticate", paste the code here')
-            .addText(text => text
-                .setPlaceholder('Paste authorization code...')
-                .setValue(''))
-            .addButton(button => button
-                .setButtonText('Exchange for Token')
-                .setCta()
-                .onClick(async () => {
-                    const textInput = authCodeGroup.querySelector('input') as HTMLInputElement;
-                    const authCode = textInput?.value?.trim();
-                    
-                    if (!authCode) {
-                        new Notice('❌ Please enter authorization code first');
-                        return;
-                    }
-                    
-                    const success = await this.plugin.exchangeCodeForToken(authCode);
-                    if (success) {
-                        textInput.value = '';
-                        this.display(); // 🔥 성공 시 즉시 화면 새로고침
-                    }
-                }));
+        // 입력 필드와 버튼을 별도 컨테이너로 분리
+        const inputContainer = authCodeGroup.createEl('div', {
+            attr: { style: 'margin-bottom: 15px;' }
+        });
+        
+        const inputLabel = inputContainer.createEl('label', { 
+            text: 'Paste Authorization Code',
+            attr: { style: 'display: block; margin-bottom: 8px; font-weight: bold;' }
+        });
+        
+        const inputDesc = inputContainer.createEl('div', { 
+            text: 'After clicking "Authenticate", paste the code here',
+            attr: { style: 'font-size: 0.9em; color: var(--text-muted); margin-bottom: 10px;' }
+        });
+        
+        const authInput = inputContainer.createEl('input', {
+            type: 'text',
+            placeholder: 'Paste authorization code...',
+            attr: { 
+                style: 'width: 100%; padding: 8px; border: 1px solid var(--background-modifier-border); border-radius: 4px; margin-bottom: 15px;'
+            }
+        });
+        
+        // 버튼 컨테이너
+        const buttonContainer = authCodeGroup.createEl('div', {
+            attr: { 
+                style: 'display: flex; justify-content: flex-end; gap: 10px;'
+            }
+        });
+        
+        const exchangeButton = buttonContainer.createEl('button', {
+            cls: 'action-button primary',
+            text: 'Exchange for Token',
+            attr: { 
+                style: 'padding: 10px 20px; font-weight: bold;'
+            }
+        });
+        
+        // Enter 키 이벤트 핸들러
+        authInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                exchangeButton.click();
+            }
+        });
+        
+        exchangeButton.onclick = async () => {
+            const authCode = authInput.value?.trim();
+            
+            if (!authCode) {
+                new Notice('❌ Please enter authorization code first');
+                authInput.focus();
+                return;
+            }
+            
+            // 버튼 비활성화 및 로딩 표시
+            exchangeButton.disabled = true;
+            exchangeButton.textContent = 'Exchanging...';
+            
+            try {
+                const success = await this.plugin.exchangeCodeForToken(authCode);
+                if (success) {
+                    authInput.value = '';
+                    this.display();
+                }
+            } finally {
+                // 버튼 복원
+                exchangeButton.disabled = false;
+                exchangeButton.textContent = 'Exchange for Token';
+            }
+        };
     }
 
     private renderConnectionStatus(container: HTMLElement): void {
@@ -4022,7 +4156,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
         });
         const localCount = localBox.createEl('div', { 
-            text: 'Click "Refresh Preview" to calculate',
+            text: 'Click "Refresh" to calculate',
             attr: { style: 'font-size: 14px; color: var(--text-muted);' }
         });
         
@@ -4045,7 +4179,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'font-weight: bold; margin-bottom: 4px;' }
         });
         const remoteCount = remoteBox.createEl('div', { 
-            text: 'Click "Refresh Preview" to calculate',
+            text: 'Click "Refresh" to calculate',
             attr: { style: 'font-size: 14px; color: var(--text-muted);' }
         });
         
@@ -4054,32 +4188,25 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'margin: 20px 0;' }
         });
         
-        actions.createEl('h4', { 
+        // Header with inline refresh button - 개선된 레이아웃
+        const headerContainer = actions.createEl('div', {
+            attr: { 
+                style: 'display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;'
+            }
+        });
+        
+        const headerTitle = headerContainer.createEl('h4', { 
             text: '🎯 What will happen:',
-            attr: { style: 'margin: 0 0 10px 0;' }
+            attr: { style: 'margin: 0; flex-grow: 1;' }
         });
         
-        const refreshContainer = actions.createEl('div', {
-            attr: { style: 'text-align: right; margin-bottom: 10px;' }
-        });
-        
-        const refreshButton = refreshContainer.createEl('button', { 
+        const refreshButton = headerContainer.createEl('button', { 
             cls: 'action-button secondary',
             text: '🔄 Refresh',
-            attr: { style: 'padding: 6px 12px; font-size: 12px;' }
+            attr: { 
+                style: 'padding: 6px 12px; font-size: 12px; min-width: 80px; flex-shrink: 0;'
+            }
         });
-        refreshButton.onclick = () => {
-            // Show loading state
-            localCount.textContent = 'Calculating...';
-            remoteCount.textContent = 'Calculating...';
-            uploadLi.textContent = 'Upload: 📤 Calculating...';
-            downloadLi.textContent = 'Download: 📥 Calculating...';
-            conflictLi.textContent = 'Conflicts: ⚡ Calculating...';
-            estimatedTime.textContent = 'Estimated time: ⏱️ Calculating...';
-            
-            // Update preview with actual data
-            this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime);
-        };
         
         const actionsList = actions.createEl('ul', { 
             attr: { style: 'margin: 10px 0; padding-left: 20px;' }
@@ -4094,34 +4221,68 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             attr: { style: 'margin-top: 10px; font-style: italic; color: var(--text-muted);' }
         });
         
-        // Single prominent Start Sync Button
-        const syncButtonContainer = preview.createEl('div', {
-            attr: { style: 'margin-top: 25px; text-align: center;' }
+        // Refresh button event handler
+        refreshButton.onclick = () => {
+            // Show loading state
+            refreshButton.disabled = true;
+            refreshButton.textContent = '🔄 Loading...';
+            
+            localCount.textContent = 'Calculating...';
+            remoteCount.textContent = 'Calculating...';
+            uploadLi.textContent = 'Upload: 📤 Calculating...';
+            downloadLi.textContent = 'Download: 📥 Calculating...';
+            conflictLi.textContent = 'Conflicts: ⚡ Calculating...';
+            estimatedTime.textContent = 'Estimated time: ⏱️ Calculating...';
+            
+            // Update preview with actual data
+            this.updateLivePreview(localCount, remoteCount, uploadLi, downloadLi, conflictLi, estimatedTime)
+                .finally(() => {
+                    refreshButton.disabled = false;
+                    refreshButton.textContent = '🔄 Refresh';
+                });
+        };
+        
+        // 🔥 개선된 버튼 레이아웃
+        const syncActionsContainer = preview.createEl('div', {
+            cls: 'sync-actions-container',
+            attr: { 
+                style: 'margin-top: 25px; display: flex; flex-direction: column; gap: 12px;'
+            }
         });
         
-        const syncButton = syncButtonContainer.createEl('button', { 
-            cls: 'action-button primary',
+        // Primary Sync Button
+        const primarySyncButton = syncActionsContainer.createEl('button', { 
+            cls: 'action-button primary sync-primary-button',
             text: '🚀 Start Sync',
-            attr: { style: 'padding: 15px 40px; font-size: 16px; font-weight: bold; min-width: 200px;' }
+            attr: { 
+                style: 'width: 100%; padding: 15px 20px; font-size: 16px; font-weight: bold; border-radius: 8px;'
+            }
         });
-        syncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
+        primarySyncButton.onclick = () => this.plugin.syncWithGoogleDrive(true);
         
-        // Optional: Add a smaller secondary action
-        const secondaryActions = syncButtonContainer.createEl('div', {
-            attr: { style: 'margin-top: 10px; display: flex; justify-content: center; gap: 10px;' }
+        // Secondary Actions Container
+        const secondaryActions = syncActionsContainer.createEl('div', {
+            cls: 'sync-secondary-actions',
+            attr: { 
+                style: 'display: grid; grid-template-columns: 1fr 1fr; gap: 10px;'
+            }
         });
         
         const uploadOnlyBtn = secondaryActions.createEl('button', { 
-            cls: 'action-button secondary',
+            cls: 'action-button secondary sync-secondary-button',
             text: '📤 Upload Only',
-            attr: { style: 'padding: 8px 16px; font-size: 13px;' }
+            attr: { 
+                style: 'padding: 10px 16px; font-size: 14px; border-radius: 6px; text-align: center;'
+            }
         });
         uploadOnlyBtn.onclick = () => this.plugin.uploadToGoogleDrive(true);
         
         const downloadOnlyBtn = secondaryActions.createEl('button', { 
-            cls: 'action-button secondary',
+            cls: 'action-button secondary sync-secondary-button',
             text: '📥 Download Only',
-            attr: { style: 'padding: 8px 16px; font-size: 13px;' }
+            attr: { 
+                style: 'padding: 10px 16px; font-size: 14px; border-radius: 6px; text-align: center;'
+            }
         });
         downloadOnlyBtn.onclick = () => this.plugin.downloadFromGoogleDrive(true);
     }
