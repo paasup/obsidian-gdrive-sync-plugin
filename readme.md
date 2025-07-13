@@ -1,117 +1,108 @@
+# ☁️ Obsidian Google Drive Sync Plugin
 
-## 환경 구성
-```
-$ node -v
-v20.15.1
+Seamlessly synchronize your Obsidian vault or specific folders with Google Drive, ensuring your notes are always backed up and accessible.
 
-$ npm install -g typescript
-$ npm install -g esbuild
-```
+## ✨ Features
 
+* **Bidirectional Sync**: Keep your local Obsidian vault and Google Drive files in perfect harmony.
+* **One-way Sync**: Choose to either upload your local changes to Google Drive or download changes from Google Drive to your vault.
+* **Folder-based Sync**: Sync your entire vault or select specific Google Drive folders to synchronize with corresponding local folders in Obsidian.
+* **Automatic Synchronization**: Set a custom interval for the plugin to automatically sync your notes in the background.
+* **Manual Sync**: Trigger a sync anytime with a single click from the ribbon icon or command palette.
+* **Conflict Resolution**: Configurable options to handle conflicts when both local and remote files have been modified.
+* **File Type Filtering**: Currently supports `.md`, `.txt`, `.json`, `.csv`, and `.html` file types.
+* **Progress Monitoring**: A dedicated modal shows the real-time progress, logs, and summary of your sync operations.
+* **Robust Authentication**: Utilizes Google OAuth 2.0 for secure and long-term access to your Google Drive.
+* **Folder Creation**: Automatically creates missing local folders when downloading files from Google Drive.
 
-## 빌드
-```
-# 의존성 설치
-npm install
+## 🚀 Getting Started
 
-# 개발 모드 (파일 변경 감지)
-npm run dev
+### 1. Installation
 
-# 또는 프로덕션 빌드
-npm run build
-```
+This plugin is not yet available in the Obsidian community plugins. You'll need to install it manually:
 
-## 설치
-### 수동 설치
-```
-# Obsidian vault의 .obsidian/plugins 디렉토리로 이동
-cd /path/to/your/vault/.obsidian/plugins
+1.  Download the latest release from the [releases page](https://github.com/paasup/obsidian-gdrive-sync-plugin/releases).
+2.  Unzip the contents into your Obsidian vault's `.obsidian/plugins/` folder.
+3.  Reload Obsidian.
+4.  Go to `Settings` -> `Community plugins` and enable "Google Drive Sync".
 
-# 플러그인 폴더 생성
-mkdir gdrive-file-sync
-cd gdrive-file-sync
+### 2. Google Cloud Project Setup
 
-# 빌드된 파일들 복사
-cp /path/to/your/plugin/main.js .
-cp /path/to/your/plugin/manifest.json .
-```
-### 심볼릭 링크 (개발단계)
-```
-# Windows (관리자 권한 필요)
-mklink /D "C:\path\to\vault\.obsidian\plugins\gdrive-file-sync" "C:\path\to\your\plugin"
+To use this plugin, you need to create a Google Cloud Project and obtain OAuth 2.0 credentials.
 
-# macOS/Linux
-ln -s /path/to/your/plugin /path/to/vault/.obsidian/plugins/gdrive-file-sync
-```
+1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
+2.  **Create a new project** (if you don't have one).
+3.  Navigate to **APIs & Services > OAuth consent screen**.
+    * Set **User Type** to "External" and configure your app. You may need to verify your app if you intend to share it, but for personal use, you can proceed without it.
+    * Add `https://www.googleapis.com/auth/drive` as a **scope**.
+4.  Navigate to **APIs & Services > Credentials**.
+    * Click "CREATE CREDENTIALS" and choose "OAuth client ID".
+    * Select **Application type** as `Desktop app`.
+    * Give it a name (e.g., "Obsidian Google Drive Sync").
+    * Copy your **Client ID** and **Client Secret**.
+    * Click "CREATE CREDENTIALS" again and choose "API Key". Copy your **API Key**.
+5.  Ensure the **Google Drive API** is enabled for your project under **APIs & Services > Library**. Search for "Google Drive API" and enable it.
 
-## Google Drive API 설정 (Google Identity Services 사용)
+### 3. Plugin Configuration
 
-이 플러그인은 **Google Identity Services (GIS)**를 사용하여 Google Drive API에 인증합니다. 다음 단계를 따라 설정해야 합니다:
+1.  Open Obsidian `Settings`.
+2.  Navigate to `Google Drive Sync` settings.
+3.  **Authentication Tab**:
+    * Paste your **Client ID**, **Client Secret**, and **API Key** into the respective fields.
+    * Click the **"🔗 Authenticate"** button. A browser window will open asking you to authorize the application.
+    * After authorizing, you will receive an **authorization code**. Copy this code.
+    * Paste the copied code into the **"Paste Authorization Code"** field in the plugin settings and click **"Exchange for Token"**.
+    * You should see a "✅ Authentication successful!" notice.
+    * (Optional) Click **"🧪 Test Connection"** to verify your setup.
+    * (Optional) Click **"🚪 Sign Out"** to revoke access and clear your tokens.
+4.  **Sync Configuration Tab**:
+    * **Sync Whole Vault**: Enable this to sync your entire Obsidian vault. If disabled, you can select specific Google Drive folders.
+    * **Google Drive Folders**:
+        * If "Sync Whole Vault" is off, click **"📁 Browse Google Drive"**. A modal will appear listing your Google Drive folders.
+        * Select the folders you want to sync. The plugin will create corresponding local folders in your vault if they don't exist.
+        * You can also create new folders directly from this modal.
+    * **Sync Direction**: Choose between "Bidirectional", "Upload Only", or "Download Only".
+    * **Conflict Resolution**: Decide how to handle files modified in both locations. "Use Newer File" is recommended.
+    * **Include Subfolders**: Toggle whether to recursively sync files within subfolders of your chosen sync folders.
+    * **Create Missing Folders**: Automatically create local folders if they exist on Google Drive but not locally during download.
 
-### 🔄 마이그레이션 공지
-이 플러그인은 기존의 Google Sign-In JavaScript 라이브러리에서 **Google Identity Services (GIS)**로 마이그레이션되었습니다. 이는 더 나은 보안성과 호환성을 제공합니다.
+### 4. Start Syncing
 
-### 1. Google Cloud Console 설정
+1.  **Manual Sync**:
+    * Click the **cloud icon** in the left ribbon pane.
+    * Or, open the Command Palette (`Ctrl/Cmd + P`) and search for "Google Drive Sync". You can choose from "Sync with Google Drive", "Download from Google Drive", or "Upload to Google Drive".
+    * A progress modal will appear showing the sync status.
+2.  **Automatic Sync**:
+    * In the **Advanced** tab, enable **"Auto Sync"**.
+    * Adjust the **"Sync Interval"** (in minutes) using the slider. The plugin will automatically sync your vault at the specified interval.
 
-1. [Google Cloud Console](https://console.cloud.google.com/)에 접속
-2. 새 프로젝트를 생성하거나 기존 프로젝트 선택
-3. **API 및 서비스 > 라이브러리**에서 "Google Drive API" 검색 후 활성화
+## ⚙️ Advanced Settings
 
-### 2. 인증 정보 생성
+* **Sync Mode**:
+    * `Always sync`: Forces a sync every time regardless of modifications.
+    * `Modified time comparison`: (Recommended) Syncs only if the modification timestamp differs.
+    * `Content checksum comparison`: (Most accurate, but slower) Syncs only if the file content (hash) differs.
+* **Root Folder Name**: Customize the name of the top-level folder created by the plugin in your Google Drive (default: `Obsidian-Sync`).
+* **Troubleshooting**:
+    * **Clear Cache**: Clears the internal folder ID cache. Useful if Google Drive folder structures change frequently.
+    * **Export Logs**: Copies internal plugin settings and status to your clipboard for debugging purposes.
+    * **Reset Settings**: Resets all plugin settings to their default values. Use with caution.
+* **Debug Auto Sync Status**: Provides detailed information about the current auto-sync state in the developer console.
 
-#### API 키 생성
-1. **API 및 서비스 > 사용자 인증 정보**로 이동
-2. **+ 사용자 인증 정보 만들기** 클릭
-3. **API 키** 선택
-4. 생성된 API 키를 복사해 둡니다
+## ⚠️ Important Notes
 
-#### OAuth 2.0 클라이언트 ID 생성
-1. 같은 페이지에서 **+ 사용자 인증 정보 만들기** 다시 클릭
-2. **OAuth 2.0 클라이언트 ID** 선택
-3. **애플리케이션 유형**에서 반드시 **웹 애플리케이션** 선택 (중요!)
-   - ⚠️ **데스크톱 애플리케이션**을 선택하면 "승인된 JavaScript 원본" 메뉴가 나타나지 않습니다
-4. **이름**: 원하는 이름 입력 (예: "Obsidian GDrive Sync")
+* **Security**: Your API credentials and tokens are stored securely within Obsidian's configuration. However, always exercise caution when sharing sensitive information.
+* **File Types**: Only a limited set of file types are currently supported for sync (`.md`, `.txt`, `.json`, `.csv`, `.html`, `.css`, `.js`). Other file types will be ignored.
+* **Large Vaults**: Initial sync of very large vaults might take a considerable amount of time depending on your internet speed and Google Drive API rate limits.
+* **Rate Limits**: Google Drive API has usage limits. Excessive syncing might temporarily block your access.
+* **Mobile Sync**: On mobile (iOS/Android), direct file system time synchronization might not be possible due to platform restrictions. The plugin attempts to work around this using Obsidian's internal APIs.
 
-### 3. 승인된 JavaScript 원본 설정 (Google Identity Services용)
+## 🤝 Contributing
 
-**웹 애플리케이션**으로 생성한 OAuth 2.0 클라이언트 ID 설정에서 **승인된 JavaScript 원본**에 다음 URL들을 추가해야 합니다:
+Contributions are welcome! If you find a bug or have a feature request, please open an issue on the [GitHub repository](https://github.com/paasup/obsidian-gdrive-sync-plugin/issues).
 
-```
-http://localhost
-https://localhost
-http://127.0.0.1
-https://127.0.0.1
-app://obsidian.md
-capacitor://localhost
-```
+If you'd like to contribute code, please fork the repository and submit a pull request.
 
-⚠️ **이 단계를 빠뜨리면 "authentication failed" 오류가 발생합니다!**
+## License
 
-**Google Identity Services 특징:**
-- 더 안전한 토큰 기반 인증
-- 팝업 차단에 덜 민감함
-- 모바일 환경 지원 개선
-- `app://obsidian.md`와 `capacitor://localhost` 지원으로 Obsidian 앱 호환성 향상
-
-### 4. 플러그인 설정
-
-1. Obsidian에서 플러그인 설정 열기
-2. Google Cloud Console에서 생성한 **Client ID**와 **API Key** 입력
-3. 동기화할 폴더 경로 설정
-4. **Test Connection** 버튼으로 연결 테스트
-
-### 문제 해결 (Google Identity Services)
-
-**Obsidian 개발자 콘솔 보는 방법:**
-- **Windows/Linux**: `Ctrl + Shift + I` 또는 `F12`
-- **macOS**: `Cmd + Option + I`
-- 또는 `View` → `Toggle Developer Tools` 메뉴 사용
-- 콘솔 탭에서 오류 메시지와 로그 확인 가능
-
-**Google APIs not loaded 오류가 발생하는 경우:**
-1. 개발자 콘솔을 열어 구체적인 오류 메시지 확인
-2. 플러그인 설정에서 "Initialize Google API" 버튼 클릭
-3. 인터넷 연결 상태 확인
-4. Client ID와 API Key가 올바르게 입력되었는지 확인
-5. 방화벽이나 광고 차단기가 `accounts.google.com`을 차단하지 않는지 확인
-
+This project is licensed under the MIT License. See the `LICENSE` file for details.
