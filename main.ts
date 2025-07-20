@@ -8,7 +8,7 @@
  * 
  */
 
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent  } from 'obsidian';
 
 interface GDriveSyncSettings {
     clientId: string;
@@ -916,6 +916,8 @@ export default class GDriveSyncPlugin extends Plugin {
 
     public clearFileStateCache(): void {
         this.settings.fileStateCache = {};
+        this.settings.selectedDriveFolders = [];
+        this.folderCache = {};        
         this.saveSettings();
         console.log('🧹 File state cache cleared');
         new Notice('✅ File state cache cleared');
@@ -967,6 +969,9 @@ export default class GDriveSyncPlugin extends Plugin {
                 const expiresIn = tokenData.expires_in || 3600; // 기본 1시간
                 this.settings.tokenExpiresAt = Date.now() + (expiresIn * 1000);
                 
+                console.log('🧹 Clearing selectedDriveFolders due to new authentication');
+                this.settings.selectedDriveFolders = [];
+
                 await this.saveSettings();
                 
                 console.log(`✓ Access token refreshed, expires at: ${new Date(this.settings.tokenExpiresAt).toLocaleString()}`);
@@ -3855,7 +3860,7 @@ export default class GDriveSyncPlugin extends Plugin {
             return this.createEmptyResult();
         }
     }
-
+       
     async testDriveAPIConnection(): Promise<boolean> {
         try {
             if (!this.isAuthenticated()) {
@@ -4049,16 +4054,16 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     await this.plugin.revokeGoogleDriveAccess();
                 }));
 
-        // Authorization code input (only shown when not authenticated)
+        // 🔥 Authorization code input (only shown when not authenticated)
         if (!this.plugin.isAuthenticated()) {
-            const authCodeSetting = new Setting(containerEl)
+            new Setting(containerEl)
                 .setName('Authorization Code')
-                .setDesc('Paste the authorization code from Google here')
+                .setDesc('After clicking "Authenticate", paste the authorization code from Google here')
                 .addText(text => {
                     text.setPlaceholder('Paste authorization code...');
                     
-                    // Store reference for the button
-                    const textComponent = text;
+                    // Store reference for the exchange button
+                    this.authCodeInput = text;
                     
                     return text;
                 })
@@ -4066,19 +4071,27 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                     .setButtonText('Exchange for Token')
                     .setCta()
                     .onClick(async () => {
-                        const textInput = authCodeSetting.controlEl.querySelector('input') as HTMLInputElement;
-                        const authCode = textInput?.value?.trim();
+                        const authCode = this.authCodeInput?.inputEl.value?.trim();
                         
                         if (!authCode) {
                             new Notice('❌ Please enter authorization code first');
-                            textInput?.focus();
+                            this.authCodeInput?.inputEl.focus();
                             return;
                         }
                         
-                        const success = await this.plugin.exchangeCodeForToken(authCode);
-                        if (success) {
-                            textInput.value = '';
-                            this.display();
+                        // Disable button during processing
+                        button.setButtonText('Exchanging...');
+                        button.setDisabled(true);
+                        
+                        try {
+                            const success = await this.plugin.exchangeCodeForToken(authCode);
+                            if (success) {
+                                this.authCodeInput?.setValue('');
+                                this.display(); // Refresh the entire settings display
+                            }
+                        } finally {
+                            button.setButtonText('Exchange for Token');
+                            button.setDisabled(false);
                         }
                     }));
         }
@@ -4278,7 +4291,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .setButtonText('Debug Auto Sync')
                 .onClick(() => {
                     this.plugin.debugAutoSyncStatus();
-                }));
+                }));                 
 
         // Export/Import settings
         new Setting(containerEl)
@@ -4425,4 +4438,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             this.plugin.settingTab = null;
         }
     }
+
+    private authCodeInput?: TextComponent;
 }
