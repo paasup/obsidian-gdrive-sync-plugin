@@ -2281,32 +2281,162 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    private async uploadBinaryFileToDriveStandard(fileName: string, content: ArrayBuffer, folderId: string, metadata: any) {
-        const boundary = '-------314159265358979323846';
-        const delimiter = "\r\n--" + boundary + "\r\n";
-        const close_delim = "\r\n--" + boundary + "--";
+    private async uploadBinaryFileToDriveStandard(fileName: string, content: ArrayBuffer, folderId: string, metadata: any): Promise<any> {
+        try {
+            const boundary = '-------314159265358979323846';
+            const delimiter = "\r\n--" + boundary + "\r\n";
+            const close_delim = "\r\n--" + boundary + "--";
     
-        const uint8Content = new Uint8Array(content);
-        const base64Content = btoa(String.fromCharCode(...uint8Content));
-        
-        const body = delimiter +
-            'Content-Type: application/json\r\n\r\n' +
-            JSON.stringify(metadata) + delimiter +
-            'Content-Type: application/octet-stream\r\n' +
-            'Content-Transfer-Encoding: base64\r\n\r\n' +
-            base64Content + close_delim;
-    
-        return await this.makeAuthenticatedRequest(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': `multipart/related; boundary="${boundary}"`
-                },
-                body: body
+            const uint8Content = new Uint8Array(content);
+            
+            // FIX: Use chunked approach instead of spread operator to avoid stack overflow
+            let base64Content: string;
+            const CHUNK_SIZE = 8192; // 8KB chunks (safe size)
+            
+            if (uint8Content.length > CHUNK_SIZE) {
+                console.log(`Large binary file (${this.formatFileSize(content.byteLength)}) - using safe chunked conversion`);
+                base64Content = await this.convertToBase64Safe(uint8Content);
+            } else {
+                // Use existing method for small files
+                base64Content = btoa(String.fromCharCode(...uint8Content));
             }
-        );
+            
+            const metadataJson = JSON.stringify(metadata);
+            
+            const body = delimiter +
+                'Content-Type: application/json\r\n\r\n' +
+                metadataJson + delimiter +
+                'Content-Type: application/octet-stream\r\n' +
+                'Content-Transfer-Encoding: base64\r\n\r\n' +
+                base64Content + close_delim;
+    
+            console.log(`Uploading ${fileName} (${this.formatFileSize(content.byteLength)} → ${this.formatFileSize(body.length)})`);
+    
+            return await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,md5Checksum,version,size',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': `multipart/related; boundary="${boundary}"`
+                    },
+                    body: body
+                }
+            );
+        } catch (error) {
+            console.error(`Binary file upload error for ${fileName}:`, error);
+            throw error;
+        }
     }
+
+    // Safe Base64 conversion without spread operator
+    private async convertToBase64Safe(uint8Array: Uint8Array): Promise<string> {
+        const CHUNK_SIZE = 8192; // 8KB chunks
+        let result = '';
+        
+        try {
+            for (let i = 0; i < uint8Array.length; i += CHUNK_SIZE) {
+                const chunk = uint8Array.slice(i, i + CHUNK_SIZE);
+                
+                // Convert chunk to string without spread operator
+                let chunkStr = '';
+                for (let j = 0; j < chunk.length; j++) {
+                    chunkStr += String.fromCharCode(chunk[j]);
+                }
+                
+                // Base64 conversion
+                const chunkBase64 = btoa(chunkStr);
+                result += chunkBase64;
+            }
+            
+            console.log(`Safe Base64 conversion completed: ${uint8Array.length} bytes → ${result.length} chars`);
+            return result;
+            
+        } catch (error) {
+            console.error('Safe Base64 conversion failed:', error);
+            
+            // Fallback: Use FileReader API (browser environment)
+            return await this.convertToBase64Fallback(uint8Array);
+        }
+    }
+
+    // Fallback: FileReader-based Base64 conversion
+    private async convertToBase64Fallback(uint8Array: Uint8Array): Promise<string> {
+        try {
+            console.log('Using FileReader fallback for Base64 conversion');
+            
+            // Convert to Blob and use FileReader
+            const blob = new Blob([uint8Array]);
+            const reader = new FileReader();
+            
+            return new Promise<string>((resolve, reject) => {
+                reader.onload = () => {
+                    const result = reader.result as string;
+                    // Remove data:application/octet-stream;base64, prefix
+                    const base64 = result.split(',')[1];
+                    console.log(`FileReader Base64 conversion completed`);
+                    resolve(base64);
+                };
+                
+                reader.onerror = () => {
+                    reject(new Error('FileReader Base64 conversion failed'));
+                };
+                
+                reader.readAsDataURL(blob);
+            });
+            
+        } catch (error) {
+            console.error('FileReader fallback failed:', error);
+            throw new Error('All Base64 conversion methods failed');
+        }
+    } 
+
+    // Better alternative: Simple Upload for large files
+    private async uploadLargeFileSimple(fileName: string, content: ArrayBuffer, folderId: string, metadata: any): Promise<any> {
+        try {
+            console.log(`Using simple upload for large file: ${fileName}`);
+            
+            // Step 1: Create file metadata only
+            const metadataResponse = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/drive/v3/files',
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(metadata)
+                }
+            );
+
+            if (metadataResponse.status !== 200 && metadataResponse.status !== 201) {
+                throw new Error(`File creation failed: ${metadataResponse.status}`);
+            }
+
+            const fileId = metadataResponse.json.id;
+            console.log(`File metadata created: ${fileId}`);
+
+            // Step 2: Upload file content (without Base64 conversion)
+            const contentResponse = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime,md5Checksum,version,size`,
+                {
+                    method: 'PATCH',
+                    headers: { 
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: content // Direct ArrayBuffer transmission (no Base64 conversion needed)
+                }
+            );
+
+            if (contentResponse.status === 200 || contentResponse.status === 201) {
+                console.log(`File content uploaded successfully: ${fileName}`);
+                return contentResponse;
+            } else {
+                throw new Error(`Content upload failed: ${contentResponse.status}`);
+            }
+
+        } catch (error) {
+            console.error(`Simple upload failed for ${fileName}:`, error);
+            throw error;
+        }
+    }   
+
     
     private async uploadTextFileToDriveStandard(fileName: string, content: string, folderId: string, metadata: any) {
         const boundary = '-------314159265358979323846';
@@ -2332,6 +2462,8 @@ export default class GDriveSyncPlugin extends Plugin {
     }
     
 
+
+    // Updated main file upload method
     private async uploadFileToDrive(fileName: string, content: string | ArrayBuffer, folderId: string, localModTime?: number): Promise<{success: boolean, fileData?: any}> {
         try {
             const metadata = {
@@ -2344,8 +2476,20 @@ export default class GDriveSyncPlugin extends Plugin {
 
             if (this.isBinaryFile(fileName)) {
                 const binaryContent = content instanceof ArrayBuffer ? content : new TextEncoder().encode(content as string).buffer;
-                uploadResponse = await this.uploadBinaryFileToDriveStandard(fileName, binaryContent, folderId, metadata);
+                const fileSize = binaryContent.byteLength;
+                
+                console.log(`Uploading binary file: ${fileName} (${this.formatFileSize(fileSize)})`);
+                
+                // Upload strategy based on file size
+                if (fileSize > 100 * 1024) { // Files larger than 100KB
+                    console.log(`Large binary file detected - using simple upload`);
+                    uploadResponse = await this.uploadLargeFileSimple(fileName, binaryContent, folderId, metadata);
+                } else {
+                    console.log(`Small binary file - using multipart upload`);
+                    uploadResponse = await this.uploadBinaryFileToDriveStandard(fileName, binaryContent, folderId, metadata);
+                }
             } else {
+                // Text files
                 uploadResponse = await this.uploadTextFileToDriveStandard(fileName, content as string, folderId, metadata);
             }
 
@@ -2353,75 +2497,27 @@ export default class GDriveSyncPlugin extends Plugin {
             
             if (success) {
                 const fileData = uploadResponse.json;
-                console.log(`✅ ${fileName}: Uploaded with hash ${fileData.md5Checksum || 'none'}`);
+                console.log(`${fileName}: Upload successful`);
                 return { success: true, fileData: fileData };
             } else {
-                console.error(`❌ ${fileName}: Upload failed - Status: ${uploadResponse.status}`);
+                console.error(`${fileName}: Upload failed - Status: ${uploadResponse.status}`);
                 return { success: false };
             }
         } catch (error) {
-            console.error(`❌ ${fileName}: Upload failed - ${error.message}`);
+            console.error(`${fileName}: Upload error - ${error.message}`);
             return { success: false };
         }
     }
-    
-
-    private async uploadSmallBinaryFileToDrive(fileName: string, content: ArrayBuffer, folderId: string, metadata: any) {
-        const boundary = '-------314159265358979323846';
-        const delimiter = "\r\n--" + boundary + "\r\n";
-        const close_delim = "\r\n--" + boundary + "--";
-    
-        const uint8Content = new Uint8Array(content);
-        const base64Content = btoa(String.fromCharCode(...uint8Content));
+    // File size formatting utility
+    private formatFileSize(bytes: number): string {
+        if (bytes === 0) return '0 Bytes';
         
-        const body = delimiter +
-            'Content-Type: application/json\r\n\r\n' +
-            JSON.stringify(metadata) + delimiter +
-            'Content-Type: application/octet-stream\r\n' +
-            'Content-Transfer-Encoding: base64\r\n\r\n' +
-            base64Content + close_delim;
-    
-        return await this.makeAuthenticatedRequest(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': `multipart/related; boundary="${boundary}"`
-                },
-                body: body
-            }
-        );
-    }
-
-    private async uploadTextFileToDrive(fileName: string, content: string, folderId: string, metadata: any) {
-        const boundary = '-------314159265358979323846';
-        const delimiter = "\r\n--" + boundary + "\r\n";
-        const close_delim = "\r\n--" + boundary + "--";
-    
-        const body = delimiter +
-            'Content-Type: application/json\r\n\r\n' +
-            JSON.stringify(metadata) + delimiter +
-            'Content-Type: text/plain\r\n\r\n' +
-            content + close_delim;
-    
-        return await this.makeAuthenticatedRequest(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': `multipart/related; boundary="${boundary}"`
-                },
-                body: body
-            }
-        );
-    }
-
-    // 10. 대용량 파일 업로드 (resumable upload)
-    private async uploadLargeFileToDrive(fileName: string, content: ArrayBuffer, folderId: string, metadata: any) {
-        // 간단한 대용량 파일 처리 - 실제로는 Google Resumable Upload API 사용 권장
-        console.log(`⚠️ Large file detected: ${fileName}. Using standard upload (consider implementing resumable upload for files > 5MB)`);
-        return await this.uploadSmallBinaryFileToDrive(fileName, content, folderId, metadata);
-    }
+        const k = 1024;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }  
 
     // 업로드 전용 메서드
     async uploadToGoogleDrive(showProgress: boolean = false): Promise<SyncResult> {
