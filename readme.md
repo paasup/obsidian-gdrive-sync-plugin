@@ -30,18 +30,41 @@ This plugin is not yet available in the Obsidian community plugins. You'll need 
 
 To use this plugin, you need to create a Google Cloud Project and obtain OAuth 2.0 credentials.
 
+#### **1. Google Cloud Console Setup**
 1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2.  **Create a new project** (if you don't have one).
-3.  Navigate to **APIs & Services > OAuth consent screen**.
-    * Set **User Type** to "External" and configure your app. You may need to verify your app if you intend to share it, but for personal use, you can proceed without it.
-    * Add `https://www.googleapis.com/auth/drive` as a **scope**.
-4.  Navigate to **APIs & Services > Credentials**.
-    * Click "CREATE CREDENTIALS" and choose "OAuth client ID".
-    * Select **Application type** as `Desktop app`.
-    * Give it a name (e.g., "Obsidian Google Drive Sync").
-    * Copy your **Client ID** and **Client Secret**.
-    * Click "CREATE CREDENTIALS" again and choose "API Key". Copy your **API Key**.
-5.  Ensure the **Google Drive API** is enabled for your project under **APIs & Services > Library**. Search for "Google Drive API" and enable it.
+2.  **Create a new project** (or select an existing project).
+3.  Navigate to **APIs & Services > Library**.
+4.  Search for "Google Drive API" and **enable it**.
+
+#### **2. Create Credentials**
+
+**Create API Key**
+1.  Navigate to **APIs & Services > Credentials**.
+2.  Click **+ CREATE CREDENTIALS**.
+3.  Select **API key**.
+4.  Copy the generated API key and save it for later use.
+
+**Create OAuth 2.0 Client ID**
+1.  On the same page, click **+ CREATE CREDENTIALS** again.
+2.  Select **OAuth 2.0 client ID**.
+3.  **⚠️ IMPORTANT**: For **Application type**, select **Web application** (NOT Desktop application!)
+    * If you select "Desktop application", the "Authorized JavaScript origins" option will not appear.
+4.  Enter a **Name** (e.g., "Obsidian GDrive Sync").
+
+#### **3. Configure Authorized JavaScript Origins**
+
+In your **Web application** OAuth 2.0 client ID settings, you must add the following URLs to **Authorized JavaScript origins**:
+
+```
+http://localhost
+https://localhost
+http://127.0.0.1
+https://127.0.0.1
+app://obsidian.md
+capacitor://localhost
+```
+
+⚠️ **Skipping this step will result in "authentication failed" errors!**
 
 ### 3. Plugin Configuration
 
