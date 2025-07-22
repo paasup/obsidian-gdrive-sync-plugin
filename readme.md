@@ -1,3 +1,9 @@
+# ⚠️ Safety Notice
+
+**Before syncing**: Please backup your vault and avoid using "Use Newer File" in conflict resolution settings. There's a known issue where 0-byte files can overwrite local content. For safety, use "Always Use Local File" or "Always Use Remote File" instead.
+
+---
+
 # ☁️ Obsidian Google Drive Sync Plugin
 
 Seamlessly synchronize your Obsidian vault or specific folders with Google Drive, ensuring your notes are always backed up and accessible.
