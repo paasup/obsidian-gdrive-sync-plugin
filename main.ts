@@ -8,7 +8,7 @@
  * 
  */
 
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent  } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent } from 'obsidian';
 
 interface GDriveSyncSettings {
     clientId: string;
@@ -79,6 +79,8 @@ interface DriveFolder {
     path: string;
     mimeType: string;
     parents?: string[];
+    isShortcut?: boolean;        // 바로가기 여부
+    shortcutTarget?: string;     // 바로가기가 가리키는 실제 ID    
 }
 interface FolderListItem extends DriveFolder {
     isSelected: boolean;     // 현재 동기화 대상 여부
@@ -582,11 +584,11 @@ class DriveFolderModal extends Modal {
         const folders: DriveFolder[] = [];
         
         try {
-            const query = `'${folderId}' in parents and (mimeType='application/vnd.google-apps.folder') and trashed=false`;
+            const query = `'${folderId}' in parents and (mimeType='application/vnd.google-apps.folder' or mimeType='application/vnd.google-apps.shortcut') and trashed=false`;
             
             const params = new URLSearchParams({
                 q: query,
-                fields: 'files(id,name,mimeType,parents)',
+                fields: 'files(id,name,mimeType,parents,shortcutDetails)',
                 pageSize: '1000',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
@@ -604,15 +606,35 @@ class DriveFolderModal extends Modal {
                     
                     let driveFolder: DriveFolder;
                     
-                  
-                    driveFolder = {
-                        id: item.id,
-                        name: item.name,
-                        path: itemPath,
-                        mimeType: item.mimeType,
-                        parents: item.parents
-                    };
-               
+                    if (item.mimeType === 'application/vnd.google-apps.shortcut') {
+                        console.log(`바로가기 발견: ${item.name}`);
+                        
+                        const resolvedItem = await this.resolveShortcutForFolder(item);
+                        
+                        if (resolvedItem && resolvedItem.mimeType === 'application/vnd.google-apps.folder') {
+                            driveFolder = {
+                                id: resolvedItem.id,
+                                name: item.name,
+                                path: itemPath,
+                                mimeType: 'application/vnd.google-apps.folder',
+                                parents: item.parents,
+                                isShortcut: true,
+                                shortcutTarget: resolvedItem.id
+                            };
+                        } else {
+                            console.log(`바로가기 "${item.name}"가 폴더가 아닌 항목을 가리킴`);
+                            continue;
+                        }
+                    } else {
+                        driveFolder = {
+                            id: item.id,
+                            name: item.name,
+                            path: itemPath,
+                            mimeType: item.mimeType,
+                            parents: item.parents,
+                            isShortcut: false
+                        };
+                    }
                     
                     folders.push(driveFolder);
                 }
@@ -624,6 +646,31 @@ class DriveFolderModal extends Modal {
         return folders;
     }
 
+    private async resolveShortcutForFolder(shortcutItem: any): Promise<any | null> {
+        try {
+            if (shortcutItem.shortcutDetails && shortcutItem.shortcutDetails.targetId) {
+                const targetId = shortcutItem.shortcutDetails.targetId;
+                
+                const params = new URLSearchParams({
+                    fields: 'id,name,mimeType',
+                    supportsAllDrives: 'true'
+                });
+                
+                const response = await this.plugin.makeAuthenticatedRequest(
+                    `https://www.googleapis.com/drive/v3/files/${targetId}?${params.toString()}`,
+                    { method: 'GET' }
+                );
+                
+                if (response.status === 200) {
+                    return response.json;
+                }
+            }
+            return null;
+        } catch (error) {
+            console.error('Error resolving shortcut:', error);
+            return null;
+        }
+    }
 
     private async deleteDriveFolder(folderId: string, folderName: string): Promise<boolean> {
         try {
@@ -917,7 +964,7 @@ export default class GDriveSyncPlugin extends Plugin {
     public clearFileStateCache(): void {
         this.settings.fileStateCache = {};
         this.settings.selectedDriveFolders = [];
-        this.folderCache = {};        
+        this.folderCache = {};
         this.saveSettings();
         console.log('🧹 File state cache cleared');
         new Notice('✅ File state cache cleared');
@@ -969,9 +1016,6 @@ export default class GDriveSyncPlugin extends Plugin {
                 const expiresIn = tokenData.expires_in || 3600; // 기본 1시간
                 this.settings.tokenExpiresAt = Date.now() + (expiresIn * 1000);
                 
-                console.log('🧹 Clearing selectedDriveFolders due to new authentication');
-                this.settings.selectedDriveFolders = [];
-
                 await this.saveSettings();
                 
                 console.log(`✓ Access token refreshed, expires at: ${new Date(this.settings.tokenExpiresAt).toLocaleString()}`);
@@ -1901,6 +1945,9 @@ export default class GDriveSyncPlugin extends Plugin {
                 const expiresIn = tokenData.expires_in || 3600; // 기본 1시간
                 this.settings.tokenExpiresAt = Date.now() + (expiresIn * 1000);
                 
+                console.log('🧹 Clearing selectedDriveFolders due to new authentication');
+                this.settings.selectedDriveFolders = [];
+
                 await this.saveSettings();
                 
                 console.log(`✓ Tokens saved successfully`);
@@ -2437,7 +2484,7 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }   
 
-    
+
     private async uploadTextFileToDriveStandard(fileName: string, content: string, folderId: string, metadata: any) {
         const boundary = '-------314159265358979323846';
         const delimiter = "\r\n--" + boundary + "\r\n";
@@ -2461,7 +2508,6 @@ export default class GDriveSyncPlugin extends Plugin {
         );
     }
     
-
 
     // Updated main file upload method
     private async uploadFileToDrive(fileName: string, content: string | ArrayBuffer, folderId: string, localModTime?: number): Promise<{success: boolean, fileData?: any}> {
@@ -2517,7 +2563,7 @@ export default class GDriveSyncPlugin extends Plugin {
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-    }  
+    }
 
     // 업로드 전용 메서드
     async uploadToGoogleDrive(showProgress: boolean = false): Promise<SyncResult> {
@@ -3283,7 +3329,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 const query = `'${folderId}' in parents and trashed=false`;
                 const params = new URLSearchParams({
                     q: query,
-                    fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,size,parents,md5Checksum,version)', // 🔥 md5Checksum 추가
+                    fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,size,parents,md5Checksum,version,shortcutDetails)', // 🔥 md5Checksum 추가
                     pageSize: '1000',
                     supportsAllDrives: 'true',
                     includeItemsFromAllDrives: 'true'
@@ -3305,11 +3351,14 @@ export default class GDriveSyncPlugin extends Plugin {
                 
                 const regularFiles: any[] = [];
                 const folders: any[] = [];
-             
+                const shortcuts: any[] = [];
+                
                 // 🔥 파일 타입별로 분류
                 for (const file of data.files || []) {
                     if (file.mimeType === 'application/vnd.google-apps.folder') {
                         folders.push(file);
+                    } else if (file.mimeType === 'application/vnd.google-apps.shortcut') {
+                        shortcuts.push(file);
                     } else {
                         regularFiles.push(file);
                     }
@@ -3320,12 +3369,17 @@ export default class GDriveSyncPlugin extends Plugin {
                     const filePath = basePath ? `${basePath}/${file.name}` : file.name;
                     allFiles.push({
                         ...file,
-                        path: filePath
+                        path: filePath,
+                        isShortcut: false
                     });
                     console.log(`📄 Found file: ${file.name}, hash: ${file.md5Checksum || 'none'}, modified: ${file.modifiedTime}`);
                 }
                 
-            
+                // 🔥 바로가기 처리 (기존 기능 유지)
+                if (shortcuts.length > 0) {
+                    const resolvedShortcuts = await this.resolveShortcutsBatch(shortcuts, basePath);
+                    allFiles.push(...resolvedShortcuts);
+                }
                 
                 // 🔥 폴더 재귀 처리
                 if (this.settings.includeSubfolders) {
@@ -3351,6 +3405,124 @@ export default class GDriveSyncPlugin extends Plugin {
         return allFiles;
     }
 
+    private async resolveShortcutsBatch(shortcuts: any[], basePath: string): Promise<any[]> {
+        const resolvedFiles: any[] = [];
+        const BATCH_SIZE = 5; // 동시 처리할 바로가기 수
+        
+        // 바로가기를 배치로 나누어 처리
+        for (let i = 0; i < shortcuts.length; i += BATCH_SIZE) {
+            const batch = shortcuts.slice(i, i + BATCH_SIZE);
+            
+            const batchPromises = batch.map(async (shortcut) => {
+                try {
+                    const filePath = basePath ? `${basePath}/${shortcut.name}` : shortcut.name;
+                    console.log(`🔍 Resolving shortcut: ${shortcut.name}`);
+                    
+                    const resolvedTarget = await this.resolveShortcutTarget(shortcut);
+                    if (resolvedTarget) {
+                        if (resolvedTarget.mimeType === 'application/vnd.google-apps.folder') {
+                            // 바로가기가 폴더를 가리키는 경우
+                            if (this.settings.includeSubfolders) {
+                                console.log(`📁 Exploring shortcut folder: ${shortcut.name} -> ${resolvedTarget.name}`);
+                                const shortcutFiles = await this.getAllFilesFromDrive(resolvedTarget.id, filePath);
+                                return shortcutFiles;
+                            }
+                            return [];
+                        } else {
+                            // 바로가기가 파일을 가리키는 경우 - md5Checksum 포함
+                            console.log(`📄 Resolved shortcut file: ${shortcut.name} -> ${resolvedTarget.name}, hash: ${resolvedTarget.md5Checksum || 'none'}`);
+                            return [{
+                                id: resolvedTarget.id,
+                                name: shortcut.name,
+                                mimeType: resolvedTarget.mimeType,
+                                modifiedTime: resolvedTarget.modifiedTime,
+                                size: resolvedTarget.size,
+                                md5Checksum: resolvedTarget.md5Checksum, // 🔥 해시 포함
+                                version: resolvedTarget.version, // 🔥 버전 포함
+                                path: filePath,
+                                isShortcut: true,
+                                originalName: resolvedTarget.name
+                            }];
+                        }
+                    } else {
+                        console.warn(`⚠️ Could not resolve shortcut: ${shortcut.name}`);
+                        return [];
+                    }
+                } catch (error) {
+                    console.error(`❌ Error resolving shortcut ${shortcut.name}:`, error);
+                    // 개별 바로가기 해결 실패는 전체 동기화를 중단시키지 않음
+                    return [];
+                }
+            });
+            
+            try {
+                const batchResults = await Promise.allSettled(batchPromises);
+                
+                batchResults.forEach((result, index) => {
+                    if (result.status === 'fulfilled') {
+                        const files = result.value;
+                        if (Array.isArray(files)) {
+                            resolvedFiles.push(...files);
+                        }
+                    } else {
+                        console.error(`❌ Batch shortcut resolution failed for ${batch[index].name}:`, result.reason);
+                    }
+                });
+                
+            } catch (error) {
+                console.error('❌ Batch processing error:', error);
+            }
+            
+            // 배치 간 잠시 대기 (API 부하 방지)
+            if (i + BATCH_SIZE < shortcuts.length) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+        
+        return resolvedFiles;
+    }
+    
+    // 바로가기 대상 해결
+    private async resolveShortcutTarget(shortcutItem: any): Promise<any | null> {
+        try {
+            if (!shortcutItem.shortcutDetails || !shortcutItem.shortcutDetails.targetId) {
+                console.warn(`⚠️ Shortcut "${shortcutItem.name}" has no target details`);
+                return null;
+            }
+
+            const targetId = shortcutItem.shortcutDetails.targetId;
+            console.log(`🔍 Resolving shortcut "${shortcutItem.name}" -> target ID: ${targetId}`);
+            
+            const params = new URLSearchParams({
+                fields: 'id,name,mimeType,modifiedTime,size,md5Checksum,version', // 🔥 해시와 버전 포함
+                supportsAllDrives: 'true'
+            });
+            
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${targetId}?${params.toString()}`,
+                { 
+                    method: 'GET',
+                    timeout: 10000 // 타임아웃 추가로 무한 대기 방지
+                }
+            );
+            
+            if (response.status === 200) {
+                const targetFile = response.json;
+                console.log(`✅ Resolved shortcut "${shortcutItem.name}" -> "${targetFile.name}" (${targetFile.mimeType}), hash: ${targetFile.md5Checksum || 'none'}`);
+                return targetFile;
+            } else if (response.status === 404) {
+                console.warn(`⚠️ Shortcut target not found: ${shortcutItem.name} -> ${targetId}`);
+                return null;
+            } else {
+                console.error(`❌ Failed to resolve shortcut target (${response.status}):`, response.json);
+                return null;
+            }
+            
+        } catch (error) {
+            console.error(`❌ Error resolving shortcut "${shortcutItem.name}":`, error);
+            return null;
+        }
+    }
 
     // 파일 다운로드 필요 여부 판단
     private async shouldDownloadFile(localFile: TFile, driveFile: any): Promise<boolean> {
@@ -3724,7 +3896,7 @@ export default class GDriveSyncPlugin extends Plugin {
     private async findFolderInDrive(itemName: string, parentFolderId?: string): Promise<{id: string, name: string} | null> {
         try {
             // 폴더, 바로가기, 공유 드라이브 모두 검색
-            let query = `name='${itemName}' and trashed=false and (mimeType='application/vnd.google-apps.folder' or mimeType='application/vnd.google-apps.drive-sdk')`;
+            let query = `name='${itemName}' and trashed=false and (mimeType='application/vnd.google-apps.folder' or mimeType='application/vnd.google-apps.shortcut' or mimeType='application/vnd.google-apps.drive-sdk')`;
             
             if (parentFolderId) {
                 query += ` and '${parentFolderId}' in parents`;
@@ -3732,7 +3904,7 @@ export default class GDriveSyncPlugin extends Plugin {
             
             const params = new URLSearchParams({
                 q: query,
-                fields: 'files(id,name,mimeType)',
+                fields: 'files(id,name,mimeType,shortcutDetails)',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
             });
@@ -3753,6 +3925,17 @@ export default class GDriveSyncPlugin extends Plugin {
                         type: found.mimeType
                     };
                     
+                    // 바로가기인 경우 실제 대상 정보도 가져오기
+                    if (found.mimeType === 'application/vnd.google-apps.shortcut') {
+                        const resolvedTarget = await this.resolveShortcut(found);
+                        if (resolvedTarget) {
+                            resultItem = {
+                                id: resolvedTarget.id,
+                                name: resolvedTarget.name,
+                                type: 'resolved_shortcut'
+                            };
+                        }
+                    }
                     
                     console.log(`항목 발견: ${resultItem.name} (타입: ${resultItem.type})`);
                     return resultItem;
@@ -3764,7 +3947,43 @@ export default class GDriveSyncPlugin extends Plugin {
             throw error;
         }
     }
-
+    private async resolveShortcut(shortcutFile: any): Promise<{id: string, name: string} | null> {
+        try {
+            if (shortcutFile.shortcutDetails && shortcutFile.shortcutDetails.targetId) {
+                const targetId = shortcutFile.shortcutDetails.targetId;
+                console.log(`바로가기 대상 ID: ${targetId}`);
+                
+                // 실제 대상 파일/폴더 정보 가져오기
+                const targetResponse = await this.makeAuthenticatedRequest(
+                    `https://www.googleapis.com/drive/v3/files/${targetId}?fields=id,name,mimeType&supportsAllDrives=true`,
+                    { method: 'GET' }
+                );
+                
+                if (targetResponse.status === 200) {
+                    const targetFile = targetResponse.json;
+                    console.log(`바로가기 대상: ${targetFile.name} (${targetFile.mimeType})`);
+                    return {
+                        id: targetFile.id,
+                        name: targetFile.name
+                    };
+                }
+            }
+            
+            // 바로가기 자체를 반환 (대상을 찾을 수 없는 경우)
+            console.log('바로가기 대상을 찾을 수 없음, 바로가기 자체 반환');
+            return {
+                id: shortcutFile.id,
+                name: shortcutFile.name
+            };
+        } catch (error) {
+            console.error('Error resolving shortcut:', error);
+            // 에러 시 바로가기 자체 반환
+            return {
+                id: shortcutFile.id,
+                name: shortcutFile.name
+            };
+        }
+    }
     private async createFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
             const response = await this.makeAuthenticatedRequest(
@@ -3956,7 +4175,7 @@ export default class GDriveSyncPlugin extends Plugin {
             return this.createEmptyResult();
         }
     }
-       
+
     async testDriveAPIConnection(): Promise<boolean> {
         try {
             if (!this.isAuthenticated()) {
@@ -4387,7 +4606,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .setButtonText('Debug Auto Sync')
                 .onClick(() => {
                     this.plugin.debugAutoSyncStatus();
-                }));                 
+                }));    
 
         // Export/Import settings
         new Setting(containerEl)
@@ -4536,4 +4755,5 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     }
 
     private authCodeInput?: TextComponent;
+
 }
