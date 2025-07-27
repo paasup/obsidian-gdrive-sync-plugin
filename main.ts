@@ -9,6 +9,7 @@
  */
 
 import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent } from 'obsidian';
+import * as crypto from 'crypto';
 
 interface GDriveSyncSettings {
     clientId: string;
@@ -33,11 +34,22 @@ interface GDriveSyncSettings {
 }
 // 🔥 간소화된 파일 상태 인터페이스
 interface FileState {
-    localModTime?: number;       // 로컬 파일 수정 시간 (밀리초)
-    remoteHash?: string;         // 원격 파일 md5Checksum
-    remoteModTime?: number;      // 원격 파일 수정 시간
-    lastSyncTime?: number;       // 마지막 동기화 시간
-    version?: string;            // Google Drive version 필드
+    localHash?: string;          // Local file MD5 hash
+    localModTime?: number;       // Local file modification time (mtime)
+    remoteHash?: string;         // Remote file md5Checksum
+    remoteModTime?: number;      // Remote file modification time
+    lastSyncTime?: number;       // Last synchronization time
+    version?: string;            // Google Drive version field
+}
+
+// Sync decision result interface
+interface SyncDecision {
+    shouldSync: boolean;
+    action: 'upload' | 'download' | 'skip' | 'conflict';
+    reason: string;
+    localHash?: string;
+    remoteHash?: string;
+    details?: any;
 }
 
 const DEFAULT_SETTINGS: GDriveSyncSettings = {
@@ -315,11 +327,10 @@ class DriveFolderModal extends Modal {
         });
         refreshBtn.onclick = () => this.refreshFolders();
     
-        // 오른쪽 버튼
-        const cancelBtn = buttonContainer.createEl('button', { 
-            text: 'Cancel'
+        const closeBtn = buttonContainer.createEl('button', { 
+            text: 'Close'
         });
-        cancelBtn.onclick = () => this.close();
+        closeBtn.onclick = () => this.close();
     }
 
     private renderFolderList(container: HTMLElement) {
@@ -961,13 +972,266 @@ export default class GDriveSyncPlugin extends Plugin {
         Object.assign(this.settings.fileStateCache[filePath], state);
     }
 
+    // Calculate hash with performance optimization for large files
+    private async calculateLocalFileHashOptimized(file: TFile): Promise<string> {
+        try {
+            const fileSize = file.stat.size;
+            let content: string | ArrayBuffer;
+            
+            // Performance optimization: different strategies based on file size
+            if (fileSize < 100 * 1024) { // Files smaller than 100KB
+                if (this.isTextFile(file.name)) {
+                    content = await this.app.vault.read(file);
+                    return crypto.createHash('md5').update(content, 'utf8').digest('hex');
+                } else {
+                    content = await this.app.vault.readBinary(file);
+                    return crypto.createHash('md5').update(new Uint8Array(content)).digest('hex');
+                }
+            } else {
+                // Large files: use chunked processing
+                const hash = crypto.createHash('md5');
+                
+                if (this.isTextFile(file.name)) {
+                    content = await this.app.vault.read(file);
+                    hash.update(content, 'utf8');
+                } else {
+                    content = await this.app.vault.readBinary(file);
+                    const uint8Array = new Uint8Array(content);
+                    const CHUNK_SIZE = 8192; // 8KB chunks
+                    
+                    for (let i = 0; i < uint8Array.length; i += CHUNK_SIZE) {
+                        const chunk = uint8Array.slice(i, i + CHUNK_SIZE);
+                        hash.update(chunk);
+                    }
+                }
+                
+                const result = hash.digest('hex');
+                console.log(`📊 Hash calculated for ${file.name} (${this.formatFileSize(fileSize)}): ${result.substring(0, 8)}...`);
+                return result;
+            }
+        } catch (error) {
+            console.error(`❌ Failed to calculate hash for ${file.path}:`, error);
+            throw error;
+        }
+    }
+
+    // Hash cache management for performance
+    private hashCache: Map<string, {hash: string, mtime: number, size: number}> = new Map();
+
+    // Cached hash calculation to avoid redundant computation
+    private async getCachedFileHash(file: TFile): Promise<string> {
+        const cacheKey = file.path;
+        const cached = this.hashCache.get(cacheKey);
+        
+        // Cache validation: check mtime and size
+        if (cached && 
+            cached.mtime === file.stat.mtime && 
+            cached.size === file.stat.size) {
+            console.log(`🚀 Using cached hash for ${file.name}: ${cached.hash.substring(0, 8)}...`);
+            return cached.hash;
+        }
+        
+        // Calculate new hash
+        const hash = await this.calculateLocalFileHashOptimized(file);
+        
+        // Update cache
+        this.hashCache.set(cacheKey, {
+            hash: hash,
+            mtime: file.stat.mtime,
+            size: file.stat.size
+        });
+        
+        return hash;
+    }
+
+    // Master sync decision logic - determines what action to take
+    private async decideSyncAction(localFile: TFile, driveFile?: any): Promise<SyncDecision> {
+        const fileName = localFile.name;
+        const filePath = localFile.path;
+        
+        try {
+            // Case 1: New file (no remote counterpart)
+            if (!driveFile) {
+                return {
+                    shouldSync: true,
+                    action: 'upload',
+                    reason: 'new-local-file',
+                    localHash: await this.getCachedFileHash(localFile)
+                };
+            }
+    
+            // Calculate current state
+            const currentLocalHash = await this.getCachedFileHash(localFile);
+            const currentRemoteHash = driveFile.md5Checksum;
+            const currentLocalModTime = localFile.stat.mtime;
+            const currentRemoteModTime = new Date(driveFile.modifiedTime).getTime();
+    
+            // 🔥 Case 2: Identical hash - content is same, no sync needed
+            if (currentLocalHash === currentRemoteHash) {
+                console.log(`✅ ${fileName}: Hash identical - no content changes`);
+                
+                // Update cache state (record as synchronized)
+                this.setFileState(filePath, {
+                    localHash: currentLocalHash,
+                    localModTime: currentLocalModTime,
+                    remoteHash: currentRemoteHash,
+                    remoteModTime: currentRemoteModTime,
+                    lastSyncTime: Date.now()
+                });
+                await this.saveSettings();
+    
+                return {
+                    shouldSync: false,
+                    action: 'skip',
+                    reason: 'identical-content-by-hash',
+                    localHash: currentLocalHash,
+                    remoteHash: currentRemoteHash
+                };
+            }
+    
+            // Get cached state for change detection
+            const fileState = this.getFileState(filePath);
+            const cachedLocalHash = fileState.localHash;
+            const cachedRemoteHash = fileState.remoteHash;
+            const cachedLocalModTime = fileState.localModTime;
+            const cachedRemoteModTime = fileState.remoteModTime;
+    
+            // 🔥 Hash-based change detection (primary criteria)
+            const localContentChanged = cachedLocalHash !== currentLocalHash;
+            const remoteContentChanged = cachedRemoteHash !== currentRemoteHash || 
+                                       cachedRemoteModTime !== currentRemoteModTime;
+            
+            // mtime change detection (secondary role)
+            const localMtimeChanged = cachedLocalModTime !== currentLocalModTime;
+    
+            // Debug logging
+            console.log(`🔍 Sync analysis for ${fileName}:`);
+            console.log(`  Current hash: local=${currentLocalHash.substring(0, 8)}..., remote=${currentRemoteHash?.substring(0, 8) || 'none'}...`);
+            console.log(`  Cached hash:  local=${cachedLocalHash?.substring(0, 8) || 'none'}..., remote=${cachedRemoteHash?.substring(0, 8) || 'none'}...`);
+            console.log(`  Change detect: localContent=${localContentChanged}, remoteContent=${remoteContentChanged}, localTime=${localMtimeChanged}`);
+    
+            // 🔥 Case 3: No hash changes detected
+            if (!localContentChanged && !remoteContentChanged) {
+                if (localMtimeChanged) {
+                    // Only mtime changed - consider as system change
+                    console.log(`⏰ ${fileName}: Only mtime changed - treating as system modification`);
+                    this.setFileState(filePath, { localModTime: currentLocalModTime });
+                    await this.saveSettings();
+                    
+                    return {
+                        shouldSync: false,
+                        action: 'skip',
+                        reason: 'mtime-only-change',
+                        localHash: currentLocalHash,
+                        remoteHash: currentRemoteHash
+                    };
+                }
+                
+                // No changes detected
+                return {
+                    shouldSync: false,
+                    action: 'skip',
+                    reason: 'no-changes-detected',
+                    localHash: currentLocalHash,
+                    remoteHash: currentRemoteHash
+                };
+            }
+    
+            // 🔥 Case 4: Only local content changed (hash-based)
+            if (localContentChanged && !remoteContentChanged) {
+                console.log(`📤 ${fileName}: Local content change detected - upload required`);
+                return {
+                    shouldSync: true,
+                    action: 'upload',
+                    reason: 'local-content-changed',
+                    localHash: currentLocalHash,
+                    remoteHash: currentRemoteHash
+                };
+            }
+    
+            // 🔥 Case 5: Only remote content changed (hash-based)
+            if (!localContentChanged && remoteContentChanged) {
+                console.log(`📥 ${fileName}: Remote content change detected - download required`);
+                return {
+                    shouldSync: true,
+                    action: 'download',
+                    reason: 'remote-content-changed',
+                    localHash: currentLocalHash,
+                    remoteHash: currentRemoteHash
+                };
+            }
+    
+            // 🔥 Case 6: Both sides changed - conflict (hash-based)
+            console.log(`⚡ ${fileName}: Both sides changed - conflict situation`);
+            return {
+                shouldSync: true,
+                action: 'conflict',
+                reason: 'both-content-changed',
+                localHash: currentLocalHash,
+                remoteHash: currentRemoteHash,
+                details: {
+                    localModTime: currentLocalModTime,
+                    remoteModTime: currentRemoteModTime,
+                    conflictResolutionStrategy: this.settings.conflictResolution
+                }
+            };
+    
+        } catch (error) {
+            console.error(`❌ Sync decision error for ${fileName}:`, error);
+            return {
+                shouldSync: true,
+                action: 'conflict',
+                reason: 'error-fallback',
+                details: { error: error.message }
+            };
+        }
+    }
+
+    // Log sync decisions for debugging and monitoring
+    private logSyncDecision(decision: SyncDecision, fileName: string): void {
+        const timestamp = new Date().toLocaleTimeString();
+        const icon = {
+            'upload': '📤',
+            'download': '📥', 
+            'skip': '⏭️',
+            'conflict': '⚡'
+        }[decision.action] || '❓';
+        
+        console.log(`[${timestamp}] ${icon} SYNC DECISION: ${fileName}`);
+        console.log(`  Should sync: ${decision.shouldSync ? '✅' : '❌'}`);
+        console.log(`  Action: ${decision.action}`);
+        console.log(`  Reason: ${decision.reason}`);
+        
+        if (decision.localHash && decision.remoteHash) {
+            console.log(`  Hash comparison: local=${decision.localHash.substring(0, 8)}... vs remote=${decision.remoteHash.substring(0, 8)}...`);
+        }
+        
+        if (decision.details) {
+            console.log(`  Details:`, decision.details);
+        }
+    }
+
     public clearFileStateCache(): void {
+        const beforeStats = {
+            fileStates: Object.keys(this.settings.fileStateCache || {}).length,
+            driveFolders: this.settings.selectedDriveFolders?.length || 0,
+            hashCache: this.hashCache?.size || 0
+        };
+
         this.settings.fileStateCache = {};
         this.settings.selectedDriveFolders = [];
         this.folderCache = {};
+        this.hashCache.clear();
         this.saveSettings();
-        console.log('🧹 File state cache cleared');
-        new Notice('✅ File state cache cleared');
+        
+        console.log('🧹 File state cache cleared:');
+        console.log(`  File states: ${beforeStats.fileStates} → 0`);
+        console.log(`  Drive folders: ${beforeStats.driveFolders} → 0`);
+        console.log(`  Hash cache: ${beforeStats.hashCache} → 0`);
+        
+        new Notice('✅ All caches cleared - fresh sync state');
+
+        this.notifySettingsChanged();
     }
 
     // 폴더 캐시 초기화 메서드
@@ -1098,13 +1362,13 @@ export default class GDriveSyncPlugin extends Plugin {
         });
         ribbonIconEl.addClass('gdrive-sync-ribbon-class');
         
-        // 🔥 NEW: 상태바 아이템 추가
+        // 상태바 아이템 추가
         this.addStatusBarSync();
         
-        // 🔥 NEW: 파일 메뉴에 동기화 옵션 추가
+        // 파일 메뉴에 동기화 옵션 추가
         this.addFileMenuItems();
 
-        // 🔥 NEW: 폴더 우클릭 메뉴 - 조건부 표시
+        // 폴더 우클릭 메뉴 - 조건부 표시
         this.addFolderContextMenu();
 
         // Commands 추가
@@ -1112,7 +1376,7 @@ export default class GDriveSyncPlugin extends Plugin {
             id: 'sync-with-gdrive',
             name: 'Sync with Google Drive',
             callback: () => {
-                this.mainSync(false); // 🔥 수정
+                this.mainSync(false); 
             }
         });
     
@@ -1164,7 +1428,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 }
             }
         });
-    
+
         // 파일 변경 감지 및 자동 동기화 설정
         this.setupFileChangeDetection();
 
@@ -1182,7 +1446,7 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log('Auto sync disabled on plugin load');
         }
     }
-  
+
     // 파일 변경 감지 설정
     private setupFileChangeDetection(): void {
         // 파일 수정 감지
@@ -2125,6 +2389,7 @@ export default class GDriveSyncPlugin extends Plugin {
         return filePath;
     }
 
+    // Enhanced bidirectional sync with intelligent decision making
     private async performBidirectionalSyncWithGlobalProgress(
         localFiles: TFile[], 
         driveFiles: any[], 
@@ -2136,91 +2401,215 @@ export default class GDriveSyncPlugin extends Plugin {
     ): Promise<SyncResult> {
         const result = this.createEmptyResult();
         
-        // 파일 매핑 생성
+        // Create file mappings
         const localFileMap = new Map<string, TFile>();
         localFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
             localFileMap.set(relativePath, file);
         });
-    
+
         const driveFileMap = new Map<string, any>();
         driveFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
             driveFileMap.set(relativePath, file);
         });
-    
+
         const allPaths = new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
         let processedInThisFolder = 0;
-    
+
+        console.log(`🔄 Processing ${allPaths.size} unique file paths in folder: ${baseFolder || 'root'}`);
+
         for (const filePath of allPaths) {
             if (progressModal?.shouldCancel()) {
+                console.log('🛑 Sync cancelled by user');
                 return result;
             }
-    
+
             const localFile = localFileMap.get(filePath);
             const driveFile = driveFileMap.get(filePath);
-    
+
             try {
-                // 🔥 전체 진행률 업데이트 (시작 지점 + 현재 폴더 내 진행률)
+                // Update progress
                 const globalProgress = startingProgress + processedInThisFolder;
                 progressModal?.updateProgress(globalProgress, totalFiles, `Processing: ${filePath}`);
-    
+
                 if (localFile && driveFile) {
-                    progressModal?.addLog(`🔍 Checking: ${filePath}`);
-                    
-                    const syncResult = await this.resolveFileConflictSafe(localFile, driveFile, rootFolderId, baseFolder);
-                    
-                    switch (syncResult.action) {
-                        case 'uploaded':
-                            result.uploaded++;
-                            result.conflicts++;
-                            progressModal?.addLog(`⚡ Conflict resolved (uploaded): ${filePath}`);
-                            break;
-                        case 'downloaded':
-                            result.downloaded++;
-                            result.conflicts++;
-                            progressModal?.addLog(`⚡ Conflict resolved (downloaded): ${filePath}`);
-                            break;
-                        case 'skipped':
-                            result.skipped++;
-                            break;
-                        case 'error':
-                            result.errors++;
-                            progressModal?.addLog(`❌ Error processing: ${filePath} - ${syncResult.error}`);
-                            break;
+                    // Both files exist - make intelligent decision
+                    const decision = await this.decideSyncAction(localFile, driveFile);
+                    this.logSyncDecision(decision, localFile.name);
+
+                    if (!decision.shouldSync) {
+                        result.skipped++;
+                        progressModal?.addLog(`⏭️ Skip: ${filePath} (${decision.reason})`);
+                    } else {
+                        const syncResult = await this.executeSyncDecision(decision, localFile, driveFile, rootFolderId, baseFolder);
+                        this.updateResultFromSyncExecution(result, syncResult, progressModal, filePath);
                     }
+
                 } else if (localFile && !driveFile) {
+                    // Local file only - upload
                     progressModal?.addLog(`📤 Upload: ${filePath}`);
                     const uploadResult = await this.uploadSingleFileSafe(localFile, rootFolderId, baseFolder);
                     if (uploadResult.success) {
                         result.uploaded++;
+                        progressModal?.addLog(`✅ Uploaded: ${filePath}`);
                     } else {
                         result.errors++;
                         progressModal?.addLog(`❌ Upload failed: ${filePath} - ${uploadResult.error}`);
                     }
+
                 } else if (!localFile && driveFile) {
+                    // Remote file only - download
                     progressModal?.addLog(`📥 Download: ${filePath}`);
                     const downloadResult = await this.downloadFileFromDriveSafe(driveFile, baseFolder);
                     if (downloadResult.success) {
                         result.downloaded++;
+                        progressModal?.addLog(`✅ Downloaded: ${filePath}`);
                     } else {
                         result.errors++;
                         progressModal?.addLog(`❌ Download failed: ${filePath} - ${downloadResult.error}`);
                     }
                 }
+
             } catch (error) {
-                console.error(`Error syncing file ${filePath}:`, error);
-                progressModal?.addLog(`❌ Unexpected error processing ${filePath}: ${error.message || 'Unknown error'}`);
+                console.error(`❌ Unexpected error processing ${filePath}:`, error);
+                progressModal?.addLog(`❌ Error: ${filePath} - ${error.message || 'Unknown error'}`);
                 result.errors++;
             }
-    
+
             processedInThisFolder++;
+            
+            // Progress report every 10 files
+            if (processedInThisFolder % 10 === 0) {
+                progressModal?.addLog(`📊 Progress: ${result.uploaded}↑ ${result.downloaded}↓ ${result.skipped}⏭️ ${result.errors}❌`);
+            }
+            
+            // Small delay to prevent UI blocking
             await new Promise(resolve => setTimeout(resolve, 10));
         }
-    
+
+        console.log(`✅ Folder sync completed: ${baseFolder || 'root'} - ${processedInThisFolder} files processed`);
         return result;
     }
     
+    //Execute sync decision with proper error handling
+    private async executeSyncDecision(
+        decision: SyncDecision,
+        localFile: TFile,
+        driveFile: any,
+        rootFolderId: string,
+        baseFolder: string
+    ): Promise<{action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string, isConflictResolution?: boolean}> {
+        try {
+            switch (decision.action) {
+                case 'upload':
+                    const uploadResult = await this.uploadSingleFileSafe(localFile, rootFolderId, baseFolder);
+                    return uploadResult.success ? {action: 'uploaded'} : {action: 'error', error: uploadResult.error};
+
+                case 'download':
+                    const downloadResult = await this.downloadFileFromDriveSafe(driveFile, baseFolder);
+                    return downloadResult.success ? {action: 'downloaded'} : {action: 'error', error: downloadResult.error};
+
+                case 'conflict':
+                    const conflictResult = await this.resolveConflictWithStrategy(decision, localFile, driveFile, rootFolderId, baseFolder);
+                    
+                    if (conflictResult.action === 'uploaded' || conflictResult.action === 'downloaded') {
+                        console.log(`✅ Conflict resolved and executed: ${localFile.name} -> ${conflictResult.action}`);
+                        return { ...conflictResult, isConflictResolution: true };
+                    } else {
+                        console.error(`❌ Conflict resolution failed for ${localFile.name}: ${conflictResult.error}`);
+                        return { action: 'error', error: conflictResult.error || 'Conflict resolution failed' };
+                    }
+                    
+                default:
+                    return {action: 'skipped'};
+            }
+        } catch (error) {
+            console.error(`❌ Error executing sync decision for ${localFile.name}:`, error);
+            return {action: 'error', error: error.message || 'Unknown execution error'};
+        }
+    }
+
+    //Resolve conflicts using configured strategy
+    private async resolveConflictWithStrategy(
+        decision: SyncDecision,
+        localFile: TFile,
+        driveFile: any,
+        rootFolderId: string,
+        baseFolder: string
+    ): Promise<{action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string}> {
+        const details = decision.details || {};
+        const localModTime = details.localModTime || localFile.stat.mtime;
+        const remoteModTime = details.remoteModTime || new Date(driveFile.modifiedTime).getTime();
+
+        let resolution: 'local' | 'remote';
+
+        switch (this.settings.conflictResolution) {
+            case 'local':
+                resolution = 'local';
+                break;
+            case 'remote':
+                resolution = 'remote';
+                break;
+            case 'newer':
+            case 'ask':
+                resolution = localModTime > remoteModTime ? 'local' : 'remote';
+                break;
+            default:
+                resolution = localModTime > remoteModTime ? 'local' : 'remote';
+        }
+
+        console.log(`⚡ Resolving conflict for ${localFile.name}:`);
+        console.log(`  Strategy: ${this.settings.conflictResolution} → use ${resolution} version`);
+        console.log(`  Times: local=${new Date(localModTime).toLocaleString()}, remote=${new Date(remoteModTime).toLocaleString()}`);
+
+        if (resolution === 'local') {
+            const uploadResult = await this.uploadSingleFileSafe(localFile, rootFolderId, baseFolder);
+            return uploadResult.success ? {action: 'uploaded'} : {action: 'error', error: uploadResult.error};
+        } else {
+            const downloadResult = await this.downloadFileFromDriveSafe(driveFile, baseFolder, true);
+            return downloadResult.success ? {action: 'downloaded'} : {action: 'error', error: downloadResult.error};
+        }
+    }
+
+    // Update result counters from sync execution
+    private updateResultFromSyncExecution(
+        result: SyncResult,
+        syncResult: {action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string, isConflictResolution?: boolean},
+        progressModal?: SyncProgressModal,
+        filePath?: string
+    ): void {
+        switch (syncResult.action) {
+            case 'uploaded':
+                result.uploaded++;
+                if (syncResult.isConflictResolution) {
+                    result.conflicts++;
+                    progressModal?.addLog(`⚡ Conflict resolved (uploaded): ${filePath}`);
+                } else {
+                    progressModal?.addLog(`📤 Uploaded: ${filePath}`);
+                }
+                break;
+            case 'downloaded':
+                result.downloaded++;
+                if (syncResult.isConflictResolution) {
+                    result.conflicts++;
+                    progressModal?.addLog(`⚡ Conflict resolved (downloaded): ${filePath}`);
+                } else {
+                    progressModal?.addLog(`📥 Downloaded: ${filePath}`);
+                }
+                break;
+            case 'skipped':
+                result.skipped++;
+                progressModal?.addLog(`⏭️ Skipped: ${filePath}`);
+                break;
+            case 'error':
+                result.errors++;
+                progressModal?.addLog(`❌ Error: ${filePath} - ${syncResult.error}`);
+                break;
+        }
+    }
+
+    // Enhanced conflict resolution with proper logic
     private async resolveFileConflictSafe(
         localFile: TFile, 
         driveFile: any, 
@@ -2228,68 +2617,21 @@ export default class GDriveSyncPlugin extends Plugin {
         baseFolder: string
     ): Promise<{action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string}> {
         try {
-            const fileState = this.getFileState(localFile.path);
-            const currentLocalModTime = localFile.stat.mtime;
-            const currentRemoteHash = driveFile.md5Checksum;
-            
-            const cachedLocalModTime = fileState.localModTime;
-            const cachedRemoteHash = fileState.remoteHash;
-            
-            // 🔥 변경 상태 확인
-            const localChanged = currentLocalModTime !== cachedLocalModTime;
-            const remoteChanged = currentRemoteHash !== cachedRemoteHash;
-            
-            if (!localChanged && !remoteChanged) {
-                console.log(`⏭️ ${localFile.name}: No actual changes - skip conflict resolution`);
+            const decision = await this.decideSyncAction(localFile, driveFile);
+            this.logSyncDecision(decision, localFile.name);
+    
+            if (!decision.shouldSync) {
                 return {action: 'skipped'};
             }
-
-            // 충돌 해결 전략
-            let resolution: 'local' | 'remote';
-            
-            if (!remoteChanged && localChanged) {
-                // 로컬만 변경됨
-                resolution = 'local';
-                console.log(`📤 ${localFile.name}: Only local changed - upload`);
-            } else if (remoteChanged && !localChanged) {
-                // 원격만 변경됨
-                resolution = 'remote';
-                console.log(`📥 ${localFile.name}: Only remote changed - download`);
+    
+            if (decision.action === 'conflict') {
+                return await this.resolveConflictWithStrategy(decision, localFile, driveFile, rootFolderId, baseFolder);
             } else {
-                // 둘 다 변경됨 - 시간 비교
-                const localModTime = localFile.stat.mtime;
-                const remoteModTime = new Date(driveFile.modifiedTime).getTime();
-                
-                console.log(`⚡ ${localFile.name}: Both changed - resolving conflict`);
-                console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
-                console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
-                
-                switch (this.settings.conflictResolution) {
-                    case 'local':
-                        resolution = 'local';
-                        break;
-                    case 'remote':
-                        resolution = 'remote';
-                        break;
-                    case 'newer':
-                    case 'ask':
-                        resolution = localModTime > remoteModTime ? 'local' : 'remote';
-                        break;
-                }
-                
-                console.log(`  Resolution: Use ${resolution} file`);
+                return await this.executeSyncDecision(decision, localFile, driveFile, rootFolderId, baseFolder);
             }
-
-            if (resolution === 'local') {
-                const uploadResult = await this.uploadSingleFileSafe(localFile, rootFolderId, baseFolder);
-                return uploadResult.success ? {action: 'uploaded'} : {action: 'error', error: uploadResult.error};
-            } else {
-                const downloadResult = await this.downloadFileFromDriveSafe(driveFile, baseFolder);
-                return downloadResult.success ? {action: 'downloaded'} : {action: 'error', error: downloadResult.error};
-            }
-
+    
         } catch (error) {
-            console.error(`Error resolving conflict for ${localFile.path}:`, error);
+            console.error(`❌ Error in conflict resolution for ${localFile.path}:`, error);
             return {action: 'error', error: error.message || 'Unknown error'};
         }
     }
@@ -2314,17 +2656,43 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
+    //  Safe download wrapper with comprehensive error handling
     private async downloadFileFromDriveSafe(
         driveFile: any, 
-        baseFolder: string
+        baseFolder: string,
+        forceDownload: boolean = false
     ): Promise<{success: boolean, error?: string}> {
         try {
             const result = this.createEmptyResult();
-            await this.downloadFileFromDrive(driveFile, result, baseFolder);
-            return {success: true};
+
+            // 🔥 FIX: forceDownload가 true면 결정 로직 건너뛰고 바로 다운로드
+            if (forceDownload) {
+                console.log(`🔥 Force downloading: ${driveFile.name} (skipping decision logic)`);
+                
+                let filePath = driveFile.path;
+                if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
+                    filePath = baseFolder + '/' + filePath;
+                }
+                
+                const existingLocalFile = this.app.vault.getAbstractFileByPath(filePath) as TFile;
+                await this.performActualDownload(driveFile, result, baseFolder, filePath, existingLocalFile);
+            } else {
+                // 기존 로직: 결정 로직 포함
+                await this.downloadFileFromDrive(driveFile, result, baseFolder);
+            }
+            
+            // Consider both downloaded and skipped as success
+            return {
+                success: result.downloaded > 0 || (result.skipped > 0 && !forceDownload),
+                error: result.errors > 0 ? 'Download had errors' : undefined
+            };
+            
         } catch (error) {
-            console.error(`Download error for ${driveFile.name}:`, error);
-            return {success: false, error: error.message || 'Unknown download error'};
+            console.error(`❌ Safe download failed for ${driveFile.name}:`, error);
+            return {
+                success: false, 
+                error: error.message || 'Unknown download error'
+            };
         }
     }
 
@@ -3067,74 +3435,96 @@ export default class GDriveSyncPlugin extends Plugin {
         return result;
     }
 
-    // Google Drive에서 파일 다운로드
+    // Smart download with early exit checks
     private async downloadFileFromDrive(driveFile: any, result: SyncResult, baseFolder: string = ''): Promise<void> {
+        let filePath = driveFile.path;
+        
+        if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
+            filePath = baseFolder + '/' + filePath;
+        }
+        
+        const localFile = this.app.vault.getAbstractFileByPath(filePath);
+
+        // Case 1: Local file doesn't exist - always download
+        if (!(localFile instanceof TFile)) {
+            console.log(`📥 ${driveFile.name}: Local file doesn't exist - downloading`);
+            await this.performActualDownload(driveFile, result, baseFolder, filePath);
+            return;
+        }
+
+        // Case 2: Use intelligent decision making
+        const decision = await this.decideSyncAction(localFile, driveFile);
+        this.logSyncDecision(decision, driveFile.name);
+
+        if (!decision.shouldSync || decision.action === 'skip') {
+            console.log(`⏭️ ${driveFile.name}: Decision was skip - ${decision.reason}`);
+            result.skipped++;
+            return;
+        }
+
+        if (decision.action === 'download') {
+            console.log(`📥 ${driveFile.name}: Decision was download - ${decision.reason}`);
+            await this.performActualDownload(driveFile, result, baseFolder, filePath, localFile);
+        } else if (decision.action === 'conflict') {
+            console.log(`⚡ ${driveFile.name}: Conflict detected - should be resolved by bidirectional sync logic`);
+            result.conflicts++;
+        } else {
+            console.log(`⏭️ ${driveFile.name}: Not a download decision (${decision.action}) - skipping`);
+            result.skipped++;
+        }
+    }
+
+    // Execute actual download with proper state management
+    private async performActualDownload(
+        driveFile: any, 
+        result: SyncResult, 
+        baseFolder: string, 
+        filePath: string, 
+        existingLocalFile?: TFile
+    ): Promise<void> {
         try {
-            let filePath = driveFile.path;
-            
-            if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
-                filePath = baseFolder + '/' + filePath;
-            }
-            
-            const localFile = this.app.vault.getAbstractFileByPath(filePath);
+            console.log(`📥 Starting download: ${driveFile.name}`);
 
-            // 다운로드 필요 여부 확인
-            if (localFile instanceof TFile) {
-                const needsUpdate = await this.shouldDownloadFile(localFile, driveFile);
-                if (!needsUpdate) {
-                    result.skipped++;
-                    return;
-                }
-            }
-
-            // 파일 다운로드
+            // Download content
             const content = await this.getFileContentFromDrive(driveFile.id, driveFile.name);
             const remoteModTime = new Date(driveFile.modifiedTime).getTime();
 
-            // 폴더 생성
+            // Create folder structure if needed
             const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
             if (folderPath && this.settings.createMissingFolders) {
                 await this.createLocalFolderStructure(folderPath, result);
             }
 
-            // 파일 저장
+            // Save file content
             if (this.isTextFile(driveFile.name)) {
-                if (localFile instanceof TFile) {
-                    await this.app.vault.modify(localFile, content as string);
+                if (existingLocalFile) {
+                    await this.app.vault.modify(existingLocalFile, content as string);
                 } else {
                     await this.app.vault.create(filePath, content as string);
                 }
             } else {
                 const binaryContent = new Uint8Array(content as ArrayBuffer);
-                if (localFile instanceof TFile) {
-                    await this.app.vault.modifyBinary(localFile, binaryContent);
+                if (existingLocalFile) {
+                    await this.app.vault.modifyBinary(existingLocalFile, binaryContent);
                 } else {
                     await this.app.vault.createBinary(filePath, binaryContent);
                 }
             }
 
-            // 파일 시간 동기화
+            // Sync file time
             await this.syncFileTime(filePath, remoteModTime);
 
-            // 🔥 상태 캐시 업데이트 (mtime 기반)
+            // Update state cache (without syncDirection)
             const updatedLocalFile = this.app.vault.getAbstractFileByPath(filePath) as TFile;
             if (updatedLocalFile) {
-                this.setFileState(filePath, {
-                    localModTime: updatedLocalFile.stat.mtime,  // 🔥 실제 저장된 파일의 mtime
-                    remoteHash: driveFile.md5Checksum,
-                    remoteModTime: remoteModTime,
-                    lastSyncTime: Date.now(),
-                    version: driveFile.version
-                });
-                
-                await this.saveSettings();
-                console.log(`💾 Download state cached for ${filePath}: localMtime=${updatedLocalFile.stat.mtime}, remoteHash=${driveFile.md5Checksum}`);
+                await this.updateFileStateAfterSync(filePath, updatedLocalFile, driveFile);
             }
             
             result.downloaded++;
+            console.log(`✅ Download completed: ${driveFile.name}`);
 
         } catch (error) {
-            console.error(`❌ ${driveFile.name}: Download failed - ${error.message}`);
+            console.error(`❌ Download failed for ${driveFile.name}:`, error);
             result.errors++;
             throw error;
         }
@@ -3212,111 +3602,7 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 파일 충돌 해결
-    private async resolveFileConflict(localFile: TFile, driveFile: any, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
-        const localModTime = localFile.stat.mtime;
-        const remoteModTime = new Date(driveFile.modifiedTime).getTime();
 
-        // 1초 이내 차이는 동일한 것으로 간주 (파일시스템 정밀도 고려)
-        const timeDiff = Math.abs(localModTime - remoteModTime);
-        const TIME_TOLERANCE = 1000; // 1초
-
-        if (timeDiff <= TIME_TOLERANCE) {
-            // 시간이 거의 같으면 충돌이 아니라 동기화된 상태
-            console.log(`⏭️ ${localFile.name}: Files are already synced (time diff: ${timeDiff}ms)`);
-            result.skipped++;
-            return; // 충돌로 카운트하지 않음
-        }
-
-        // ⚠️ 여기서부터가 실제 충돌 상황
-        let resolution: 'local' | 'remote';
-        let isActualConflict = false; // 실제 충돌 여부 추적
-
-        switch (this.settings.conflictResolution) {
-            case 'local':
-                resolution = 'local';
-                break;
-            case 'remote':
-                resolution = 'remote';
-                break;
-            case 'newer':
-                resolution = localModTime > remoteModTime ? 'local' : 'remote';
-                break;
-            case 'ask':
-                resolution = localModTime > remoteModTime ? 'local' : 'remote';
-                console.log(`Conflict resolved automatically (newer): ${localFile.path} -> ${resolution}`);
-                break;
-        }
-
-        // 🔥 실제 충돌 해결이 필요한 경우에만 로그 출력
-        console.log(`⚡ Conflict detected: ${localFile.name}`);
-        console.log(`  Local:  ${new Date(localModTime).toLocaleString()}`);
-        console.log(`  Remote: ${new Date(remoteModTime).toLocaleString()}`);
-        console.log(`  Resolution: Use ${resolution} file`);
-
-        try {
-            if (resolution === 'local') {
-                // 로컬 파일로 원격 파일 업데이트
-                const syncResult = await this.syncFileToGoogleDrive(localFile, rootFolderId, baseFolder);
-                if (syncResult === 'skipped') {
-                    result.skipped++;
-                    console.log(`⏭️ ${localFile.name}: Actually skipped after conflict check`);
-                } else if (syncResult === true) {
-                    result.uploaded++;
-                    result.conflicts++; // ✅ 실제로 업로드된 경우에만 충돌로 카운트
-                    isActualConflict = true;
-                } else {
-                    result.errors++;
-                }
-            } else {
-                // 원격 파일로 로컬 파일 업데이트
-                const shouldDownload = await this.shouldDownloadFile(localFile, driveFile);
-                if (shouldDownload) {
-                    await this.downloadFileFromDrive(driveFile, result, baseFolder);
-                    result.downloaded++;
-                    result.conflicts++; // ✅ 실제로 다운로드된 경우에만 충돌로 카운트
-                    isActualConflict = true;
-                } else {
-                    result.skipped++;
-                    console.log(`⏭️ ${localFile.name}: Actually skipped after download check`);
-                }
-            }
-
-            // 실제 충돌이 해결된 경우에만 해결 로그 출력
-            if (isActualConflict) {
-                console.log(`✅ Conflict resolved: ${localFile.name} (used ${resolution} version)`);
-            }
-
-        } catch (error) {
-            console.error(`Error resolving conflict for ${localFile.path}:`, error);
-            result.errors++;
-        }
-    }
-
-    // 단일 파일 업로드
-    private async uploadSingleFile(file: TFile, rootFolderId: string, result: SyncResult, baseFolder: string = ''): Promise<void> {
-        try {
-            const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId, baseFolder);
-            if (syncResult === 'skipped') {
-                result.skipped++;
-            } else if (syncResult === true) {
-                result.uploaded++;
-            } else {
-                result.errors++;
-            }
-        } catch (error) {
-            console.error(`Error uploading file ${file.path}:`, error);
-            result.errors++;
-        }
-    }
-
-    // 여러 파일 업로드
-    private async uploadFilesToDrive(filesToSync: TFile[], rootFolderId: string, result: SyncResult): Promise<void> {
-        for (const file of filesToSync) {
-            await this.uploadSingleFile(file, rootFolderId, result);
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-    }
     
     // Google Drive에서 모든 파일 가져오기 (재귀적으로 폴더 구조 포함)
     async getAllFilesFromDrive(folderId: string, basePath: string = ''): Promise<any[]> {
@@ -3524,60 +3810,10 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 파일 다운로드 필요 여부 판단
+    // Enhanced shouldDownloadFile with hash-first logic
     private async shouldDownloadFile(localFile: TFile, driveFile: any): Promise<boolean> {
-        try {
-            const filePath = localFile.path;
-            const fileState = this.getFileState(filePath);
-            
-            // 원격 파일 정보
-            const remoteHash = driveFile.md5Checksum;
-            const remoteModTime = new Date(driveFile.modifiedTime).getTime();
-            
-            if (!remoteHash) {
-                console.log(`📥 ${localFile.name}: No remote hash - download needed`);
-                return true;
-            }
-
-            // 캐시된 상태
-            const cachedRemoteHash = fileState.remoteHash;
-            const cachedRemoteModTime = fileState.remoteModTime;
-            const cachedLocalModTime = fileState.localModTime;
-            
-            // 🔥 로컬 파일이 변경되었는지 확인 (mtime)
-            const localFileChanged = localFile.stat.mtime !== cachedLocalModTime;
-            
-            // 🔥 원격 파일이 변경되었는지 확인 (해시)
-            const remoteFileChanged = remoteHash !== cachedRemoteHash ||
-                                    remoteModTime !== cachedRemoteModTime;
-            
-            // 원격 파일이 변경되지 않았고, 로컬 파일도 변경되지 않았으면 스킵
-            if (!remoteFileChanged && !localFileChanged) {
-                console.log(`⏭️ ${localFile.name}: No changes detected - skip download`);
-                return false;
-            }
-            
-            // 원격 파일만 변경된 경우 다운로드 필요
-            if (remoteFileChanged && !localFileChanged) {
-                console.log(`📥 ${localFile.name}: Remote file changed - download needed`);
-                console.log(`  Remote hash: ${remoteHash} (was: ${cachedRemoteHash})`);
-                return true;
-            }
-            
-            // 둘 다 변경된 경우 충돌 해결 필요
-            if (remoteFileChanged && localFileChanged) {
-                console.log(`⚡ ${localFile.name}: Both files changed - conflict resolution needed`);
-                return true;
-            }
-            
-            // 로컬만 변경된 경우 다운로드 불필요
-            console.log(`⏭️ ${localFile.name}: Only local file changed - skip download`);
-            return false;
-
-        } catch (error) {
-            console.error(`❌ ${localFile.name}: Download check error - ${error.message}`);
-            return true; // 에러 시 안전하게 다운로드
-        }
+        const decision = await this.decideSyncAction(localFile, driveFile);
+        return decision.shouldSync && (decision.action === 'download' || decision.action === 'conflict');
     }
 
     // 동기화 결과 객체 생성
@@ -3633,60 +3869,6 @@ export default class GDriveSyncPlugin extends Plugin {
         return files;
     }
 
-    private async shouldSyncFile(localFile: TFile, driveFile?: any): Promise<boolean> {
-        try {
-            const filePath = localFile.path;
-            const fileState = this.getFileState(filePath);
-            
-            // 새 파일인 경우 업로드 필요
-            if (!driveFile) {
-                console.log(`📤 ${localFile.name}: New file - upload needed`);
-                return true;
-            }
-
-            const currentLocalModTime = localFile.stat.mtime;
-            const currentRemoteHash = driveFile.md5Checksum;
-            const currentRemoteModTime = new Date(driveFile.modifiedTime).getTime();
-            
-            // 캐시된 상태
-            const cachedLocalModTime = fileState.localModTime;
-            const cachedRemoteHash = fileState.remoteHash;
-            const cachedRemoteModTime = fileState.remoteModTime;
-            
-            // 🔥 1단계: 로컬 파일 변경 체크 (mtime만 사용)
-            const localFileChanged = cachedLocalModTime !== currentLocalModTime;
-            
-            // 🔥 2단계: 원격 파일 변경 체크 (해시 비교)
-            const remoteFileChanged = cachedRemoteHash !== currentRemoteHash ||
-                                    cachedRemoteModTime !== currentRemoteModTime;
-            
-            // 둘 다 변경되지 않았으면 스킵
-            if (!localFileChanged && !remoteFileChanged) {
-                console.log(`⏭️ ${localFile.name}: No changes detected - skip sync`);
-                console.log(`  Local mtime: ${currentLocalModTime} (cached: ${cachedLocalModTime})`);
-                console.log(`  Remote hash: ${currentRemoteHash} (cached: ${cachedRemoteHash})`);
-                return false;
-            }
-            
-            // 변경 감지 로그
-            if (localFileChanged) {
-                console.log(`📤 ${localFile.name}: Local file changed - sync needed`);
-                console.log(`  Local mtime: ${currentLocalModTime} (was: ${cachedLocalModTime})`);
-            }
-            
-            if (remoteFileChanged) {
-                console.log(`📥 ${localFile.name}: Remote file changed - sync needed`);
-                console.log(`  Remote hash: ${currentRemoteHash} (was: ${cachedRemoteHash})`);
-            }
-            
-            return true;
-            
-        } catch (error) {
-            console.error(`❌ ${localFile.name}: Sync check error - ${error.message}`);
-            return true; // 에러 시 안전하게 동기화
-        }
-    }
-
     // Google Drive 관련 메서드들
     async getOrCreateDriveFolder(): Promise<{id: string, name: string} | null> {
         try {
@@ -3738,9 +3920,10 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
+    // Modified syncFileToGoogleDrive with enhanced state tracking
     private async syncFileToGoogleDrive(file: TFile, rootFolderId: string, baseFolder: string = ''): Promise<boolean | 'skipped'> {
         try {
-            // 폴더 구조 처리 (기존 로직 유지)
+            // ... existing folder structure handling code ...
             let relativePath = file.path;
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
                 relativePath = file.path.substring(baseFolder.length + 1);
@@ -3756,15 +3939,15 @@ export default class GDriveSyncPlugin extends Plugin {
                 targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
             }
             
-            // 기존 파일 확인
+            // Check existing file using decision engine
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
-            const needsSync = await this.shouldSyncFile(file, existingFile);
+            const decision = await this.decideSyncAction(file, existingFile);
             
-            if (!needsSync) {
+            if (!decision.shouldSync) {
                 return 'skipped';
             }
 
-            // 파일 내용 읽기
+            // File content reading
             let content: string | ArrayBuffer;
             if (this.isTextFile(file.name)) {
                 content = await this.app.vault.read(file);
@@ -3776,12 +3959,12 @@ export default class GDriveSyncPlugin extends Plugin {
             let success = false;
             let remoteFileData: any = null;
 
+            // Upload or update
             if (existingFile) {
                 console.log(`🔄 Updating ${file.path} in Google Drive`);
                 const result = await this.updateFileInDrive(existingFile.id, content, localModTime);
                 success = result.success;
                 if (success) {
-                    // 업데이트된 파일 정보 가져오기
                     remoteFileData = await this.getUpdatedFileInfo(existingFile.id);
                 }
             } else {
@@ -3791,18 +3974,9 @@ export default class GDriveSyncPlugin extends Plugin {
                 remoteFileData = result.fileData;
             }
 
-            // 🔥 성공 시 상태 캐시 업데이트 (mtime + 원격 해시)
+            // Update state cache (without syncDirection)
             if (success && remoteFileData) {
-                this.setFileState(file.path, {
-                    localModTime: localModTime,  // 🔥 로컬은 mtime만
-                    remoteHash: remoteFileData.md5Checksum,  // 🔥 원격은 해시
-                    remoteModTime: new Date(remoteFileData.modifiedTime).getTime(),
-                    lastSyncTime: Date.now(),
-                    version: remoteFileData.version
-                });
-                
-                await this.saveSettings();
-                console.log(`💾 State cached for ${file.path}: localMtime=${localModTime}, remoteHash=${remoteFileData.md5Checksum}`);
+                await this.updateFileStateAfterSync(file.path, file, remoteFileData);
             }
 
             return success;
@@ -3810,6 +3984,49 @@ export default class GDriveSyncPlugin extends Plugin {
         } catch (error) {
             console.error(`❌ Failed to sync ${file.path}:`, error);
             return false;
+        }
+    }
+
+     // Update file state after successful sync
+     private async updateFileStateAfterSync(
+        filePath: string, 
+        localFile: TFile, 
+        remoteFileData: any
+    ): Promise<void> {
+        try {
+            // Calculate fresh local hash after sync
+            const localHash = await this.getCachedFileHash(localFile);
+            const remoteHash = remoteFileData.md5Checksum;
+            const localModTime = localFile.stat.mtime;
+            const remoteModTime = new Date(remoteFileData.modifiedTime).getTime();
+            
+            // 🔥 Hash consistency validation
+            if (localHash !== remoteHash) {
+                console.warn(`⚠️ Hash mismatch after sync for ${filePath}:`);
+                console.warn(`  Local:  ${localHash}`);
+                console.warn(`  Remote: ${remoteHash}`);
+            } else {
+                console.log(`✅ Sync completed for ${filePath} - hash consistency confirmed`);
+            }
+            
+            // 🔥 Update state cache (hash-centric)
+            this.setFileState(filePath, {
+                localHash: localHash,
+                localModTime: localModTime,
+                remoteHash: remoteHash,
+                remoteModTime: remoteModTime,
+                lastSyncTime: Date.now(),
+                version: remoteFileData.version
+            });
+            
+            await this.saveSettings();
+            
+            console.log(`💾 State cache updated for ${filePath}:`);
+            console.log(`  Hash: ${localHash.substring(0, 8)}... (local/remote identical)`);
+            console.log(`  Time: ${new Date(localModTime).toLocaleString()} / ${new Date(remoteModTime).toLocaleString()}`);
+            
+        } catch (error) {
+            console.error(`❌ Failed to update state for ${filePath}:`, error);
         }
     }
 
@@ -4128,11 +4345,6 @@ export default class GDriveSyncPlugin extends Plugin {
         console.log(`Final auto sync status: ${this.isAutoSyncActive()}`);
     }
 
-    resetGoogleAPIState() {
-        console.log('Resetting Google API state...');
-        this.isGoogleApiLoaded = false;
-        console.log('Google API state reset completed');
-    }
     async mainSync(showProgress: boolean = true): Promise<SyncResult> {
         if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
             new Notice('Please configure Google Drive API credentials in settings');
@@ -4601,6 +4813,10 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .setButtonText('Clear Cache')
                 .onClick(() => {
                     this.plugin.clearFileStateCache();
+                    button.setButtonText('Cleared!');
+                    setTimeout(() => {
+                        button.setButtonText('Clear Cache');
+                    }, 2000);
                 }))
             .addButton(button => button
                 .setButtonText('Debug Auto Sync')
