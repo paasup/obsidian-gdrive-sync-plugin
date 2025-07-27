@@ -1696,6 +1696,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     const isSelectedForSync = this.isFolderSelectedForSync(folderPath);
                     const isSyncWholeVault = this.settings.syncWholeVault;
                     
+                    const isTopLevelFolder = this.isTopLevelFolder(folderPath);
+
                     if (isSyncWholeVault) {
                         // 전체 볼트 동기화 모드인 경우 - 폴더 동기화 메뉴
                         menu.addItem((item) => {
@@ -1727,21 +1729,32 @@ export default class GDriveSyncPlugin extends Plugin {
                         //         });
                         // });
                     } else {
-                        // 동기화 대상이 아닌 경우 - 동기화 대상 등록 메뉴
-                        menu.addItem((item) => {
-                            item
-                                .setTitle('Add to Google Drive Sync')
-                                .setIcon('plus')
-                                .onClick(async () => {
-                                    await this.addFolderToSyncTargets(file);
-                                });
-                        });
+                        // 동기화 대상이 아닌 경우 - 최상위 폴더에서만 동기화 대상 등록 메뉴 표시
+                        if (isTopLevelFolder) {
+                            menu.addItem((item) => {
+                                item
+                                    .setTitle('Add to Google Drive Sync')
+                                    .setIcon('plus')
+                                    .onClick(async () => {
+                                        await this.addFolderToSyncTargets(file);
+                                    });
+                            });
+                        }
                     }
                 }
             })
         );
     }
 
+    private isTopLevelFolder(folderPath: string): boolean {
+        // Empty path means root, which we don't consider as a folder
+        if (!folderPath) return false;
+        
+        // Count the number of '/' characters to determine depth
+        // Top-level folders have no '/' in their path
+        return !folderPath.includes('/');
+    }
+    
     // 🔥 단일 파일 동기화 메서드
     private async syncSingleFile(file: TFile): Promise<void> {
         try {
@@ -1972,63 +1985,69 @@ export default class GDriveSyncPlugin extends Plugin {
     
             new Notice(`🔄 Syncing ${files.length} files from ${folder.name}...`);
     
-            // 🔥 기존 양방향 동기화 로직 재사용
             let result: SyncResult;
             
             if (this.settings.syncWholeVault) {
-                // 전체 볼트 동기화 모드인 경우 - 기존 bidirectionalSync 사용
+                // Whole vault sync mode
                 const rootFolder = await this.getOrCreateDriveFolder();
                 if (!rootFolder) {
                     new Notice('❌ Failed to access Google Drive folder');
                     return;
                 }
     
-                // 해당 폴더의 파일들만 필터링해서 동기화
-                const allLocalFiles = this.app.vault.getFiles().filter(file => this.shouldSyncFileType(file));
-                const folderFiles = allLocalFiles.filter(file => 
-                    file.path.startsWith(folder.path + '/') || file.path === folder.path
-                );
-                
-                const allDriveFiles = await this.getAllFilesFromDrive(rootFolder.id);
-                const folderDriveFiles = allDriveFiles.filter(file => 
-                    file.path.startsWith(folder.path + '/') || file.path === folder.path
-                );
+                // 🔥 OPTIMIZED: Directly collect files only from target folder
+                const folderFiles = await this.getLocalFilesForTargetFolder(folder.path);
+                const folderDriveFiles = await this.getDriveFilesForTargetFolder(folder.path, rootFolder.id);
     
                 result = await this.performBidirectionalSyncWithGlobalProgress(
                     folderFiles, 
                     folderDriveFiles, 
                     rootFolder.id, 
-                    '', // baseFolder는 빈 문자열 (전체 볼트 모드)
-                    undefined, // progressModal 없음
+                    '',
+                    undefined,
                     0, 
                     folderFiles.length + folderDriveFiles.length
                 );
             } else {
-                // 선택된 폴더 동기화 모드인 경우
-                const selectedFolder = this.settings.selectedDriveFolders.find(
-                    sf => sf.path === folder.path
-                );
+                // Selected folder sync mode
+                const selectedFolder = this.findParentSyncFolder(folder.path);
                 
                 if (!selectedFolder) {
-                    new Notice(`❌ Folder "${folder.name}" is not configured for sync. Please add it in settings.`);
+                    new Notice(`❌ Folder "${folder.name}" is not within any configured sync folder. Please add a parent folder in settings.`);
                     return;
                 }
     
-                const localFiles = await this.getLocalFilesForDriveFolder(selectedFolder);
-                const driveFiles = await this.getAllFilesFromDrive(selectedFolder.id, selectedFolder.path);
+                console.log(`📁 Found parent sync folder: ${selectedFolder.name} for target folder: ${folder.name}`);
+    
+                let localFiles: TFile[];
+                let driveFiles: any[];
+    
+                if (folder.path === selectedFolder.path) {
+                    // 🔥 CASE 1: Exact match with configured folder - use existing logic
+                    console.log(`📁 Syncing entire configured folder: ${selectedFolder.name}`);
+                    localFiles = await this.getLocalFilesForDriveFolder(selectedFolder);
+                    driveFiles = await this.getAllFilesFromDrive(selectedFolder.id, selectedFolder.path);
+                } else {
+                    // 🔥 CASE 2: Subfolder - directly search only target folder (performance optimized)
+                    console.log(`📁 Syncing subfolder: ${folder.name} within ${selectedFolder.name}`);
+                    
+                    // 🔥 OPTIMIZED: Directly collect files only from subfolder
+                    localFiles = await this.getLocalFilesForTargetFolder(folder.path);
+                    driveFiles = await this.getDriveFilesForTargetFolder(folder.path, selectedFolder.id, selectedFolder.path);
+                }
     
                 result = await this.performBidirectionalSyncWithGlobalProgress(
                     localFiles, 
                     driveFiles, 
                     selectedFolder.id, 
                     selectedFolder.path,
-                    undefined, // progressModal 없음
+                    undefined,
                     0, 
                     localFiles.length + driveFiles.length
                 );
             }
     
-            // 🔥 기존과 동일한 결과 요약 로직
+            // Result summary logic
             const messages: string[] = [];
             if (result.uploaded > 0) messages.push(`${result.uploaded} uploaded`);
             if (result.downloaded > 0) messages.push(`${result.downloaded} downloaded`);
@@ -2043,7 +2062,6 @@ export default class GDriveSyncPlugin extends Plugin {
                 new Notice(`⚠️ Folder sync completed with ${result.errors} errors: ${summary}`);
             }
     
-            // 🔥 마지막 동기화 시간 업데이트
             this.settings.lastSyncTime = Date.now();
             await this.saveSettings();
     
@@ -2051,6 +2069,104 @@ export default class GDriveSyncPlugin extends Plugin {
             console.error('Folder sync error:', error);
             new Notice(`❌ Error syncing folder ${folder.name}: ${error.message}`);
         }
+    }
+    
+    // 🔥 NEW: Find parent sync folder that contains the given folder path
+    private findParentSyncFolder(folderPath: string): {id: string, name: string, path: string} | null {
+        for (const selectedFolder of this.settings.selectedDriveFolders) {
+            // Exact match case
+            if (folderPath === selectedFolder.path) {
+                return selectedFolder;
+            }
+            
+            // Subfolder case
+            if (folderPath.startsWith(selectedFolder.path + '/')) {
+                return selectedFolder;
+            }
+        }
+        
+        return null;
+    }
+    
+    // 🔥 NEW: Directly collect local files only from specific folder path (performance optimized)
+    private async getLocalFilesForTargetFolder(targetFolderPath: string): Promise<TFile[]> {
+        console.log(`🔍 Collecting local files for target folder: ${targetFolderPath}`);
+        
+        // Get target folder object
+        const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath);
+        
+        if (!(targetFolder instanceof TFolder)) {
+            console.warn(`⚠️ Target folder not found: ${targetFolderPath}`);
+            return [];
+        }
+        
+        // Collect files only from target folder
+        const files = await this.collectFilesToSync(targetFolder, this.settings.includeSubfolders);
+        
+        console.log(`✅ Found ${files.length} local files in target folder: ${targetFolderPath}`);
+        return files;
+    }
+    
+    // 🔥 NEW: Directly search Google Drive files only from specific folder path (performance optimized)
+    private async getDriveFilesForTargetFolder(
+        targetFolderPath: string, 
+        parentDriveFolderId: string, 
+        parentFolderPath: string = ''
+    ): Promise<any[]> {
+        console.log(`🔍 Collecting drive files for target folder: ${targetFolderPath}`);
+        
+        try {
+            // 🔥 STEP 1: Find target folder ID in Google Drive
+            let targetDriveFolderId = parentDriveFolderId;
+            
+            if (targetFolderPath !== parentFolderPath) {
+                // For subfolder case, find the corresponding folder ID
+                const relativePath = targetFolderPath.startsWith(parentFolderPath + '/') 
+                    ? targetFolderPath.substring(parentFolderPath.length + 1)
+                    : targetFolderPath;
+                
+                console.log(`🔍 Finding drive folder ID for relative path: ${relativePath}`);
+                targetDriveFolderId = await this.findOrCreateDriveFolderPath(relativePath, parentDriveFolderId);
+                
+                if (!targetDriveFolderId) {
+                    console.warn(`⚠️ Target drive folder not found: ${targetFolderPath}`);
+                    return [];
+                }
+            }
+            
+            // 🔥 STEP 2: Get files directly from target folder only
+            console.log(`📡 Getting files from drive folder ID: ${targetDriveFolderId}`);
+            const driveFiles = await this.getAllFilesFromDrive(targetDriveFolderId, targetFolderPath);
+            
+            console.log(`✅ Found ${driveFiles.length} drive files in target folder: ${targetFolderPath}`);
+            return driveFiles;
+            
+        } catch (error) {
+            console.error(`❌ Error getting drive files for target folder ${targetFolderPath}:`, error);
+            return [];
+        }
+    }
+    
+    // 🔥 NEW: Find or create nested folder path ID in Google Drive
+    private async findOrCreateDriveFolderPath(relativePath: string, rootFolderId: string): Promise<string> {
+        const pathParts = relativePath.split('/').filter(part => part.length > 0);
+        let currentFolderId = rootFolderId;
+        
+        for (const folderName of pathParts) {
+            // Find existing folder
+            const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
+            
+            if (existingFolder) {
+                currentFolderId = existingFolder.id;
+                console.log(`✅ Found existing drive folder: ${folderName} (${currentFolderId})`);
+            } else {
+                // If folder doesn't exist, don't create it - return empty string (read-only search)
+                console.warn(`⚠️ Drive folder not found: ${folderName} in ${currentFolderId}`);
+                return '';
+            }
+        }
+        
+        return currentFolderId;
     }
 
     debugAutoSyncStatus() {
