@@ -962,14 +962,16 @@ export default class GDriveSyncPlugin extends Plugin {
 
     // 🔥 파일 상태 캐시 관리 메서드들
     private getFileState(filePath: string): FileState {
-        return this.settings.fileStateCache[filePath] || {};
+        const normalizedPath = this.normalizeFullPath(filePath);
+        return this.settings.fileStateCache[normalizedPath] || {};
     }
 
     private setFileState(filePath: string, state: Partial<FileState>): void {
-        if (!this.settings.fileStateCache[filePath]) {
-            this.settings.fileStateCache[filePath] = {};
+        const normalizedPath = this.normalizeFullPath(filePath);
+        if (!this.settings.fileStateCache[normalizedPath]) {
+            this.settings.fileStateCache[normalizedPath] = {};
         }
-        Object.assign(this.settings.fileStateCache[filePath], state);
+        Object.assign(this.settings.fileStateCache[normalizedPath], state);
     }
 
     // Calculate hash with performance optimization for large files
@@ -2521,13 +2523,15 @@ export default class GDriveSyncPlugin extends Plugin {
         const localFileMap = new Map<string, TFile>();
         localFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
-            localFileMap.set(relativePath, file);
+            const normalizedPath = this.normalizePath(relativePath); // 추가
+            localFileMap.set(normalizedPath, file);
         });
 
         const driveFileMap = new Map<string, any>();
         driveFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
-            driveFileMap.set(relativePath, file);
+            const normalizedPath = this.normalizePath(relativePath); // 추가
+            driveFileMap.set(normalizedPath, file);
         });
 
         const allPaths = new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
@@ -4434,10 +4438,22 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
     
+    private normalizeFileName(fileName: string): string {
+        return fileName.normalize('NFC');
+    }
+    
+    private normalizePath(path: string): string {
+        return path.normalize('NFC');
+    }
+    
+    private normalizeFullPath(filePath: string): string {
+        return filePath.split('/').map(part => part.normalize('NFC')).join('/');
+    }
+    
     private async findFileInDrive(fileName: string, folderId: string): Promise<any | null> {
         try {
             const actualFolderId = await this.resolveToActualFolderId(folderId);
-            const normalizedFileName = fileName.normalize('NFC');
+            const normalizedFileName = this.normalizeFileName(fileName)
             
             console.log(`🔍 [SEARCH] fileName: "${normalizedFileName}"`);
             console.log(`🔍 [SEARCH] folderId: ${actualFolderId}`);
@@ -4466,11 +4482,11 @@ export default class GDriveSyncPlugin extends Plugin {
                     // 모든 검색 결과 로그
                     data.files.forEach((file, index) => {
                         console.log(`🔍 [SEARCH] Result ${index + 1}: "${file.name}" (${file.id})`);
-                        console.log(`🔍 [SEARCH] Normalized match: ${file.name.normalize('NFC') === normalizedFileName}`);
+                        console.log(`🔍 [SEARCH] Normalized match: ${this.normalizeFileName(fileName) === normalizedFileName}`);
                     });
                     
                     const matchingFile = data.files.find(file => 
-                        file.name.normalize('NFC') === normalizedFileName
+                        this.normalizeFileName(fileName) === normalizedFileName
                     );
                     
                     if (matchingFile) {
