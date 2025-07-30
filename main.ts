@@ -3985,13 +3985,21 @@ export default class GDriveSyncPlugin extends Plugin {
         return files;
     }
 
-    // Google Drive 관련 메서드들
+    // Google Drive related methods
     async getOrCreateDriveFolder(): Promise<{id: string, name: string} | null> {
         try {
             console.log(`Looking for Google Drive folder: ${this.settings.driveFolder}`);
 
+            const params = new URLSearchParams({
+                q: `name='${this.settings.driveFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false and 'root' in parents`,
+                fields: 'files(id,name,driveId,parents)',
+                corpora: 'user',
+                supportsAllDrives: 'false',
+                includeItemsFromAllDrives: 'false'
+            });
+            
             const searchResponse = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files?q=name='${this.settings.driveFolder}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+                `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
                 { method: 'GET' }
             );
 
@@ -3999,10 +4007,27 @@ export default class GDriveSyncPlugin extends Plugin {
                 const searchData = searchResponse.json;
                 
                 if (searchData.files && searchData.files.length > 0) {
-                    const folder = searchData.files[0];
-                    console.log(`✓ Found existing folder: ${folder.name} (${folder.id})`);
-                    return { id: folder.id, name: folder.name };
+
+                    console.log('=== ALL FOUND FOLDERS ===');
+                    searchData.files.forEach((file, index) => {
+                        console.log(`${index + 1}. Name: ${file.name}`);
+                        console.log(`   ID: ${file.id}`);
+                        console.log(`   driveId: ${file.driveId || 'null (My Drive)'}`);
+                        console.log(`   parents: ${file.parents || 'null (No Parents)'}`);
+                        console.log(`   ---`);
+                    });
+
+                    // filtering my driver folders (except shared drive)
+                    const myDriveFolders = searchData.files.filter(file => !file.driveId);
+                    
+                    if (myDriveFolders.length > 0) {
+                        const folder = myDriveFolders[0];
+                        console.log(`✓ Found existing folder in my drive: ${folder.name} (${folder.id})`);
+                        return { id: folder.id, name: folder.name };
+                    }
                 }
+            } else {
+                console.log(`searchResponse : ${searchResponse.status}` )
             }
 
             console.log(`Creating new Google Drive folder: ${this.settings.driveFolder}`);
