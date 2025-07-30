@@ -3050,7 +3050,7 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log(`🔗 [RESOLVE] Input folderId: ${folderId}`);
             
             const response = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType,shortcutDetails`,
+                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType,shortcutDetails,capabilities&supportsAllDrives=true`,
                 { method: 'GET' }
             );
             
@@ -3062,26 +3062,65 @@ export default class GDriveSyncPlugin extends Plugin {
                     id: folderInfo.id,
                     name: folderInfo.name,
                     mimeType: folderInfo.mimeType,
-                    isShortcut: folderInfo.mimeType === 'application/vnd.google-apps.shortcut'
+                    isShortcut: folderInfo.mimeType === 'application/vnd.google-apps.shortcut',
+                    canAddChildren: folderInfo.capabilities?.canAddChildren
                 });
                 
                 if (folderInfo.mimeType === 'application/vnd.google-apps.shortcut' && 
                     folderInfo.shortcutDetails?.targetId) {
                     const targetId = folderInfo.shortcutDetails.targetId;
-                    console.log(`🔗 [RESOLVE] Shortcut resolved: ${folderId} → ${targetId}`);
-                    return targetId;
+                    console.log(`🔗 [RESOLVE] Shortcut detected, resolving target: ${folderId} → ${targetId}`);
+                    
+                    // 🔥 NEW: Get target folder capabilities
+                    const targetResponse = await this.makeAuthenticatedRequest(
+                        `https://www.googleapis.com/drive/v3/files/${targetId}?fields=id,name,mimeType,capabilities&supportsAllDrives=true`,
+                        { method: 'GET' }
+                    );
+                    
+                    if (targetResponse.status === 200) {
+                        const targetInfo = targetResponse.json;
+                        console.log(`🔗 [RESOLVE] Target info:`, {
+                            id: targetInfo.id,
+                            name: targetInfo.name,
+                            mimeType: targetInfo.mimeType,
+                            canAddChildren: targetInfo.capabilities?.canAddChildren
+                        });
+                        
+                        // 🔥 NEW: Verify target is a folder with proper permissions
+                        if (targetInfo.mimeType !== 'application/vnd.google-apps.folder') {
+                            console.warn(`⚠️ [RESOLVE] Shortcut target is not a folder: ${targetInfo.mimeType}`);
+                            return folderId; // Fallback to original ID
+                        }
+                        
+                        // 🔥 NEW: Check write permissions
+                        if (targetInfo.capabilities?.canAddChildren === false) {
+                            console.warn(`⚠️ [RESOLVE] No permission to add children to target folder: ${targetInfo.name}`);
+                            // Don't throw error here, let createFolderInDrive handle it
+                        }
+                        
+                        return targetId;
+                    } else {
+                        console.error(`❌ [RESOLVE] Failed to get target info: ${targetResponse.status}`);
+                        return folderId; // Fallback to original ID
+                    }
                 }
                 
-                console.log(`🔗 [RESOLVE] Not a shortcut, using original: ${folderId}`);
+                // 🔥 NEW: Check permissions for direct folders
+                if (folderInfo.mimeType === 'application/vnd.google-apps.folder' && 
+                    folderInfo.capabilities?.canAddChildren === false) {
+                    console.warn(`⚠️ [RESOLVE] No permission to add children to folder: ${folderInfo.name}`);
+                }
+                
+                console.log(`🔗 [RESOLVE] Using original folder ID: ${folderId}`);
                 return folderId;
             } else {
-                console.log(`❌ [RESOLVE] Failed to get folder info: ${response.status}`);
-                return folderId;
+                console.error(`❌ [RESOLVE] Failed to get folder info: ${response.status}`);
+                return folderId; // Fallback to original ID
             }
             
         } catch (error) {
             console.error(`❌ [RESOLVE] Error:`, error);
-            return folderId;
+            return folderId; // Fallback to original ID
         }
     }
 
@@ -3304,7 +3343,10 @@ export default class GDriveSyncPlugin extends Plugin {
         const pathParts = folderPath.split('/');
         let currentFolderId = rootFolderId;
         let currentPath = '';
-
+    
+        console.log(`📂 [NESTED] Creating nested folders for path: ${folderPath}`);
+        console.log(`📂 [NESTED] Starting from root folder: ${rootFolderId}`);
+    
         for (const folderName of pathParts) {
             if (!folderName) continue;
             
@@ -3313,26 +3355,42 @@ export default class GDriveSyncPlugin extends Plugin {
             // 캐시에서 먼저 확인
             if (this.folderCache[currentPath]) {
                 currentFolderId = this.folderCache[currentPath];
+                console.log(`🚀 [NESTED] Using cached folder: ${folderName} at ${currentPath} (${currentFolderId})`);
                 continue;
             }
+            
+            console.log(`📂 [NESTED] Processing folder: ${folderName} (path: ${currentPath})`);
             
             const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
             
             if (existingFolder) {
                 currentFolderId = existingFolder.id;
-                this.folderCache[currentPath] = currentFolderId; // 캐시에 저장
-                console.log(`✓ Found and cached existing folder: ${folderName} at ${currentPath}`);
+                this.folderCache[currentPath] = currentFolderId;
+                console.log(`✅ [NESTED] Found existing folder: ${folderName} at ${currentPath} (${currentFolderId})`);
             } else {
+                console.log(`📁 [NESTED] Creating new folder: ${folderName} in parent: ${currentFolderId}`);
+                
                 const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
                 if (!newFolder) {
-                    throw new Error(`Failed to create folder: ${folderName}`);
+                    // 🔥 NEW: Enhanced error with context
+                    const errorMsg = `Failed to create folder: ${folderName} in path: ${currentPath}`;
+                    console.error(`❌ [NESTED] ${errorMsg}`);
+                    console.error(`📋 [NESTED] Context:`, {
+                        fullPath: folderPath,
+                        failedAt: currentPath,
+                        parentFolderId: currentFolderId,
+                        rootFolderId
+                    });
+                    
+                    throw new Error(`${errorMsg}. This may be due to insufficient permissions on a shared folder.`);
                 }
                 currentFolderId = newFolder.id;
-                this.folderCache[currentPath] = currentFolderId; // 캐시에 저장
-                console.log(`📁 Created and cached folder: ${folderName} at ${currentPath}`);
+                this.folderCache[currentPath] = currentFolderId;
+                console.log(`📁 [NESTED] Created and cached folder: ${folderName} at ${currentPath} (${currentFolderId})`);
             }
         }
-
+    
+        console.log(`✅ [NESTED] Completed nested folder creation: ${folderPath} → ${currentFolderId}`);
         return currentFolderId;
     }
 
@@ -4410,8 +4468,26 @@ export default class GDriveSyncPlugin extends Plugin {
     }
     private async createFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
+            console.log(`📁 [CREATE] Creating folder "${folderName}" in parent: ${parentFolderId}`);
+            
+            // 🔥 NEW: Resolve parent folder ID and get detailed info
+            const resolvedParentId = await this.resolveToActualFolderId(parentFolderId);
+            
+            if (resolvedParentId !== parentFolderId) {
+                console.log(`📁 [CREATE] Resolved shortcut: ${parentFolderId} → ${resolvedParentId}`);
+            }
+            
+            // 🔥 NEW: Pre-check if folder already exists (avoid duplicate creation)
+            const existingFolder = await this.findFolderInDrive(folderName, resolvedParentId);
+            if (existingFolder) {
+                console.log(`📁 [CREATE] Folder already exists: ${folderName} (${existingFolder.id})`);
+                return { id: existingFolder.id, name: existingFolder.name };
+            }
+            
+            console.log(`📁 [CREATE] Creating new folder "${folderName}" in resolved parent: ${resolvedParentId}`);
+            
             const response = await this.makeAuthenticatedRequest(
-                'https://www.googleapis.com/drive/v3/files',
+                'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
                 {
                     method: 'POST',
                     headers: {
@@ -4420,21 +4496,70 @@ export default class GDriveSyncPlugin extends Plugin {
                     body: JSON.stringify({
                         name: folderName,
                         mimeType: 'application/vnd.google-apps.folder',
-                        parents: [parentFolderId]
+                        parents: [resolvedParentId]
                     })
                 }
             );
     
+            console.log(`📁 [CREATE] Response status: ${response.status}`);
+    
             if (response.status === 200 || response.status === 201) {
                 const folderData = response.json;
+                console.log(`✅ [CREATE] Successfully created: ${folderData.name} (${folderData.id})`);
                 return { id: folderData.id, name: folderData.name };
             } else {
-                console.error('Failed to create folder:', response.status, response.json);
+                // 🔥 NEW: Enhanced error logging and handling
+                const errorData = response.json || {};
+                console.error(`❌ [CREATE] Failed to create folder:`, {
+                    status: response.status,
+                    folderName,
+                    originalParentId: parentFolderId,
+                    resolvedParentId,
+                    error: errorData
+                });
+                
+                // 🔥 NEW: Provide specific error guidance
+                if (response.status === 403) {
+                    console.error(`❌ [CREATE] Permission denied - likely a shared folder access issue`);
+                    console.error(`💡 [CREATE] Suggestion: Check if you have "Editor" or "Manager" access to the shared folder`);
+                    
+                    // Try to get parent folder info for debugging
+                    try {
+                        const parentInfo = await this.makeAuthenticatedRequest(
+                            `https://www.googleapis.com/drive/v3/files/${resolvedParentId}?fields=id,name,capabilities,owners,permissions&supportsAllDrives=true`,
+                            { method: 'GET' }
+                        );
+                        
+                        if (parentInfo.status === 200) {
+                            const info = parentInfo.json;
+                            console.error(`📋 [CREATE] Parent folder details:`, {
+                                name: info.name,
+                                canAddChildren: info.capabilities?.canAddChildren,
+                                isOwner: info.owners?.[0]?.me || false
+                            });
+                        }
+                    } catch (debugError) {
+                        console.error(`❌ [CREATE] Could not get parent folder details:`, debugError);
+                    }
+                    
+                } else if (response.status === 404) {
+                    console.error(`❌ [CREATE] Parent folder not found: ${resolvedParentId}`);
+                    console.error(`💡 [CREATE] The shortcut may point to a deleted or inaccessible folder`);
+                } else if (response.status === 400) {
+                    console.error(`❌ [CREATE] Bad request - possibly invalid folder name or parent ID`);
+                }
+                
                 return null;
             }
         } catch (error) {
-            console.error('Error creating folder in Drive:', error);
-            throw error;
+            console.error(`❌ [CREATE] Exception creating folder "${folderName}":`, error);
+            
+            // 🔥 NEW: Enhanced error message for user
+            if (error.message?.includes('Permission denied') || error.message?.includes('403')) {
+                console.error(`💡 [CREATE] This is likely a shared folder permission issue. Ensure you have "Editor" access.`);
+            }
+            
+            return null;
         }
     }
     
