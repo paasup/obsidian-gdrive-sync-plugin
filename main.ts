@@ -2844,7 +2844,7 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log(`Uploading ${fileName} (${this.formatFileSize(content.byteLength)} → ${this.formatFileSize(body.length)})`);
     
             return await this.makeAuthenticatedRequest(
-                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,md5Checksum,version,size',
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true',
                 {
                     method: 'POST',
                     headers: {
@@ -2928,7 +2928,7 @@ export default class GDriveSyncPlugin extends Plugin {
             
             // Step 1: Create file metadata only
             const metadataResponse = await this.makeAuthenticatedRequest(
-                'https://www.googleapis.com/drive/v3/files',
+                'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2945,7 +2945,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
             // Step 2: Upload file content (without Base64 conversion)
             const contentResponse = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime,md5Checksum,version,size`,
+                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true`,
                 {
                     method: 'PATCH',
                     headers: { 
@@ -2981,7 +2981,7 @@ export default class GDriveSyncPlugin extends Plugin {
             content + close_delim;
     
         return await this.makeAuthenticatedRequest(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true',
             {
                 method: 'POST',
                 headers: {
@@ -2996,9 +2996,11 @@ export default class GDriveSyncPlugin extends Plugin {
     // Updated main file upload method
     private async uploadFileToDrive(fileName: string, content: string | ArrayBuffer, folderId: string, localModTime?: number): Promise<{success: boolean, fileData?: any}> {
         try {
+            const actualFolderId = await this.resolveToActualFolderId(folderId);
+
             const metadata = {
                 name: fileName,
-                parents: [folderId],
+                parents: [actualFolderId],
                 modifiedTime: localModTime ? new Date(localModTime).toISOString() : undefined
             };
 
@@ -3038,6 +3040,35 @@ export default class GDriveSyncPlugin extends Plugin {
             return { success: false };
         }
     }
+
+    private async resolveToActualFolderId(folderId: string): Promise<string> {
+        try {
+            // Query folder information
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,mimeType,shortcutDetails`,
+                { method: 'GET' }
+            );
+            
+            if (response.status === 200) {
+                const folderInfo = response.json;
+                
+                // If it's a Shortcut, return the actual target ID
+                if (folderInfo.mimeType === 'application/vnd.google-apps.shortcut' && 
+                    folderInfo.shortcutDetails?.targetId) {
+                    console.log(`🔗 Shortcut detected: ${folderId} → ${folderInfo.shortcutDetails.targetId}`);
+                    return folderInfo.shortcutDetails.targetId;
+                }
+            }
+            
+            // If not a Shortcut or conversion fails, return the original ID
+            return folderId;
+            
+        } catch (error) {
+            console.warn(`⚠️ Failed to resolve folder ID ${folderId}:`, error);
+            return folderId; // Use original ID on error
+        }
+    }
+
     // File size formatting utility
     private formatFileSize(bytes: number): string {
         if (bytes === 0) return '0 Bytes';
@@ -4374,8 +4405,10 @@ export default class GDriveSyncPlugin extends Plugin {
 
     private async findFileInDrive(fileName: string, folderId: string): Promise<any | null> {
         try {
+            const actualFolderId = await this.resolveToActualFolderId(folderId);
+            
             const params = new URLSearchParams({
-                q: `name='${fileName}' and '${folderId}' in parents and trashed=false`,
+                q: `name='${fileName}' and '${actualFolderId}' in parents and trashed=false`,
                 fields: 'files(id,name,modifiedTime,md5Checksum,version,size)', // 🔥 필요한 필드만 요청
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
@@ -4409,7 +4442,7 @@ export default class GDriveSyncPlugin extends Plugin {
             
             if (typeof content === 'string') {
                 contentResponse = await this.makeAuthenticatedRequest(
-                    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+                    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&supportsAllDrives=true`,
                     {
                         method: 'PATCH',
                         headers: { 'Content-Type': 'text/plain' },
@@ -4418,7 +4451,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 );
             } else {
                 contentResponse = await this.makeAuthenticatedRequest(
-                    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+                    `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&supportsAllDrives=true`,
                     {
                         method: 'PATCH',
                         headers: { 'Content-Type': 'application/octet-stream' },
@@ -4433,7 +4466,7 @@ export default class GDriveSyncPlugin extends Plugin {
 
             // 메타데이터 업데이트 및 최신 정보 가져오기
             const metadataResponse = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,modifiedTime,md5Checksum,version,size`,
+                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true`,
                 {
                     method: 'PATCH',
                     headers: { 'Content-Type': 'application/json' },
