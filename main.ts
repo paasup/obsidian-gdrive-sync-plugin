@@ -3043,29 +3043,41 @@ export default class GDriveSyncPlugin extends Plugin {
 
     private async resolveToActualFolderId(folderId: string): Promise<string> {
         try {
-            // Query folder information
+            console.log(`🔗 [RESOLVE] Input folderId: ${folderId}`);
+            
             const response = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,mimeType,shortcutDetails`,
+                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType,shortcutDetails`,
                 { method: 'GET' }
             );
             
+            console.log(`🔗 [RESOLVE] Response status: ${response.status}`);
+            
             if (response.status === 200) {
                 const folderInfo = response.json;
+                console.log(`🔗 [RESOLVE] Folder info:`, {
+                    id: folderInfo.id,
+                    name: folderInfo.name,
+                    mimeType: folderInfo.mimeType,
+                    isShortcut: folderInfo.mimeType === 'application/vnd.google-apps.shortcut'
+                });
                 
-                // If it's a Shortcut, return the actual target ID
                 if (folderInfo.mimeType === 'application/vnd.google-apps.shortcut' && 
                     folderInfo.shortcutDetails?.targetId) {
-                    console.log(`🔗 Shortcut detected: ${folderId} → ${folderInfo.shortcutDetails.targetId}`);
-                    return folderInfo.shortcutDetails.targetId;
+                    const targetId = folderInfo.shortcutDetails.targetId;
+                    console.log(`🔗 [RESOLVE] Shortcut resolved: ${folderId} → ${targetId}`);
+                    return targetId;
                 }
+                
+                console.log(`🔗 [RESOLVE] Not a shortcut, using original: ${folderId}`);
+                return folderId;
+            } else {
+                console.log(`❌ [RESOLVE] Failed to get folder info: ${response.status}`);
+                return folderId;
             }
             
-            // If not a Shortcut or conversion fails, return the original ID
-            return folderId;
-            
         } catch (error) {
-            console.warn(`⚠️ Failed to resolve folder ID ${folderId}:`, error);
-            return folderId; // Use original ID on error
+            console.error(`❌ [RESOLVE] Error:`, error);
+            return folderId;
         }
     }
 
@@ -4112,9 +4124,28 @@ export default class GDriveSyncPlugin extends Plugin {
             }
             
             // Check existing file using decision engine
+            console.log(`🔍 Searching for existing file: ${fileName} in folder: ${targetFolderId}`);
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
+
+            if (existingFile) {
+                console.log(`✅ Found existing file: ${existingFile.name} (ID: ${existingFile.id})`);
+                console.log(`📊 Existing file details:`, {
+                    id: existingFile.id,
+                    name: existingFile.name,
+                    modifiedTime: existingFile.modifiedTime,
+                    md5Checksum: existingFile.md5Checksum
+                });
+            } else {
+                console.log(`❌ No existing file found - will create new file`);
+            }
+
             const decision = await this.decideSyncAction(file, existingFile);
-            
+            console.log(`📋 Sync decision:`, {
+                shouldSync: decision.shouldSync,
+                action: decision.action,
+                reason: decision.reason
+            });
+
             if (!decision.shouldSync) {
                 return 'skipped';
             }
@@ -4402,34 +4433,62 @@ export default class GDriveSyncPlugin extends Plugin {
             throw error;
         }
     }
-
+    
     private async findFileInDrive(fileName: string, folderId: string): Promise<any | null> {
         try {
             const actualFolderId = await this.resolveToActualFolderId(folderId);
+            const normalizedFileName = fileName.normalize('NFC');
+            
+            console.log(`🔍 [SEARCH] fileName: "${normalizedFileName}"`);
+            console.log(`🔍 [SEARCH] folderId: ${actualFolderId}`);
             
             const params = new URLSearchParams({
-                q: `name='${fileName}' and '${actualFolderId}' in parents and trashed=false`,
-                fields: 'files(id,name,modifiedTime,md5Checksum,version,size)', // 🔥 필요한 필드만 요청
+                q: `name='${normalizedFileName}' and '${actualFolderId}' in parents and trashed=false`,
+                fields: 'files(id,name,modifiedTime,md5Checksum,version,size)',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
             });
+            
+            console.log(`🔍 [SEARCH] Query: ${params.get('q')}`);
             
             const response = await this.makeAuthenticatedRequest(
                 `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
                 { method: 'GET' }
             );
-
+    
+            console.log(`🔍 [SEARCH] Response status: ${response.status}`);
+            
             if (response.status === 200) {
                 const data = response.json;
+                console.log(`🔍 [SEARCH] Found ${data.files?.length || 0} files`);
+                
                 if (data.files && data.files.length > 0) {
-                    const file = data.files[0];
-                    console.log(`🔍 Found remote file: ${fileName}, hash: ${file.md5Checksum || 'none'}, modified: ${file.modifiedTime}`);
-                    return file;
+                    // 모든 검색 결과 로그
+                    data.files.forEach((file, index) => {
+                        console.log(`🔍 [SEARCH] Result ${index + 1}: "${file.name}" (${file.id})`);
+                        console.log(`🔍 [SEARCH] Normalized match: ${file.name.normalize('NFC') === normalizedFileName}`);
+                    });
+                    
+                    const matchingFile = data.files.find(file => 
+                        file.name.normalize('NFC') === normalizedFileName
+                    );
+                    
+                    if (matchingFile) {
+                        console.log(`✅ [SEARCH] MATCH FOUND: ${matchingFile.name} (${matchingFile.id})`);
+                        return matchingFile;
+                    } else {
+                        console.log(`❌ [SEARCH] NO EXACT MATCH despite ${data.files.length} results`);
+                    }
+                } else {
+                    console.log(`❌ [SEARCH] NO FILES FOUND in folder ${actualFolderId}`);
                 }
+            } else {
+                console.log(`❌ [SEARCH] API ERROR: ${response.status}`, response.json);
             }
+            
             return null;
         } catch (error) {
-            console.error('Error searching file in Drive:', error);
+            console.error('❌ [SEARCH] EXCEPTION:', error);
             throw error;
         }
     }
