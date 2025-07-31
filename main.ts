@@ -3704,11 +3704,13 @@ export default class GDriveSyncPlugin extends Plugin {
         existingLocalFile?: TFile
     ): Promise<void> {
         try {
-            console.log(`📥 Starting download: ${driveFile.name}`);
-
             // Download content
             const content = await this.getFileContentFromDrive(driveFile.id, driveFile.name);
             const remoteModTime = new Date(driveFile.modifiedTime).getTime();
+
+            const downloadedSize = content instanceof ArrayBuffer ? content.byteLength : content.length;
+            const expectedSize = parseInt(driveFile.size) || 0;
+            console.log(`📥 [ACTUAL_DOWNLOAD] ${driveFile.name} - Size validation: Expected(${expectedSize} bytes), Downloaded(${downloadedSize} ${content instanceof ArrayBuffer ? 'bytes' : 'characters'})`);
 
             // Create folder structure if needed
             const folderPath = filePath.substring(0, filePath.lastIndexOf('/'));
@@ -3740,9 +3742,7 @@ export default class GDriveSyncPlugin extends Plugin {
             if (updatedLocalFile) {
                 await this.updateFileStateAfterSync(filePath, updatedLocalFile, driveFile);
             }
-            
             result.downloaded++;
-            console.log(`✅ Download completed: ${driveFile.name}`);
 
         } catch (error) {
             console.error(`❌ Download failed for ${driveFile.name}:`, error);
@@ -4318,13 +4318,14 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    shouldSyncFileType(file: TFile): boolean {
-        // 텍스트 파일 확장자
-        const textExtensions = ['.md', '.txt', '.json', '.csv', '.html', '.css', '.js'];
-        
-        // 바이너리 파일 확장자 (Obsidian에서 일반적으로 사용되는 것들)
-        const binaryExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.png', '.jpg', '.jpeg', '.gif', '.webp'];
-        
+
+    // 텍스트 파일 확장자
+    private textExtensions = ['.md', '.txt', '.json', '.csv', '.html', '.css', '.js'];
+    
+    // 바이너리 파일 확장자 (Obsidian에서 일반적으로 사용되는 것들)
+    private binaryExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.hwp', '.hwpx'];
+    
+    shouldSyncFileType(file: TFile): boolean { 
         const excludePatterns = [
             /^\./, // 숨김 파일
             /\.tmp$/, // 임시 파일
@@ -4332,19 +4333,18 @@ export default class GDriveSyncPlugin extends Plugin {
             /\.lock$/, // 락 파일
         ];
     
-        const hasValidExtension = [...textExtensions, ...binaryExtensions].some(ext => file.name.endsWith(ext));
+        const hasValidExtension = [...this.textExtensions, ...this.binaryExtensions].some(ext => file.name.endsWith(ext));
         const shouldExclude = excludePatterns.some(pattern => pattern.test(file.name));
     
         return hasValidExtension && !shouldExclude;
     }
+
     private isTextFile(fileName: string): boolean {
-        const textExtensions = ['.md', '.txt', '.json', '.csv', '.html', '.css', '.js'];
-        return textExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
+        return this.textExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
     }
     
     private isBinaryFile(fileName: string): boolean {
-        const binaryExtensions = ['.pdf', '.docx', '.pptx', '.xlsx', '.png', '.jpg', '.jpeg', '.gif', '.webp'];
-        return binaryExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
+        return this.binaryExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
     }
 
     private async getFileContentFromDrive(fileId: string, fileName?: string): Promise<string | ArrayBuffer> {
