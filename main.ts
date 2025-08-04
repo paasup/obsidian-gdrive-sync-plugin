@@ -284,6 +284,7 @@ class DriveFolderModal extends Modal {
         this.onChoose = onChoose;
     }
 
+
     async onOpen() {
         const { contentEl } = this;
         contentEl.empty();
@@ -773,6 +774,8 @@ class DriveFolderModal extends Modal {
     onClose() {
         const { contentEl } = this;
         contentEl.empty();
+
+        this.plugin.notifySettingsChanged(); 
     }
 }
 
