@@ -2819,49 +2819,55 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    private async uploadBinaryFileToDriveStandard(fileName: string, content: ArrayBuffer, folderId: string, metadata: any): Promise<any> {
+    private async uploadBinaryFileSimple(
+        fileName: string, 
+        content: ArrayBuffer, 
+        parentFolderId: string, 
+        metadata: any
+    ): Promise<any> {
         try {
-            const boundary = '-------314159265358979323846';
-            const delimiter = "\r\n--" + boundary + "\r\n";
-            const close_delim = "\r\n--" + boundary + "--";
-    
-            const uint8Content = new Uint8Array(content);
+            console.log(`📤 Simple upload starting for: ${fileName}`);
             
-            // FIX: Use chunked approach instead of spread operator to avoid stack overflow
-            let base64Content: string;
-            const CHUNK_SIZE = 8192; // 8KB chunks (safe size)
-            
-            if (uint8Content.length > CHUNK_SIZE) {
-                console.log(`Large binary file (${this.formatFileSize(content.byteLength)}) - using safe chunked conversion`);
-                base64Content = await this.convertToBase64Safe(uint8Content);
-            } else {
-                // Use existing method for small files
-                base64Content = btoa(String.fromCharCode(...uint8Content));
-            }
-            
-            const metadataJson = JSON.stringify(metadata);
-            
-            const body = delimiter +
-                'Content-Type: application/json\r\n\r\n' +
-                metadataJson + delimiter +
-                'Content-Type: application/octet-stream\r\n' +
-                'Content-Transfer-Encoding: base64\r\n\r\n' +
-                base64Content + close_delim;
-    
-            console.log(`Uploading ${fileName} (${this.formatFileSize(content.byteLength)} → ${this.formatFileSize(body.length)})`);
-    
-            return await this.makeAuthenticatedRequest(
-                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true',
+            // Step 1: Create file metadata first
+            const metadataResponse = await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
                 {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': `multipart/related; boundary="${boundary}"`
-                    },
-                    body: body
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(metadata)
                 }
             );
+    
+            if (metadataResponse.status !== 200 && metadataResponse.status !== 201) {
+                console.error(`❌ Metadata creation failed:`, metadataResponse.status, metadataResponse.json);
+                throw new Error(`File metadata creation failed: ${metadataResponse.status}`);
+            }
+    
+            const fileId = metadataResponse.json.id;
+            console.log(`✅ Step 1/2: Metadata created (ID: ${fileId})`);
+    
+            // Step 2: Upload binary content directly (no Base64!)
+            const contentResponse = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true`,
+                {
+                    method: 'PATCH',
+                    headers: { 
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: content // Direct ArrayBuffer - no conversion, no encoding!
+                }
+            );
+    
+            if (contentResponse.status === 200 || contentResponse.status === 201) {
+                console.log(`✅ Step 2/2: Content uploaded successfully`);
+                return contentResponse;
+            } else {
+                console.error(`❌ Content upload failed:`, contentResponse.status, contentResponse.json);
+                throw new Error(`Content upload failed: ${contentResponse.status}`);
+            }
+    
         } catch (error) {
-            console.error(`Binary file upload error for ${fileName}:`, error);
+            console.error(`❌ Simple upload failed for ${fileName}:`, error);
             throw error;
         }
     }
@@ -2976,77 +2982,92 @@ export default class GDriveSyncPlugin extends Plugin {
     }   
 
 
-    private async uploadTextFileToDriveStandard(fileName: string, content: string, folderId: string, metadata: any) {
-        const boundary = '-------314159265358979323846';
-        const delimiter = "\r\n--" + boundary + "\r\n";
-        const close_delim = "\r\n--" + boundary + "--";
+    private async uploadTextFileToDriveMultipart(
+        fileName: string, 
+        content: string, 
+        parentFolderId: string, 
+        metadata: any
+    ): Promise<any> {
+        try {
+            const boundary = '-------314159265358979323846';
+            const delimiter = "\r\n--" + boundary + "\r\n";
+            const close_delim = "\r\n--" + boundary + "--";
     
-        const body = delimiter +
-            'Content-Type: application/json\r\n\r\n' +
-            JSON.stringify(metadata) + delimiter +
-            'Content-Type: text/plain\r\n\r\n' +
-            content + close_delim;
+            const body = delimiter +
+                'Content-Type: application/json\r\n\r\n' +
+                JSON.stringify(metadata) + delimiter +
+                'Content-Type: text/plain; charset=UTF-8\r\n\r\n' +  // Added UTF-8
+                content + close_delim;
     
-        return await this.makeAuthenticatedRequest(
-            'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': `multipart/related; boundary="${boundary}"`
-                },
-                body: body
-            }
-        );
+            console.log(`📝 Uploading text file: ${fileName} (${this.formatFileSize(body.length)})`);
+    
+            return await this.makeAuthenticatedRequest(
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true',
+                {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': `multipart/related; boundary="${boundary}"`
+                    },
+                    body: body
+                }
+            );
+        } catch (error) {
+            console.error(`Text file upload error for ${fileName}:`, error);
+            throw error;
+        }
     }
     
 
     // Updated main file upload method
-    private async uploadFileToDrive(fileName: string, content: string | ArrayBuffer, folderId: string, localModTime?: number): Promise<{success: boolean, fileData?: any}> {
+    private async uploadFileToDrive(
+        fileName: string, 
+        content: string | ArrayBuffer, 
+        folderId: string, 
+        localModTime?: number
+    ): Promise<{success: boolean, fileData?: any}> {
         try {
             const actualFolderId = await this.resolveToActualFolderId(folderId);
-
+    
             const metadata = {
                 name: fileName,
                 parents: [actualFolderId],
                 modifiedTime: localModTime ? new Date(localModTime).toISOString() : undefined
             };
-
+    
             let uploadResponse;
-
+    
             if (this.isBinaryFile(fileName)) {
+                // 🔥 ALL binary files use Simple Upload - no Base64, no size threshold!
                 const binaryContent = content instanceof ArrayBuffer ? content : new TextEncoder().encode(content as string).buffer;
-                const fileSize = binaryContent.byteLength;
+                console.log(`📤 Binary file: ${fileName} (${this.formatFileSize(binaryContent.byteLength)}) - using Simple Upload`);
+                uploadResponse = await this.uploadBinaryFileSimple(fileName, binaryContent, actualFolderId, metadata);
                 
-                console.log(`Uploading binary file: ${fileName} (${this.formatFileSize(fileSize)})`);
-                
-                // Upload strategy based on file size
-                if (fileSize > 100 * 1024) { // Files larger than 100KB
-                    console.log(`Large binary file detected - using simple upload`);
-                    uploadResponse = await this.uploadLargeFileSimple(fileName, binaryContent, folderId, metadata);
-                } else {
-                    console.log(`Small binary file - using multipart upload`);
-                    uploadResponse = await this.uploadBinaryFileToDriveStandard(fileName, binaryContent, folderId, metadata);
-                }
             } else {
-                // Text files
-                uploadResponse = await this.uploadTextFileToDriveStandard(fileName, content as string, folderId, metadata);
+                // Text files still use multipart (efficient for small text)
+                console.log(`📝 Text file: ${fileName} - using multipart upload`);
+                uploadResponse = await this.uploadTextFileToDriveMultipart(fileName, content as string, actualFolderId, metadata);
             }
-
+    
             const success = uploadResponse.status === 200 || uploadResponse.status === 201;
             
             if (success) {
                 const fileData = uploadResponse.json;
-                console.log(`${fileName}: Upload successful`);
+                console.log(`✅ ${fileName}: Upload successful`);
                 return { success: true, fileData: fileData };
             } else {
-                console.error(`${fileName}: Upload failed - Status: ${uploadResponse.status}`);
+                console.error(`❌ ${fileName}: Upload failed - Status: ${uploadResponse.status}`);
+                if (uploadResponse.json) {
+                    console.error(`Response details:`, uploadResponse.json);
+                }
                 return { success: false };
             }
+            
         } catch (error) {
-            console.error(`${fileName}: Upload error - ${error.message}`);
+            console.error(`❌ ${fileName}: Upload error - ${error.message}`);
             return { success: false };
         }
     }
+
 
     private async resolveToActualFolderId(folderId: string): Promise<string> {
         try {
@@ -4638,21 +4659,26 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
 
-    private async updateFileInDrive(fileId: string, content: string | ArrayBuffer, localModTime: number): Promise<{success: boolean, fileData?: any}> {
+    private async updateFileInDrive(
+        fileId: string, 
+        content: string | ArrayBuffer, 
+        localModTime: number
+    ): Promise<{success: boolean, fileData?: any}> {
         try {
-            // 파일 내용 업데이트
             let contentResponse;
             
             if (typeof content === 'string') {
+                // Text file - direct upload
                 contentResponse = await this.makeAuthenticatedRequest(
                     `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&supportsAllDrives=true`,
                     {
                         method: 'PATCH',
-                        headers: { 'Content-Type': 'text/plain' },
+                        headers: { 'Content-Type': 'text/plain; charset=UTF-8' },
                         body: content
                     }
                 );
             } else {
+                // Binary file - direct upload (no Base64!)
                 contentResponse = await this.makeAuthenticatedRequest(
                     `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&supportsAllDrives=true`,
                     {
@@ -4662,12 +4688,13 @@ export default class GDriveSyncPlugin extends Plugin {
                     }
                 );
             }
-
+    
             if (contentResponse.status !== 200) {
+                console.error(`❌ Content update failed:`, contentResponse.status);
                 return { success: false };
             }
-
-            // 메타데이터 업데이트 및 최신 정보 가져오기
+    
+            // Update metadata (modified time)
             const metadataResponse = await this.makeAuthenticatedRequest(
                 `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true`,
                 {
@@ -4678,18 +4705,19 @@ export default class GDriveSyncPlugin extends Plugin {
                     })
                 }
             );
-
+    
             const success = metadataResponse.status === 200;
             
             if (success) {
                 const fileData = metadataResponse.json;
-                console.log(`🔄 File updated with hash ${fileData.md5Checksum || 'none'} at ${new Date(localModTime).toLocaleString()}`);
+                console.log(`✅ File updated: ${fileData.name} (hash: ${fileData.md5Checksum || 'N/A'})`);
                 return { success: true, fileData: fileData };
             }
             
             return { success: false };
+            
         } catch (error) {
-            console.error(`❌ Update failed - ${error.message}`);
+            console.error(`❌ Update failed:`, error.message);
             return { success: false };
         }
     }
