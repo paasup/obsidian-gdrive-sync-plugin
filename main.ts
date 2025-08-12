@@ -8,7 +8,7 @@
  * 
  */
 
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent, Menu } from 'obsidian';
 import * as crypto from 'crypto';
 
 interface GDriveSyncSettings {
@@ -50,6 +50,22 @@ interface SyncDecision {
     localHash?: string;
     remoteHash?: string;
     details?: any;
+}
+
+// Phase 1: 기본 동시 작업 구현
+// 1. 동시 작업 인터페이스
+interface SyncOperation {
+    success: boolean;
+    error?: string;
+    localReverted?: boolean;
+}
+
+interface SyncOperationContext {
+    file: TFile | TFolder;
+    originalPath: string;
+    targetPath?: string;
+    targetName?: string;
+    operationType: 'rename' | 'delete' | 'move';
 }
 
 const DEFAULT_SETTINGS: GDriveSyncSettings = {
@@ -1367,16 +1383,16 @@ export default class GDriveSyncPlugin extends Plugin {
         });
         ribbonIconEl.addClass('gdrive-sync-ribbon-class');
         
-        // 상태바 아이템 추가
+        // Add status bar sync indicator
         this.addStatusBarSync();
         
-        // 파일 메뉴에 동기화 옵션 추가
+        // Add file menu items for sync operations
         this.addFileMenuItems();
 
-        // 폴더 우클릭 메뉴 - 조건부 표시
+        // Add folder context menu with conditional display
         this.addFolderContextMenu();
 
-        // Commands 추가
+        // Commands 
         this.addCommand({
             id: 'sync-with-gdrive',
             name: 'Sync with Google Drive',
@@ -1401,7 +1417,7 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
     
-        // Auto Sync 디버그 명령어 추가
+        // Add auto sync debug command
         this.addCommand({
             id: 'debug-auto-sync',
             name: 'Debug Auto Sync Status',
@@ -1410,17 +1426,18 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
 
-        // 단축키 추가
+        // Add hotkey
         this.addCommand({
             id: 'quick-sync-gdrive',
             name: 'Quick Sync with Google Drive',
             hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'S' }], // Ctrl+Shift+S
             callback: () => {
-                this.mainSync(true); // 진행률 표시와 함께
+                this.mainSync(true); // Show progress
             }
         });
 
-        // 현재 파일만 동기화
+
+        // Sync current file only
         this.addCommand({
             id: 'sync-current-file',
             name: 'Sync Current File to Google Drive',
@@ -1434,16 +1451,21 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         });
 
-        // 파일 변경 감지 및 자동 동기화 설정
+        // Setup file change detection and auto sync
         this.setupFileChangeDetection();
 
         this.settingTab = new GDriveSyncSettingTab(this.app, this);
         this.addSettingTab(this.settingTab);
-    
+
         console.log('Plugin loaded - Google Drive folder-based sync');
+        
+        // Add concurrent operation context menus
+        this.addSyncContextMenus();
+        
+        console.log('Phase 1: Sync operations context menus loaded');
         console.log(`Initial auto sync setting: ${this.settings.autoSync}`);
-    
-        // Auto Sync 초기 설정
+
+        // Initialize auto sync
         if (this.settings.autoSync) {
             console.log('Initializing auto sync on plugin load...');
             this.setupAutoSync();
@@ -1452,6 +1474,936 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
+    private addSyncContextMenus(): void {
+        // Keep basic sync operation context menus, 
+        // but avoid duplication with existing file/folder menus
+        this.registerEvent(
+            this.app.workspace.on('file-menu', (menu, file) => {
+                if (file instanceof TFile && this.shouldSyncFileType(file)) {
+                    if (this.isFileInSyncScope(file)) {
+                        // Add only basic single file sync menu (prevent duplication)
+                        menu.addItem((item) => {
+                            item
+                                .setTitle('Sync File to Drive')
+                                .setIcon('cloud')
+                                .onClick(async () => {
+                                    await this.syncSingleFile(file);
+                                });
+                        });
+                    }
+                } else if (file instanceof TFolder) {
+                    if (this.isFolderInSyncScope(file)) {
+                        // Add only basic folder sync menu (prevent duplication)
+                        menu.addItem((item) => {
+                            item
+                                .setTitle('Sync Folder to Drive')
+                                .setIcon('cloud')
+                                .onClick(async () => {
+                                    await this.syncFolderToGoogleDrive(file);
+                                });
+                        });
+                    }
+                }
+            })
+        );
+     }
+     
+
+    private isFileInSyncScope(file: TFile): boolean {
+        if (!this.isAuthenticated()) return false;
+        
+        if (this.settings.syncWholeVault) return true;
+        
+        const fileFolder = file.parent?.path || '';
+        return this.isFolderSelectedForSync(fileFolder);
+    }
+
+    private isFolderInSyncScope(folder: TFolder): boolean {
+        if (!this.isAuthenticated()) return false;
+        
+        if (this.settings.syncWholeVault) return true;
+        
+        return this.isFolderSelectedForSync(folder.path);
+    }
+
+    private addFileContextMenuItems(menu: Menu, file: TFile): void {
+        menu.addSeparator();
+        
+        menu.addItem((item) => {
+            item
+                .setTitle('Rename in Drive')
+                .setIcon('edit')
+                .onClick(() => this.showRenameDialog(file));
+        });
+
+        menu.addItem((item) => {
+            item
+                .setTitle('Delete from Drive')
+                .setIcon('trash')
+                .onClick(() => this.confirmAndDeleteFile(file));
+        });
+
+        menu.addItem((item) => {
+            item
+                .setTitle('Move in Drive')
+                .setIcon('folder')
+                .onClick(() => this.showMoveDialog(file));
+        });
+    }
+
+    private addFolderContextMenuItems(menu: Menu, folder: TFolder): void {
+        menu.addSeparator();
+        
+        menu.addItem((item) => {
+            item
+                .setTitle('Rename Folder in Drive')
+                .setIcon('edit')
+                .onClick(() => this.showRenameFolderDialog(folder));
+        });
+
+        menu.addItem((item) => {
+            item
+                .setTitle('Delete Folder from Drive')
+                .setIcon('trash')
+                .onClick(() => this.confirmAndDeleteFolder(folder));
+        });
+
+        menu.addItem((item) => {
+            item
+                .setTitle('Move Folder in Drive')
+                .setIcon('folder')
+                .onClick(() => this.showMoveFolderDialog(folder));
+        });
+    }
+
+    private async showRenameDialog(file: TFile): Promise<void> {
+        const modal = new RenameModal(this.app, file.name, async (newName: string) => {
+            if (newName && newName !== file.name) {
+                await this.performSyncRename(file, newName);
+            }
+        });
+        modal.open();
+    }
+
+    private async showRenameFolderDialog(folder: TFolder): Promise<void> {
+        const modal = new RenameModal(this.app, folder.name, async (newName: string) => {
+            if (newName && newName !== folder.name) {
+                await this.performSyncRenameFolder(folder, newName);
+            }
+        });
+        modal.open();
+    }
+
+    private async removeFolderStateAfterDelete(folderPath: string): Promise<void> {
+        let removedCount = 0;
+        
+        // 폴더 내 모든 파일의 상태 캐시 제거
+        for (const filePath of Object.keys(this.settings.fileStateCache)) {
+            if (filePath.startsWith(folderPath + '/') || filePath === folderPath) {
+                delete this.settings.fileStateCache[filePath];
+                removedCount++;
+            }
+        }
+        
+        await this.saveSettings();
+        console.log(`[STATE] Folder state removed: ${folderPath} (${removedCount} files affected)`);
+    }
+    private async validateDeleteFolderOperation(folder: TFolder): Promise<void> {
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+        
+        // 폴더 존재 확인
+        if (!await this.app.vault.adapter.exists(folder.path)) {
+            throw new Error('Folder no longer exists locally');
+        }
+    }
+    private async deleteDriveFolder(folderPath: string): Promise<void> {
+        try {
+            const driveFolder = await this.findDriveFolderByPath(folderPath);
+            if (!driveFolder) {
+                console.warn(`Folder not found in Drive for deletion: ${folderPath}`);
+                return; // 폴더가 없으면 이미 삭제된 것으로 간주
+            }
+
+            // ✅ Check folder delete permission
+            const hasDeletePermission = await this.checkFolderDeletePermission(driveFolder.id);
+            if (!hasDeletePermission) {
+                throw new Error(`Permission denied: You don't have permission to delete folder "${driveFolder.name}". This folder may be owned by someone else or you may only have read access.`);
+            }
+            
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFolder.id}?supportsAllDrives=true`,
+                { method: 'DELETE' }
+            );
+            
+            if (response.status !== 204 && response.status !== 200) {
+                throw new Error(`Drive folder delete failed: ${response.status}`);
+            }
+            
+            console.log(`✅ Drive folder deleted: ${driveFolder.name}`);
+            
+        } catch (error) {
+            console.error('Drive folder delete error:', error);
+            throw new Error(`Failed to delete folder from Google Drive: ${error.message}`);
+        }
+    }  
+      
+    private async checkFolderDeletePermission(folderId: string): Promise<boolean> {
+        try {
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=capabilities&supportsAllDrives=true`,
+                { method: 'GET' }
+            );
+            
+            if (response.status !== 200) {
+                return false;
+            }
+            
+            const folderDetails = response.json;
+            const capabilities = folderDetails.capabilities || {};
+            
+            return capabilities.canDelete === true || capabilities.canMoveToTrash === true;
+            
+        } catch (error) {
+            console.error('Error checking folder delete permission:', error);
+            return false;
+        }
+    }
+
+    private async findDriveFolderByPath(folderPath: string): Promise<any | null> {
+        try {
+            if (!folderPath.includes('/')) {
+                const selectedFolder = this.settings.selectedDriveFolders.find(f => f.path === folderPath);
+                if (selectedFolder) {
+                    return await this.findFolderInDrive(selectedFolder.name);
+                }
+            }
+
+            let targetFolderId: string;
+            let folderName: string;
+            
+            if (this.settings.syncWholeVault) {
+                const rootFolder = await this.getOrCreateDriveFolder();
+                if (!rootFolder) return null;
+                
+                if (folderPath.includes('/')) {
+                    const pathParts = folderPath.split('/');
+                    folderName = pathParts.pop()!;
+                    const parentPath = pathParts.join('/');
+                    targetFolderId = await this.getCachedFolderId(parentPath, rootFolder.id);
+                } else {
+                    folderName = folderPath;
+                    targetFolderId = rootFolder.id;
+                }
+            } else {
+                // Find in selected folders
+                const selectedFolder = this.findContainingSelectedFolder(folderPath);
+                if (!selectedFolder) return null;
+                
+                const relativePath = this.getRelativePath(folderPath, selectedFolder.path);
+                if (relativePath.includes('/')) {
+                    const pathParts = relativePath.split('/');
+                    folderName = pathParts.pop()!;
+                    const parentPath = pathParts.join('/');
+                    targetFolderId = await this.getCachedFolderId(parentPath, selectedFolder.id);
+                } else {
+                    folderName = relativePath;
+                    targetFolderId = selectedFolder.id;
+                }
+            }
+            
+            return await this.findFolderInDrive(folderName, targetFolderId);
+            
+        } catch (error) {
+            console.error(`Error finding Drive folder for ${folderPath}:`, error);
+            return null;
+        }
+    }    
+    private async confirmAndDeleteFile(file: TFile): Promise<void> {
+        const confirmed = await this.showDeleteConfirmation(
+            `Delete "${file.name}" from both local vault and Google Drive?`,
+            'This action cannot be undone. The file will be moved to Drive\'s trash.'
+        );
+        
+        if (confirmed) {
+            await this.performSyncDelete(file);
+        }
+    }
+    private async performSyncDelete(file: TFile): Promise<void> {
+        const context: SyncOperationContext = {
+            file,
+            originalPath: file.path,
+            operationType: 'delete'
+        };
+
+        const progressNotice = new Notice(`🗑️ Deleting "${file.name}" from local and Drive...`, 0);
+
+        try {
+            console.log(`[SYNC_DELETE] Starting delete: ${file.name}`);
+            
+            // Phase 1: Validation
+            await this.validateDeleteOperation(file);
+            
+            // Phase 2: Drive delete (먼저 원격 삭제)
+            await this.deleteDriveFile(file.path);
+            console.log(`[SYNC_DELETE] Drive delete completed`);
+            
+            // Phase 3: Local delete
+            await this.app.vault.delete(file);
+            console.log(`[SYNC_DELETE] Local delete completed`);
+            
+            // Phase 4: Update state
+            await this.removeFileStateAfterDelete(context.originalPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Deleted "${file.name}" from both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_DELETE] Error:`, error);
+            progressNotice.hide();
+            
+            // Show error (no rollback for delete)
+            new Notice(`❌ Failed to delete "${file.name}": ${error.message}`);
+        }
+    }    
+    private async removeFileStateAfterDelete(filePath: string): Promise<void> {
+        // 파일 상태 캐시에서 제거
+        const normalizedPath = this.normalizeFullPath(filePath);
+        if (this.settings.fileStateCache[normalizedPath]) {
+            delete this.settings.fileStateCache[normalizedPath];
+            await this.saveSettings();
+            console.log(`[STATE] File state removed: ${filePath}`);
+        }
+    }    
+    private async deleteDriveFile(filePath: string): Promise<void> {
+        try {
+            const driveFile = await this.findDriveFileByPath(filePath);
+            if (!driveFile) {
+                console.warn(`File not found in Drive for deletion: ${filePath}`);
+                return; // 파일이 없으면 이미 삭제된 것으로 간주
+            }
+            
+            // ✅ Check file permissions before attempting delete
+            const hasDeletePermission = await this.checkDeletePermission(driveFile.id);
+            if (!hasDeletePermission) {
+                throw new Error(`Permission denied: You don't have permission to delete "${driveFile.name}". This file may be owned by someone else or you may only have read/comment access.`);
+            }
+
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFile.id}?supportsAllDrives=true`,
+                { method: 'DELETE' }
+            );
+            
+            if (response.status !== 204 && response.status !== 200) {
+                throw new Error(`Drive delete failed: ${response.status}`);
+            }
+            
+            console.log(`✅ Drive file deleted: ${driveFile.name}`);
+            
+        } catch (error) {
+            console.error('Drive delete error:', error);
+            throw new Error(`Failed to delete file from Google Drive: ${error.message}`);
+        }
+    }
+    private async checkDeletePermission(fileId: string): Promise<boolean> {
+        try {
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=capabilities&supportsAllDrives=true`,
+                { method: 'GET' }
+            );
+            
+            if (response.status !== 200) {
+                return false;
+            }
+            
+            const fileDetails = response.json;
+            const capabilities = fileDetails.capabilities || {};
+            
+            return capabilities.canDelete === true || capabilities.canMoveToTrash === true;
+            
+        } catch (error) {
+            console.error('Error checking delete permission:', error);
+            return false;
+        }
+    }
+    private async validateDeleteOperation(file: TFile): Promise<void> {
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+        
+        // 파일 존재 확인
+        if (!await this.app.vault.adapter.exists(file.path)) {
+            throw new Error('File no longer exists locally');
+        }
+    }
+    private async performSyncDeleteFolder(folder: TFolder): Promise<void> {
+        const context: SyncOperationContext = {
+            file: folder,
+            originalPath: folder.path,
+            operationType: 'delete'
+        };
+
+        const progressNotice = new Notice(`🗑️ Deleting folder "${folder.name}" from local and Drive...`, 0);
+
+        try {
+            console.log(`[SYNC_DELETE_FOLDER] Starting: ${folder.name}`);
+            
+            // Phase 1: Validation
+            await this.validateDeleteFolderOperation(folder);
+            
+            // Phase 2: Drive delete (먼저 원격 삭제)
+            await this.deleteDriveFolder(folder.path);
+            console.log(`[SYNC_DELETE_FOLDER] Drive delete completed`);
+            
+            // Phase 3: Local delete
+            await this.app.vault.delete(folder);
+            console.log(`[SYNC_DELETE_FOLDER] Local delete completed`);
+            
+            // Phase 4: Update state
+            await this.removeFolderStateAfterDelete(context.originalPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Deleted folder "${folder.name}" from both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_DELETE_FOLDER] Error:`, error);
+            progressNotice.hide();
+            
+            new Notice(`❌ Failed to delete folder "${folder.name}": ${error.message}`);
+        }
+    }
+    private async showDeleteConfirmation(title: string, description: string): Promise<boolean> {
+        return new Promise((resolve) => {
+            const modal = new ConfirmDeleteModal(this.app, title, description, resolve);
+            modal.open();
+        });
+    }
+    private async confirmAndDeleteFolder(folder: TFolder): Promise<void> {
+        const fileCount = await this.countFilesInFolder(folder);
+        const confirmed = await this.showDeleteConfirmation(
+            `Delete folder "${folder.name}" and ${fileCount} files from both local vault and Google Drive?`,
+            'This action cannot be undone. All files will be moved to Drive\'s trash.'
+        );
+        
+        if (confirmed) {
+            await this.performSyncDeleteFolder(folder);
+        }
+    }    
+    private async countFilesInFolder(folder: TFolder): Promise<number> {
+        const files = await this.collectFilesToSync(folder, true);
+        return files.length;
+    }    
+
+    private async showMoveDialog(file: TFile): Promise<void> {
+        const modal = new MoveFileModal(this.app, this, async (targetPath: string) => {
+            if (targetPath && targetPath !== file.parent?.path) {
+                await this.performSyncMove(file, targetPath);
+            }
+        });
+        modal.open();
+    }
+
+    private async performSyncMove(file: TFile, targetFolderPath: string): Promise<void> {
+        const newPath = `${targetFolderPath}/${file.name}`;
+        const context: SyncOperationContext = {
+            file,
+            originalPath: file.path,
+            targetPath: newPath,
+            operationType: 'move'
+        };
+
+        const progressNotice = new Notice(`📁 Moving "${file.name}" to "${targetFolderPath}"...`, 0);
+
+        try {
+            console.log(`[SYNC_MOVE] Starting move: ${file.path} → ${newPath}`);
+            
+            // Phase 1: Validation
+            await this.validateMoveOperation(file, targetFolderPath);
+            
+            // Phase 2: Drive move
+            await this.moveDriveFile(context.originalPath, targetFolderPath);
+            console.log(`[SYNC_MOVE] Drive move completed`);
+            
+            // Phase 3: Local move
+            await this.app.vault.rename(file, newPath);
+            console.log(`[SYNC_MOVE] Local move completed: ${newPath}`);
+  
+            // Phase 4: Update state
+            await this.updateFileStateAfterMove(context.originalPath, newPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Moved "${file.name}" to "${targetFolderPath}" in both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_MOVE] Error:`, error);
+            progressNotice.hide();
+            
+            // Rollback if needed
+            await this.rollbackMove(context, error);
+        }
+    }    
+    private async rollbackMove(context: SyncOperationContext, error: Error): Promise<void> {
+        console.log(`[ROLLBACK] Attempting to rollback move operation`);
+        
+        try {
+            // Check if local file was moved (exists at target path)
+            const currentFile = this.app.vault.getAbstractFileByPath(context.targetPath!);
+            if (currentFile) {
+                // File was moved locally, move it back
+                await this.app.vault.rename(currentFile, context.originalPath);
+                console.log(`[ROLLBACK] Successfully reverted local move`);
+            }
+            
+            new Notice(`❌ Sync move failed: ${error.message} (Local changes reverted)`);
+            
+        } catch (rollbackError) {
+            console.error(`[ROLLBACK] Failed to rollback move:`, rollbackError);
+            new Notice(`❌ Sync move failed AND rollback failed. Manual intervention needed.`);
+        }
+    }    
+    private async updateFileStateAfterMove(oldPath: string, newPath: string): Promise<void> {
+        // 이동은 이름 변경과 동일한 처리
+        await this.updateFileStateAfterRename(oldPath, newPath);
+    }
+    private async updateFileStateAfterRename(oldPath: string, newPath: string): Promise<void> {
+        // 파일 상태 캐시에서 경로 업데이트
+        const oldState = this.getFileState(oldPath);
+        if (oldState) {
+            this.setFileState(newPath, oldState);
+            delete this.settings.fileStateCache[this.normalizeFullPath(oldPath)];
+        }
+        
+        await this.saveSettings();
+        console.log(`[STATE] File state updated: ${oldPath} → ${newPath}`);
+    }    
+    private async validateMoveOperation(file: TFile, targetFolderPath: string): Promise<void> {
+        // 대상 폴더 존재 확인
+        const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath);
+        if (!targetFolder || !(targetFolder instanceof TFolder)) {
+            throw new Error(`Target folder "${targetFolderPath}" does not exist`);
+        }
+        
+        // 순환 이동 방지 (파일에는 해당 없음)
+        
+        // 중복 파일명 검사
+        const newPath = `${targetFolderPath}/${file.name}`;
+        const existingFile = this.app.vault.getAbstractFileByPath(newPath);
+        if (existingFile) {
+            throw new Error(`File "${file.name}" already exists in target folder`);
+        }
+        
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+    }
+    private async moveDriveFile(filePath: string, targetFolderPath: string): Promise<void> {
+        try {
+            const driveFile = await this.findDriveFileByPath(filePath);
+            if (!driveFile) {
+                throw new Error('File not found in Google Drive');
+            }
+            
+            const targetDriveFolder = await this.findDriveFolderByPath(targetFolderPath);
+            if (!targetDriveFolder) {
+                throw new Error('Target folder not found in Google Drive');
+            }
+            //console.log(`Drive file moveing: ${driveFile.name} → ${targetFolderPath} : ${targetDriveFolder}`);
+
+            // Remove from current parents and add to new parent
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFile.id}?addParents=${targetDriveFolder.id}&removeParents=${driveFile.parents.join(',')}&supportsAllDrives=true`,
+                { method: 'PATCH' }
+            );
+            
+            if (response.status !== 200) {
+                throw new Error(`Drive move failed: ${response.status}`);
+            }
+            
+            console.log(`Drive file moved: ${driveFile.name} → ${targetFolderPath}`);
+            
+        } catch (error) {
+            console.error('Drive move error:', error);
+            throw new Error(`Failed to move file in Google Drive: ${error.message}`);
+        }
+    }    
+    private async findDriveFileByPath(filePath: string): Promise<any | null> {
+        try {
+            let targetFolderId: string;
+            let fileName: string;
+            
+            if (this.settings.syncWholeVault) {
+                const rootFolder = await this.getOrCreateDriveFolder();
+                if (!rootFolder) return null;
+                
+                if (filePath.includes('/')) {
+                    const pathParts = filePath.split('/');
+                    fileName = pathParts.pop()!;
+                    const folderPath = pathParts.join('/');
+                    targetFolderId = await this.getCachedFolderId(folderPath, rootFolder.id);
+                } else {
+                    fileName = filePath;
+                    targetFolderId = rootFolder.id;
+                }
+            } else {
+                // 선택된 폴더에서 찾기
+                const selectedFolder = this.findContainingSelectedFolder(filePath);
+                if (!selectedFolder) return null;
+                
+                const relativePath = this.getRelativePath(filePath, selectedFolder.path);
+                if (relativePath.includes('/')) {
+                    const pathParts = relativePath.split('/');
+                    fileName = pathParts.pop()!;
+                    const folderPath = pathParts.join('/');
+                    targetFolderId = await this.getCachedFolderId(folderPath, selectedFolder.id);
+                } else {
+                    fileName = relativePath;
+                    targetFolderId = selectedFolder.id;
+                }
+            }
+            
+            return await this.findFileInDrive(fileName, targetFolderId);
+            
+        } catch (error) {
+            console.error(`Error finding Drive file for ${filePath}:`, error);
+            return null;
+        }
+    }    
+    private findContainingSelectedFolder(filePath: string): {id: string, name: string, path: string} | null {
+        for (const selectedFolder of this.settings.selectedDriveFolders) {
+            if (filePath === selectedFolder.path || filePath.startsWith(selectedFolder.path + '/')) {
+                return selectedFolder;
+            }
+        }
+        return null;
+    }    
+    private async showMoveFolderDialog(folder: TFolder): Promise<void> {
+        const modal = new MoveFolderModal(this.app, this, async (targetPath: string) => {
+            if (targetPath && targetPath !== folder.parent?.path) {
+                await this.performSyncMoveFolder(folder, targetPath);
+            }
+        });
+        modal.open();
+    }
+    private async performSyncMoveFolder(folder: TFolder, targetFolderPath: string): Promise<void> {
+        const newPath = `${targetFolderPath}/${folder.name}`;
+        const context: SyncOperationContext = {
+            file: folder,
+            originalPath: folder.path,
+            targetPath: newPath,
+            operationType: 'move'
+        };
+
+        const progressNotice = new Notice(`📁 Moving folder "${folder.name}" to "${targetFolderPath}"...`, 0);
+
+        try {
+            console.log(`[SYNC_MOVE_FOLDER] Starting: ${folder.path} → ${newPath}`);
+            
+            // Phase 1: Validation
+            await this.validateMoveFolderOperation(folder, targetFolderPath);
+            
+            // Phase 2: Drive move
+            await this.moveDriveFolder(context.originalPath, targetFolderPath);
+            console.log(`[SYNC_MOVE_FOLDER] Drive move completed`);
+            
+            // Phase 3: Local move
+            await this.app.vault.rename(folder, newPath);
+            console.log(`[SYNC_MOVE_FOLDER] Local move completed: ${newPath}`);
+            
+            // Phase 4: Update all affected file states
+            await this.updateFolderStateAfterMove(context.originalPath, newPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Moved folder "${folder.name}" to "${targetFolderPath}" in both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_MOVE_FOLDER] Error:`, error);
+            progressNotice.hide();
+            
+            // Rollback if needed
+            await this.rollbackMove(context, error);
+        }
+    }
+    private async updateFolderStateAfterMove(oldPath: string, newPath: string): Promise<void> {
+        // 폴더 이동은 폴더 이름 변경과 동일한 처리
+        await this.updateFolderStateAfterRename(oldPath, newPath);
+    }    
+    private async updateFolderStateAfterRename(oldPath: string, newPath: string): Promise<void> {
+        const updatedPaths = new Map<string, string>();
+        
+        // 폴더 내 모든 파일의 상태 캐시 업데이트
+        for (const [filePath, state] of Object.entries(this.settings.fileStateCache)) {
+            if (filePath.startsWith(oldPath + '/') || filePath === oldPath) {
+                const newFilePath = filePath.replace(oldPath, newPath);
+                updatedPaths.set(filePath, newFilePath);
+                this.setFileState(newFilePath, state);
+            }
+        }
+        
+        // 기존 경로들 제거
+        for (const oldFilePath of updatedPaths.keys()) {
+            delete this.settings.fileStateCache[this.normalizeFullPath(oldFilePath)];
+        }
+        
+        await this.saveSettings();
+        console.log(`[STATE] Folder state updated: ${oldPath} → ${newPath} (${updatedPaths.size} files affected)`);
+    }
+
+    private async moveDriveFolder(folderPath: string, targetFolderPath: string): Promise<void> {
+        try {
+            const driveFolder = await this.findDriveFolderByPath(folderPath);
+            if (!driveFolder) {
+                throw new Error('Folder not found in Google Drive');
+            }
+            
+            const targetDriveFolder = await this.findDriveFolderByPath(targetFolderPath);
+            if (!targetDriveFolder) {
+                throw new Error('Target folder not found in Google Drive');
+            }
+
+            //console.log(`Drive folder moving: ${driveFolder.name} (${driveFolder.parents}) → ${targetFolderPath} (${targetDriveFolder.name})`);
+
+            // Remove from current parents and add to new parent
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFolder.id}?addParents=${targetDriveFolder.id}&removeParents=${driveFolder.parents.join(',')}&supportsAllDrives=true`,
+                { method: 'PATCH' }
+            );
+            
+            if (response.status !== 200) {
+                throw new Error(`Drive folder move failed: ${response.status}`);
+            }
+            
+            console.log(`Drive folder moved: ${driveFolder.name} → ${targetFolderPath}`);
+            
+        } catch (error) {
+            console.error('Drive folder move error:', error);
+            throw new Error(`Failed to move folder in Google Drive: ${error.message}`);
+        }
+    }    
+    private async validateMoveFolderOperation(folder: TFolder, targetFolderPath: string): Promise<void> {
+        // 대상 폴더 존재 확인
+        const targetFolder = this.app.vault.getAbstractFileByPath(targetFolderPath);
+        if (!targetFolder || !(targetFolder instanceof TFolder)) {
+            throw new Error(`Target folder "${targetFolderPath}" does not exist`);
+        }
+        
+        // 순환 이동 방지
+        if (targetFolderPath.startsWith(folder.path + '/')) {
+            throw new Error('Cannot move folder into its own subfolder');
+        }
+        
+        // 중복 폴더명 검사
+        const newPath = `${targetFolderPath}/${folder.name}`;
+        const existingFolder = this.app.vault.getAbstractFileByPath(newPath);
+        if (existingFolder) {
+            throw new Error(`Folder "${folder.name}" already exists in target location`);
+        }
+        
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+    }    
+    private async performSyncRename(file: TFile, newName: string): Promise<void> {
+        const context: SyncOperationContext = {
+            file,
+            originalPath: file.path,
+            targetName: newName,
+            operationType: 'rename'
+        };
+
+        const progressNotice = new Notice(`🔄 Renaming "${file.name}" to "${newName}"...`, 0);
+
+        try {
+            console.log(`[SYNC_RENAME] Starting rename: ${file.name} → ${newName}`);
+            
+            // Phase 1: Validation
+            await this.validateRenameOperation(file, newName);
+            
+            // Phase 2: Drive rename
+            await this.renameDriveFile(file.path, newName);
+            console.log(`[SYNC_RENAME] Drive rename completed`);
+
+            // Phase 3: Local rename
+            const newPath = file.path.replace(file.name, newName);
+            await this.app.vault.rename(file, newPath);
+            console.log(`[SYNC_RENAME] Local rename completed: ${newPath}`);
+
+            
+            // Phase 4: Update state
+            await this.updateFileStateAfterRename(context.originalPath, newPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Renamed "${file.name}" to "${newName}" in both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_RENAME] Error:`, error);
+            progressNotice.hide();
+            
+            // Rollback if needed
+            await this.rollbackRename(context, error);
+        }
+    }
+    private async renameDriveFile(filePath: string, newName: string): Promise<void> {
+        try {
+            const driveFile = await this.findDriveFileByPath(filePath);
+            if (!driveFile) {
+                throw new Error('File not found in Google Drive');
+            }
+            
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFile.id}?supportsAllDrives=true`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName })
+                }
+            );
+            
+            if (response.status !== 200) {
+                throw new Error(`Drive rename failed: ${response.status}`);
+            }
+            
+            console.log(`✅ Drive file renamed: ${driveFile.name} → ${newName}`);
+ 
+        } catch (error) {
+            console.error('Drive rename error:', error);
+            throw new Error(`Failed to rename file in Google Drive: ${error.message}`);
+        }
+    }    
+    private async rollbackRename(context: SyncOperationContext, error: Error): Promise<void> {
+        console.log(`[ROLLBACK] Attempting to rollback rename operation`);
+        
+        try {
+            // Check if local file was renamed (exists at target path)
+            const currentFile = this.app.vault.getAbstractFileByPath(context.originalPath);
+            if (!currentFile) {
+                // File was moved locally, try to move it back
+                const renamedFile = this.app.vault.getFiles().find(f => 
+                    f.path.includes(context.targetName!) && 
+                    f.path.replace(context.targetName!, context.file.name) === context.originalPath
+                );
+                
+                if (renamedFile) {
+                    await this.app.vault.rename(renamedFile, context.originalPath);
+                    console.log(`[ROLLBACK] Successfully reverted local rename`);
+                }
+            }
+            
+            new Notice(`❌ Sync rename failed: ${error.message} (Local changes reverted)`);
+            
+        } catch (rollbackError) {
+            console.error(`[ROLLBACK] Failed to rollback rename:`, rollbackError);
+            new Notice(`❌ Sync rename failed AND rollback failed. Manual intervention needed.`);
+        }
+    }    
+    private async validateRenameOperation(file: TFile, newName: string): Promise<void> {
+        // 파일명 유효성 검사
+        if (!/^[^<>:"/\\|?*]+$/.test(newName)) {
+            throw new Error('Invalid file name. Avoid special characters: < > : " / \\ | ? *');
+        }
+        
+        // 동일 폴더 내 중복 파일명 검사
+        const parentPath = file.parent?.path || '';
+        const newPath = parentPath ? `${parentPath}/${newName}` : newName;
+        const existingFile = this.app.vault.getAbstractFileByPath(newPath);
+        if (existingFile) {
+            throw new Error(`File "${newName}" already exists in the same folder`);
+        }
+        
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+    }
+    private async performSyncRenameFolder(folder: TFolder, newName: string): Promise<void> {
+        const context: SyncOperationContext = {
+            file: folder,
+            originalPath: folder.path,
+            targetName: newName,
+            operationType: 'rename'
+        };
+
+        const progressNotice = new Notice(`🔄 Renaming folder "${folder.name}" to "${newName}"...`, 0);
+
+        try {
+            console.log(`[SYNC_RENAME_FOLDER] Starting: ${folder.name} → ${newName}`);
+            
+            // Phase 1: Validation
+            await this.validateRenameFolderOperation(folder, newName);
+
+            // Phase 2: Drive rename
+            await this.renameDriveFolder(folder.path, newName);
+            console.log(`[SYNC_RENAME_FOLDER] Drive rename completed`);
+            
+            // Phase 3: Local rename
+            const newPath = folder.path.replace(folder.name, newName);
+            await this.app.vault.rename(folder, newPath);
+            console.log(`[SYNC_RENAME_FOLDER] Local rename completed: ${newPath}`);
+            
+            // Phase 4: Update all affected file states
+            await this.updateFolderStateAfterRename(context.originalPath, newPath);
+            
+            progressNotice.hide();
+            new Notice(`✅ Renamed folder "${folder.name}" to "${newName}" in both local and Drive`);
+            
+        } catch (error) {
+            console.error(`[SYNC_RENAME_FOLDER] Error:`, error);
+            progressNotice.hide();
+            
+            // Rollback if needed
+            await this.rollbackRename(context, error);
+        }
+    }
+    private async validateRenameFolderOperation(folder: TFolder, newName: string): Promise<void> {
+        // 폴더명 유효성 검사
+        if (!/^[^<>:"/\\|?*]+$/.test(newName)) {
+            throw new Error('Invalid folder name. Avoid special characters: < > : " / \\ | ? *');
+        }
+        
+        // 동일 레벨 중복 폴더명 검사
+        const parentPath = folder.parent?.path || '';
+        const newPath = parentPath ? `${parentPath}/${newName}` : newName;
+        const existingFolder = this.app.vault.getAbstractFileByPath(newPath);
+        if (existingFolder) {
+            throw new Error(`Folder "${newName}" already exists in the same location`);
+        }
+        
+        // Google Drive 권한 확인
+        if (!this.isAuthenticated()) {
+            throw new Error('Not authenticated with Google Drive');
+        }
+    }
+    private async renameDriveFolder(folderPath: string, newName: string): Promise<void> {
+        try {
+            const driveFolder = await this.findDriveFolderByPath(folderPath);
+            if (!driveFolder) {
+                throw new Error('Folder not found in Google Drive');
+            }
+            
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files/${driveFolder.id}?supportsAllDrives=true`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName })
+                }
+            );
+            
+            if (response.status !== 200) {
+                throw new Error(`Drive folder rename failed: ${response.status}`);
+            }
+            
+            console.log(`✅ Drive folder renamed: ${driveFolder.name} → ${newName}`);
+            
+        } catch (error) {
+            console.error('Drive folder rename error:', error);
+            throw new Error(`Failed to rename folder in Google Drive: ${error.message}`);
+        }
+    }    
     // 파일 변경 감지 설정
     private setupFileChangeDetection(): void {
         // 파일 수정 감지
@@ -1679,14 +2631,9 @@ export default class GDriveSyncPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
                 if (file instanceof TFile && this.shouldSyncFileType(file)) {
-                    menu.addItem((item) => {
-                        item
-                            .setTitle('Sync to Google Drive')
-                            .setIcon('cloud')
-                            .onClick(async () => {
-                                await this.syncSingleFile(file);
-                            });
-                    });
+                    if (this.isFileInSyncScope(file)) {
+                        this.addFileContextMenuItems(menu, file);
+                    }
                 }
             })
         );
@@ -1697,48 +2644,16 @@ export default class GDriveSyncPlugin extends Plugin {
         this.registerEvent(
             this.app.workspace.on('file-menu', (menu, file) => {
                 if (file instanceof TFolder) {
-                    const folderPath = file.path;
-                    const isSelectedForSync = this.isFolderSelectedForSync(folderPath);
-                    const isSyncWholeVault = this.settings.syncWholeVault;
-                    
-                    const isTopLevelFolder = this.isTopLevelFolder(folderPath);
-
-                    if (isSyncWholeVault) {
-                        // 전체 볼트 동기화 모드인 경우 - 폴더 동기화 메뉴
-                        menu.addItem((item) => {
-                            item
-                                .setTitle('Sync Folder to Google Drive')
-                                .setIcon('cloud')
-                                .onClick(async () => {
-                                    await this.syncFolderToGoogleDrive(file);
-                                });
-                        });
-                    } else if (isSelectedForSync) {
-                        // 이미 동기화 대상인 경우 - 폴더 동기화 메뉴
-                        menu.addItem((item) => {
-                            item
-                                .setTitle('Sync Folder to Google Drive')
-                                .setIcon('cloud')
-                                .onClick(async () => {
-                                    await this.syncFolderToGoogleDrive(file);
-                                });
-                        });
-                        
-                        // 동기화 대상에서 제거 메뉴
-                        // menu.addItem((item) => {
-                        //     item
-                        //         .setTitle('❌ Remove from Sync Targets')
-                        //         .setIcon('x')
-                        //         .onClick(async () => {
-                        //             await this.removeFolderFromSyncTargets(folderPath);
-                        //         });
-                        // });
-                    } else {
-                        // 동기화 대상이 아닌 경우 - 최상위 폴더에서만 동기화 대상 등록 메뉴 표시
+                    if (this.isFolderInSyncScope(file)) {
+                        this.addFolderContextMenuItems(menu, file);
+                    } else if (!this.settings.syncWholeVault) {
+                        // Not sync target - show add to sync menu only for top-level folders
+                        const isTopLevelFolder = this.isTopLevelFolder(file.path);
                         if (isTopLevelFolder) {
+                            menu.addSeparator();
                             menu.addItem((item) => {
                                 item
-                                    .setTitle('Add to Google Drive Sync')
+                                    .setTitle('➕ Add to Google Drive Sync')
                                     .setIcon('plus')
                                     .onClick(async () => {
                                         await this.addFolderToSyncTargets(file);
@@ -1948,32 +2863,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // 🔥 NEW: 폴더를 동기화 대상에서 제거
-    private async removeFolderFromSyncTargets(folderPath: string): Promise<void> {
-        try {
-            const folderIndex = this.settings.selectedDriveFolders.findIndex(folder => 
-                folder.path === folderPath
-            );
-            
-            if (folderIndex !== -1) {
-                const folderName = this.settings.selectedDriveFolders[folderIndex].name;
-                this.settings.selectedDriveFolders.splice(folderIndex, 1);
-                await this.saveSettings();
-                
-                new Notice(`✅ Removed "${folderName}" from sync targets`);
-                
-                // 설정 탭 새로고침
-                this.notifySettingsChanged();
-            } else {
-                new Notice('❌ Folder not found in sync targets');
-            }
-
-        } catch (error) {
-            console.error('Error removing folder from sync targets:', error);
-            new Notice(`❌ Error removing folder: ${error.message}`);
-        }
-    }    
-    
     // 🔥 폴더 동기화 메서드
     private async syncFolderToGoogleDrive(folder: TFolder): Promise<void> {
         try {
@@ -3364,42 +4253,34 @@ export default class GDriveSyncPlugin extends Plugin {
 
     // 기존 createNestedFolders 메서드는 그대로 유지하되, 캐시 활용
     private async createNestedFolders(folderPath: string, rootFolderId: string): Promise<string> {
+        console.log(`📂 Creating nested folders: ${folderPath}`);
+        
         const pathParts = folderPath.split('/');
         let currentFolderId = rootFolderId;
         let currentPath = '';
-    
-        console.log(`📂 [NESTED] Creating nested folders for path: ${folderPath}`);
-        console.log(`📂 [NESTED] Starting from root folder: ${rootFolderId}`);
+        let createdFolders = 0;
     
         for (const folderName of pathParts) {
             if (!folderName) continue;
             
             currentPath = currentPath ? `${currentPath}/${folderName}` : folderName;
             
-            // 캐시에서 먼저 확인
+            // Check cache first
             if (this.folderCache[currentPath]) {
                 currentFolderId = this.folderCache[currentPath];
-                console.log(`🚀 [NESTED] Using cached folder: ${folderName} at ${currentPath} (${currentFolderId})`);
                 continue;
             }
-            
-            console.log(`📂 [NESTED] Processing folder: ${folderName} (path: ${currentPath})`);
             
             const existingFolder = await this.findFolderInDrive(folderName, currentFolderId);
             
             if (existingFolder) {
                 currentFolderId = existingFolder.id;
                 this.folderCache[currentPath] = currentFolderId;
-                console.log(`✅ [NESTED] Found existing folder: ${folderName} at ${currentPath} (${currentFolderId})`);
             } else {
-                console.log(`📁 [NESTED] Creating new folder: ${folderName} in parent: ${currentFolderId}`);
-                
                 const newFolder = await this.createFolderInDrive(folderName, currentFolderId);
                 if (!newFolder) {
-                    // 🔥 NEW: Enhanced error with context
                     const errorMsg = `Failed to create folder: ${folderName} in path: ${currentPath}`;
-                    console.error(`❌ [NESTED] ${errorMsg}`);
-                    console.error(`📋 [NESTED] Context:`, {
+                    console.error(`❌ ${errorMsg}`, {
                         fullPath: folderPath,
                         failedAt: currentPath,
                         parentFolderId: currentFolderId,
@@ -3410,11 +4291,11 @@ export default class GDriveSyncPlugin extends Plugin {
                 }
                 currentFolderId = newFolder.id;
                 this.folderCache[currentPath] = currentFolderId;
-                console.log(`📁 [NESTED] Created and cached folder: ${folderName} at ${currentPath} (${currentFolderId})`);
+                createdFolders++;
             }
         }
     
-        console.log(`✅ [NESTED] Completed nested folder creation: ${folderPath} → ${currentFolderId}`);
+        console.log(`✅ ${folderPath} → ${currentFolderId} (${createdFolders} new folders)`);
         return currentFolderId;
     }
 
@@ -4193,6 +5074,9 @@ export default class GDriveSyncPlugin extends Plugin {
     // Modified syncFileToGoogleDrive with enhanced state tracking
     private async syncFileToGoogleDrive(file: TFile, rootFolderId: string, baseFolder: string = ''): Promise<boolean | 'skipped'> {
         try {
+            // Entry log with essential sync information
+            console.log(`🔄 Syncing: ${file.path}`);
+            
             // ... existing folder structure handling code ...
             let relativePath = file.path;
             if (baseFolder && file.path.startsWith(baseFolder + '/')) {
@@ -4209,33 +5093,14 @@ export default class GDriveSyncPlugin extends Plugin {
                 targetFolderId = await this.getCachedFolderId(folderPath, rootFolderId);
             }
             
-            // Check existing file using decision engine
-            console.log(`🔍 Searching for existing file: ${fileName} in folder: ${targetFolderId}`);
+            // Check existing file and make decision
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
-
-            if (existingFile) {
-                console.log(`✅ Found existing file: ${existingFile.name} (ID: ${existingFile.id})`);
-                console.log(`📊 Existing file details:`, {
-                    id: existingFile.id,
-                    name: existingFile.name,
-                    modifiedTime: existingFile.modifiedTime,
-                    md5Checksum: existingFile.md5Checksum
-                });
-            } else {
-                console.log(`❌ No existing file found - will create new file`);
-            }
-
             const decision = await this.decideSyncAction(file, existingFile);
-            console.log(`📋 Sync decision:`, {
-                shouldSync: decision.shouldSync,
-                action: decision.action,
-                reason: decision.reason
-            });
-
+    
             if (!decision.shouldSync) {
                 return 'skipped';
             }
-
+    
             // File content reading
             let content: string | ArrayBuffer;
             if (this.isTextFile(file.name)) {
@@ -4247,31 +5112,32 @@ export default class GDriveSyncPlugin extends Plugin {
             const localModTime = file.stat.mtime;
             let success = false;
             let remoteFileData: any = null;
-
+    
             // Upload or update
             if (existingFile) {
-                console.log(`🔄 Updating ${file.path} in Google Drive`);
                 const result = await this.updateFileInDrive(existingFile.id, content, localModTime);
                 success = result.success;
                 if (success) {
                     remoteFileData = await this.getUpdatedFileInfo(existingFile.id);
                 }
             } else {
-                console.log(`📤 Uploading ${file.path} to Google Drive`);
                 const result = await this.uploadFileToDrive(fileName, content, targetFolderId, localModTime);
                 success = result.success;
                 remoteFileData = result.fileData;
             }
-
-            // Update state cache (without syncDirection)
+    
+            // Update state cache
             if (success && remoteFileData) {
                 await this.updateFileStateAfterSync(file.path, file, remoteFileData);
             }
-
+    
+            // Result log with action summary
+            console.log(`${success ? '✅' : '❌'} ${file.path}: ${existingFile ? 'updated' : 'uploaded'} | ${decision.action}`);
+    
             return success;
-
+    
         } catch (error) {
-            console.error(`❌ Failed to sync ${file.path}:`, error);
+            console.error(`❌ Sync failed [${file.path}]:`, error.message || error);
             return false;
         }
     }
@@ -4410,7 +5276,7 @@ export default class GDriveSyncPlugin extends Plugin {
             
             const params = new URLSearchParams({
                 q: query,
-                fields: 'files(id,name,mimeType,shortcutDetails)',
+                fields: 'files(id,name,mimeType,parents,shortcutDetails)',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
             });
@@ -4428,7 +5294,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     let resultItem = {
                         id: found.id,
                         name: found.name,
-                        type: found.mimeType
+                        type: found.mimeType,
+                        parents: found.parents
                     };
                     
                     // 바로가기인 경우 실제 대상 정보도 가져오기
@@ -4438,12 +5305,13 @@ export default class GDriveSyncPlugin extends Plugin {
                             resultItem = {
                                 id: resolvedTarget.id,
                                 name: resolvedTarget.name,
-                                type: 'resolved_shortcut'
+                                type: 'resolved_shortcut',
+                                parents: found.parents
                             };
                         }
                     }
                     
-                    console.log(`항목 발견: ${resultItem.name} (타입: ${resultItem.type})`);
+                    console.log(`[SEARCH] : ${resultItem.name} (${resultItem.type})`);
                     return resultItem;
                 }
             }
@@ -4457,7 +5325,7 @@ export default class GDriveSyncPlugin extends Plugin {
         try {
             if (shortcutFile.shortcutDetails && shortcutFile.shortcutDetails.targetId) {
                 const targetId = shortcutFile.shortcutDetails.targetId;
-                console.log(`바로가기 대상 ID: ${targetId}`);
+                //console.log(`바로가기 대상 ID: ${targetId}`);
                 
                 // 실제 대상 파일/폴더 정보 가져오기
                 const targetResponse = await this.makeAuthenticatedRequest(
@@ -4467,7 +5335,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 
                 if (targetResponse.status === 200) {
                     const targetFile = targetResponse.json;
-                    console.log(`바로가기 대상: ${targetFile.name} (${targetFile.mimeType})`);
+                    //console.log(`바로가기 대상: ${targetFile.name} (${targetFile.mimeType})`);
                     return {
                         id: targetFile.id,
                         name: targetFile.name
@@ -4492,23 +5360,17 @@ export default class GDriveSyncPlugin extends Plugin {
     }
     private async createFolderInDrive(folderName: string, parentFolderId: string): Promise<{id: string, name: string} | null> {
         try {
-            console.log(`📁 [CREATE] Creating folder "${folderName}" in parent: ${parentFolderId}`);
+            console.log(`📁 Creating folder: "${folderName}" in ${parentFolderId}`);
             
-            // 🔥 NEW: Resolve parent folder ID and get detailed info
+            // Resolve parent folder ID
             const resolvedParentId = await this.resolveToActualFolderId(parentFolderId);
             
-            if (resolvedParentId !== parentFolderId) {
-                console.log(`📁 [CREATE] Resolved shortcut: ${parentFolderId} → ${resolvedParentId}`);
-            }
-            
-            // 🔥 NEW: Pre-check if folder already exists (avoid duplicate creation)
+            // Pre-check if folder already exists
             const existingFolder = await this.findFolderInDrive(folderName, resolvedParentId);
             if (existingFolder) {
-                console.log(`📁 [CREATE] Folder already exists: ${folderName} (${existingFolder.id})`);
+                console.log(`✅ Found existing: ${folderName} (${existingFolder.id})`);
                 return { id: existingFolder.id, name: existingFolder.name };
             }
-            
-            console.log(`📁 [CREATE] Creating new folder "${folderName}" in resolved parent: ${resolvedParentId}`);
             
             const response = await this.makeAuthenticatedRequest(
                 'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
@@ -4525,64 +5387,37 @@ export default class GDriveSyncPlugin extends Plugin {
                 }
             );
     
-            console.log(`📁 [CREATE] Response status: ${response.status}`);
-    
             if (response.status === 200 || response.status === 201) {
                 const folderData = response.json;
-                console.log(`✅ [CREATE] Successfully created: ${folderData.name} (${folderData.id})`);
+                console.log(`✅ Created: ${folderData.name} (${folderData.id})`);
                 return { id: folderData.id, name: folderData.name };
             } else {
-                // 🔥 NEW: Enhanced error logging and handling
-                const errorData = response.json || {};
-                console.error(`❌ [CREATE] Failed to create folder:`, {
+                // Enhanced error logging with context
+                const errorContext = {
                     status: response.status,
                     folderName,
-                    originalParentId: parentFolderId,
+                    parentId: parentFolderId,
                     resolvedParentId,
-                    error: errorData
-                });
+                    error: response.json || {}
+                };
                 
-                // 🔥 NEW: Provide specific error guidance
+                let errorHint = '';
                 if (response.status === 403) {
-                    console.error(`❌ [CREATE] Permission denied - likely a shared folder access issue`);
-                    console.error(`💡 [CREATE] Suggestion: Check if you have "Editor" or "Manager" access to the shared folder`);
-                    
-                    // Try to get parent folder info for debugging
-                    try {
-                        const parentInfo = await this.makeAuthenticatedRequest(
-                            `https://www.googleapis.com/drive/v3/files/${resolvedParentId}?fields=id,name,capabilities,owners,permissions&supportsAllDrives=true`,
-                            { method: 'GET' }
-                        );
-                        
-                        if (parentInfo.status === 200) {
-                            const info = parentInfo.json;
-                            console.error(`📋 [CREATE] Parent folder details:`, {
-                                name: info.name,
-                                canAddChildren: info.capabilities?.canAddChildren,
-                                isOwner: info.owners?.[0]?.me || false
-                            });
-                        }
-                    } catch (debugError) {
-                        console.error(`❌ [CREATE] Could not get parent folder details:`, debugError);
-                    }
-                    
+                    errorHint = ' - Check shared folder permissions';
                 } else if (response.status === 404) {
-                    console.error(`❌ [CREATE] Parent folder not found: ${resolvedParentId}`);
-                    console.error(`💡 [CREATE] The shortcut may point to a deleted or inaccessible folder`);
+                    errorHint = ' - Parent folder not found';
                 } else if (response.status === 400) {
-                    console.error(`❌ [CREATE] Bad request - possibly invalid folder name or parent ID`);
+                    errorHint = ' - Invalid request parameters';
                 }
                 
+                console.error(`❌ Create failed [${response.status}]${errorHint}:`, errorContext);
                 return null;
             }
         } catch (error) {
-            console.error(`❌ [CREATE] Exception creating folder "${folderName}":`, error);
+            const isPermissionError = error.message?.includes('Permission denied') || error.message?.includes('403');
+            const errorHint = isPermissionError ? ' - Likely permission issue' : '';
             
-            // 🔥 NEW: Enhanced error message for user
-            if (error.message?.includes('Permission denied') || error.message?.includes('403')) {
-                console.error(`💡 [CREATE] This is likely a shared folder permission issue. Ensure you have "Editor" access.`);
-            }
-            
+            console.error(`❌ Create error "${folderName}"${errorHint}:`, error.message || error);
             return null;
         }
     }
@@ -4602,62 +5437,55 @@ export default class GDriveSyncPlugin extends Plugin {
     private async findFileInDrive(fileName: string, folderId: string): Promise<any | null> {
         try {
             const actualFolderId = await this.resolveToActualFolderId(folderId);
-            const normalizedFileName = this.normalizeFileName(fileName)
+            const normalizedFileName = this.normalizeFileName(fileName);
             
-            console.log(`🔍 [SEARCH] fileName: "${normalizedFileName}"`);
-            console.log(`🔍 [SEARCH] folderId: ${actualFolderId}`);
+            console.log(`🔍 Searching: "${normalizedFileName}" in ${actualFolderId}`);
             
             const params = new URLSearchParams({
                 q: `name='${normalizedFileName}' and '${actualFolderId}' in parents and trashed=false`,
-                fields: 'files(id,name,modifiedTime,md5Checksum,version,size)',
+                fields: 'files(id,name,modifiedTime,md5Checksum,version,size,parents)',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true'
             });
-            
-            console.log(`🔍 [SEARCH] Query: ${params.get('q')}`);
             
             const response = await this.makeAuthenticatedRequest(
                 `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
                 { method: 'GET' }
             );
     
-            console.log(`🔍 [SEARCH] Response status: ${response.status}`);
-            
             if (response.status === 200) {
                 const data = response.json;
-                console.log(`🔍 [SEARCH] Found ${data.files?.length || 0} files`);
+                const filesFound = data.files?.length || 0;
                 
-                if (data.files && data.files.length > 0) {
-                    // 모든 검색 결과 로그
-                    data.files.forEach((file, index) => {
-                        console.log(`🔍 [SEARCH] Result ${index + 1}: "${file.name}" (${file.id})`);
-                        console.log(`🔍 [SEARCH] Normalized match: ${this.normalizeFileName(fileName) === normalizedFileName}`);
-                    });
-                    
+                if (filesFound > 0) {
                     const matchingFile = data.files.find(file => 
-                        this.normalizeFileName(fileName) === normalizedFileName
+                        this.normalizeFileName(file.name) === normalizedFileName
                     );
                     
                     if (matchingFile) {
-                        console.log(`✅ [SEARCH] MATCH FOUND: ${matchingFile.name} (${matchingFile.id})`);
+                        console.log(`✅ Found: ${matchingFile.name} (${matchingFile.id})`);
                         return matchingFile;
                     } else {
-                        console.log(`❌ [SEARCH] NO EXACT MATCH despite ${data.files.length} results`);
+                        console.log(`❌ No exact match in ${filesFound} results`);
                     }
                 } else {
-                    console.log(`❌ [SEARCH] NO FILES FOUND in folder ${actualFolderId}`);
+                    console.log(`❌ No files found`);
                 }
             } else {
-                console.log(`❌ [SEARCH] API ERROR: ${response.status}`, response.json);
+                console.error(`❌ Search failed [${response.status}]:`, {
+                    fileName: normalizedFileName,
+                    folderId: actualFolderId,
+                    query: params.get('q'),
+                    response: response.json
+                });
             }
             
             return null;
         } catch (error) {
-            console.error('❌ [SEARCH] EXCEPTION:', error);
+            console.error(`❌ Search error for "${fileName}":`, error.message || error);
             throw error;
         }
     }
-
 
     private async updateFileInDrive(
         fileId: string, 
@@ -4848,6 +5676,446 @@ export default class GDriveSyncPlugin extends Plugin {
             new Notice('❌ Unexpected error occurred. Check console for details.');
             return false;
         }
+    }
+}
+
+class RenameModal extends Modal {
+    private onSubmit: (newName: string) => void;
+    private originalName: string;
+
+    constructor(app: App, originalName: string, onSubmit: (newName: string) => void) {
+        super(app);
+        this.originalName = originalName;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Rename File/Folder' });
+
+        const inputContainer = contentEl.createEl('div', { 
+            attr: { style: 'margin: 20px 0;' }
+        });
+
+        const inputLabel = inputContainer.createEl('label', { 
+            text: 'New Name:',
+            attr: { style: 'display: block; margin-bottom: 8px; font-weight: bold;' }
+        });
+
+        const nameInput = inputContainer.createEl('input', {
+            type: 'text',
+            value: this.originalName,
+            attr: { 
+                style: 'width: 100%; padding: 8px; border: 1px solid var(--background-modifier-border); border-radius: 4px;'
+            }
+        });
+
+        nameInput.focus();
+        nameInput.select();
+
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--background-modifier-border);' }
+        });
+
+        const renameButton = buttonContainer.createEl('button', { 
+            text: 'Rename',
+            cls: 'mod-cta'
+        });
+
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel'
+        });
+
+        const handleSubmit = () => {
+            const newName = nameInput.value.trim();
+            if (!newName) {
+                new Notice('❌ Please enter a name');
+                nameInput.focus();
+                return;
+            }
+
+            if (newName === this.originalName) {
+                this.close();
+                return;
+            }
+
+            this.onSubmit(newName);
+            this.close();
+        };
+
+        renameButton.onclick = handleSubmit;
+        cancelButton.onclick = () => this.close();
+
+        nameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleSubmit();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                this.close();
+            }
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class MoveFileModal extends Modal {
+    private plugin: GDriveSyncPlugin;
+    private onSubmit: (targetPath: string) => void;
+
+    constructor(app: App, plugin: GDriveSyncPlugin, onSubmit: (targetPath: string) => void) {
+        super(app);
+        this.plugin = plugin;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Move File' });
+
+        const inputContainer = contentEl.createEl('div', { 
+            attr: { style: 'margin: 20px 0;' }
+        });
+
+        const inputLabel = inputContainer.createEl('label', { 
+            text: 'Target Folder Path:',
+            attr: { style: 'display: block; margin-bottom: 8px; font-weight: bold;' }
+        });
+
+        const pathInput = inputContainer.createEl('input', {
+            type: 'text',
+            placeholder: 'e.g., Projects/Work',
+            attr: { 
+                style: 'width: 100%; padding: 8px; border: 1px solid var(--background-modifier-border); border-radius: 4px;'
+            }
+        });
+
+        // 폴더 제안 목록 생성
+        const suggestionContainer = contentEl.createEl('div', {
+            attr: { style: 'margin: 10px 0;' }
+        });
+
+        const suggestionLabel = suggestionContainer.createEl('div', {
+            text: 'Available Folders:',
+            attr: { style: 'font-weight: bold; margin-bottom: 8px;' }
+        });
+
+        const suggestionList = suggestionContainer.createEl('div', {
+            attr: { 
+                style: 'max-height: 150px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; padding: 8px;'
+            }
+        });
+
+        // 사용 가능한 폴더 목록 표시
+        this.populateFolderSuggestions(suggestionList, pathInput);
+
+        pathInput.focus();
+
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--background-modifier-border);' }
+        });
+
+        const moveButton = buttonContainer.createEl('button', { 
+            text: 'Move',
+            cls: 'mod-cta'
+        });
+
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel'
+        });
+
+        const handleSubmit = () => {
+            const targetPath = pathInput.value.trim();
+            if (!targetPath) {
+                new Notice('❌ Please enter a target folder path');
+                pathInput.focus();
+                return;
+            }
+
+            this.onSubmit(targetPath);
+            this.close();
+        };
+
+        moveButton.onclick = handleSubmit;
+        cancelButton.onclick = () => this.close();
+
+        pathInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleSubmit();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                this.close();
+            }
+        });
+    }
+
+    private populateFolderSuggestions(container: HTMLElement, pathInput: HTMLInputElement): void {
+        const folders = this.app.vault.getAllLoadedFiles()
+            .filter(f => f instanceof TFolder)
+            .map(f => f.path)
+            .sort();
+
+        if (folders.length === 0) {
+            container.createEl('div', { 
+                text: 'No folders available',
+                attr: { style: 'color: var(--text-muted); font-style: italic;' }
+            });
+            return;
+        }
+
+        folders.forEach(folderPath => {
+            const folderItem = container.createEl('div', {
+                text: folderPath || '(Root)',
+                attr: { 
+                    style: 'padding: 4px 8px; cursor: pointer; border-radius: 3px; margin: 2px 0;'
+                }
+            });
+
+            folderItem.addEventListener('mouseenter', () => {
+                folderItem.style.backgroundColor = 'var(--background-modifier-hover)';
+            });
+
+            folderItem.addEventListener('mouseleave', () => {
+                folderItem.style.backgroundColor = 'transparent';
+            });
+
+            folderItem.addEventListener('click', () => {
+                pathInput.value = folderPath;
+                pathInput.focus();
+            });
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class MoveFolderModal extends Modal {
+    private plugin: GDriveSyncPlugin;
+    private onSubmit: (targetPath: string) => void;
+
+    constructor(app: App, plugin: GDriveSyncPlugin, onSubmit: (targetPath: string) => void) {
+        super(app);
+        this.plugin = plugin;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { text: 'Move Folder' });
+
+        const inputContainer = contentEl.createEl('div', { 
+            attr: { style: 'margin: 20px 0;' }
+        });
+
+        const inputLabel = inputContainer.createEl('label', { 
+            text: 'Target Parent Folder Path:',
+            attr: { style: 'display: block; margin-bottom: 8px; font-weight: bold;' }
+        });
+
+        const pathInput = inputContainer.createEl('input', {
+            type: 'text',
+            placeholder: 'e.g., Archive (or leave empty for root)',
+            attr: { 
+                style: 'width: 100%; padding: 8px; border: 1px solid var(--background-modifier-border); border-radius: 4px;'
+            }
+        });
+
+        // 폴더 제안 목록 생성
+        const suggestionContainer = contentEl.createEl('div', {
+            attr: { style: 'margin: 10px 0;' }
+        });
+
+        const suggestionLabel = suggestionContainer.createEl('div', {
+            text: 'Available Parent Folders:',
+            attr: { style: 'font-weight: bold; margin-bottom: 8px;' }
+        });
+
+        const suggestionList = suggestionContainer.createEl('div', {
+            attr: { 
+                style: 'max-height: 150px; overflow-y: auto; border: 1px solid var(--background-modifier-border); border-radius: 4px; padding: 8px;'
+            }
+        });
+
+        // 사용 가능한 폴더 목록 표시
+        this.populateFolderSuggestions(suggestionList, pathInput);
+
+        pathInput.focus();
+
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--background-modifier-border);' }
+        });
+
+        const moveButton = buttonContainer.createEl('button', { 
+            text: 'Move',
+            cls: 'mod-cta'
+        });
+
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel'
+        });
+
+        const handleSubmit = () => {
+            const targetPath = pathInput.value.trim() || ''; // 빈 문자열은 루트를 의미
+
+            this.onSubmit(targetPath);
+            this.close();
+        };
+
+        moveButton.onclick = handleSubmit;
+        cancelButton.onclick = () => this.close();
+
+        pathInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                handleSubmit();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                this.close();
+            }
+        });
+    }
+
+    private populateFolderSuggestions(container: HTMLElement, pathInput: HTMLInputElement): void {
+        // 루트 옵션 추가
+        const rootItem = container.createEl('div', {
+            text: '(Root)',
+            attr: { 
+                style: 'padding: 4px 8px; cursor: pointer; border-radius: 3px; margin: 2px 0; font-style: italic;'
+            }
+        });
+
+        rootItem.addEventListener('mouseenter', () => {
+            rootItem.style.backgroundColor = 'var(--background-modifier-hover)';
+        });
+
+        rootItem.addEventListener('mouseleave', () => {
+            rootItem.style.backgroundColor = 'transparent';
+        });
+
+        rootItem.addEventListener('click', () => {
+            pathInput.value = '';
+            pathInput.focus();
+        });
+
+        // 기존 폴더들
+        const folders = this.app.vault.getAllLoadedFiles()
+            .filter(f => f instanceof TFolder)
+            .map(f => f.path)
+            .sort();
+
+        folders.forEach(folderPath => {
+            const folderItem = container.createEl('div', {
+                text: folderPath,
+                attr: { 
+                    style: 'padding: 4px 8px; cursor: pointer; border-radius: 3px; margin: 2px 0;'
+                }
+            });
+
+            folderItem.addEventListener('mouseenter', () => {
+                folderItem.style.backgroundColor = 'var(--background-modifier-hover)';
+            });
+
+            folderItem.addEventListener('mouseleave', () => {
+                folderItem.style.backgroundColor = 'transparent';
+            });
+
+            folderItem.addEventListener('click', () => {
+                pathInput.value = folderPath;
+                pathInput.focus();
+            });
+        });
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
+    }
+}
+
+class ConfirmDeleteModal extends Modal {
+    private title: string;
+    private description: string;
+    private onResult: (confirmed: boolean) => void;
+
+    constructor(app: App, title: string, description: string, onResult: (confirmed: boolean) => void) {
+        super(app);
+        this.title = title;
+        this.description = description;
+        this.onResult = onResult;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.empty();
+
+        contentEl.createEl('h2', { 
+            text: this.title,
+            attr: { style: 'color: var(--text-error);' }
+        });
+
+        contentEl.createEl('p', { 
+            text: this.description,
+            attr: { style: 'margin: 20px 0; line-height: 1.5;' }
+        });
+
+        const warningBox = contentEl.createEl('div', {
+            text: '⚠️ This action will affect both your local vault and Google Drive.',
+            attr: {
+                style: 'background: var(--background-modifier-error); padding: 12px; border-radius: 4px; margin: 15px 0; border-left: 4px solid var(--text-error);'
+            }
+        });
+
+        const buttonContainer = contentEl.createEl('div', { 
+            attr: { style: 'display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--background-modifier-border);' }
+        });
+
+        const deleteButton = buttonContainer.createEl('button', { 
+            text: 'Delete',
+            cls: 'mod-warning'
+        });
+
+        const cancelButton = buttonContainer.createEl('button', { 
+            text: 'Cancel',
+            cls: 'mod-cta'
+        });
+
+        deleteButton.onclick = () => {
+            this.onResult(true);
+            this.close();
+        };
+
+        cancelButton.onclick = () => {
+            this.onResult(false);
+            this.close();
+        };
+
+        // ESC 키로 취소
+        this.scope.register([], 'Escape', () => {
+            this.onResult(false);
+            this.close();
+        });
+
+        // 기본 포커스를 Cancel 버튼에
+        cancelButton.focus();
+    }
+
+    onClose() {
+        const { contentEl } = this;
+        contentEl.empty();
     }
 }
 
