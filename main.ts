@@ -8,7 +8,7 @@
  * 
  */
 
-import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent, Menu } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, Notice, TFolder, TFile, requestUrl, FuzzySuggestModal, Modal, TextComponent, Menu, TAbstractFile } from 'obsidian';
 import * as crypto from 'crypto';
 
 interface GDriveSyncSettings {
@@ -24,21 +24,17 @@ interface GDriveSyncSettings {
     tokenExpiresAt: number;
     driveFolder: string;
     includeSubfolders: boolean;
+    // syncMode: 'etag' | 'always' | 'modified' | 'checksum';
     lastSyncTime: number;
     syncDirection: 'upload' | 'download' | 'bidirectional';
     conflictResolution: 'local' | 'remote' | 'newer' | 'ask';
     createMissingFolders: boolean;
     selectedDriveFolders: Array<{id: string, name: string, path: string}>; // 선택된 Google Drive 폴더 정보
     fileStateCache: {[filePath: string]: FileState};
-
-    // Phase 2: New change detection settings
-    changeDetectionEnabled: boolean;
-    lastChangeToken: string;
-    changePollingInterval: number;    
-    persistentSnapshots: {[folderId: string]: FolderSnapshot};
+    lastRemoteSnapshot?: DriveSnapshot;
+    enableRemoteChangeDetection: boolean;    
 }
-
-// 파일 상태 인터페이스
+// 🔥 간소화된 파일 상태 인터페이스
 interface FileState {
     localHash?: string;          // Local file MD5 hash
     localModTime?: number;       // Local file modification time (mtime)
@@ -46,15 +42,12 @@ interface FileState {
     remoteModTime?: number;      // Remote file modification time
     lastSyncTime?: number;       // Last synchronization time
     version?: string;            // Google Drive version field
-    fileId?: string;
-    originalName?: string; 
-    parents?: string[]; 
 }
 
 // Sync decision result interface
 interface SyncDecision {
     shouldSync: boolean;
-    action: 'upload' | 'download' | 'deleted' | 'skip' | 'conflict';
+    action: 'upload' | 'download' | 'skip' | 'conflict';
     reason: string;
     localHash?: string;
     remoteHash?: string;
@@ -62,6 +55,8 @@ interface SyncDecision {
 }
 
 // Phase 1: 기본 동시 작업 구현
+// 1. 동시 작업 인터페이스
+
 interface SyncOperationContext {
     file: TFile | TFolder;
     originalPath: string;
@@ -83,27 +78,25 @@ const DEFAULT_SETTINGS: GDriveSyncSettings = {
     tokenExpiresAt: 0,
     driveFolder: 'Obsidian-Sync',
     includeSubfolders: true,
+    // syncMode: 'etag',
     lastSyncTime: 0,
     syncDirection: 'bidirectional',
     conflictResolution: 'newer',
     createMissingFolders: true,
     selectedDriveFolders: [],
     fileStateCache: {},
-    changeDetectionEnabled: false,
-    lastChangeToken: '',
-    changePollingInterval: 30000, // 30 seconds
-    persistentSnapshots: {}
+    enableRemoteChangeDetection: true
 };
 
 // 동기화 결과 인터페이스
 interface SyncResult {
     uploaded: number;
     downloaded: number;
-    deleted: number;
     skipped: number;
     conflicts: number;
     errors: number;
     createdFolders: string[];
+    remoteChangesApplied?: number;
 }
 
 // Google Drive 폴더 인터페이스
@@ -113,6 +106,7 @@ interface DriveFolder {
     path: string;
     mimeType: string;
     parents?: string[];
+    modifiedTime: string;  
     isShortcut?: boolean;        // 바로가기 여부
     shortcutTarget?: string;     // 바로가기가 가리키는 실제 ID    
 }
@@ -120,1755 +114,73 @@ interface FolderListItem extends DriveFolder {
     isSelected: boolean;     // 현재 동기화 대상 여부
     canSelect: boolean;      // 선택 가능 여부
 }
+interface DriveSnapshot {
+    files: DriveFile[];
+    folders: DriveFolder[];
+    scanTime: number;
+}
 
-// Phase 2: Change Tracking - Core Interfaces and Types
+interface DriveFile {
+    id: string;
+    name: string;
+    path: string;
+    mimeType: string;
+    parents?: string[];
+    md5Checksum?: string;
+    modifiedTime: string;
+    size?: number;
+}
 
-interface DriveChangeEvent {
-    changeType: 'rename' | 'move' | 'delete' | 'create' | 'modify';
-    resourceType: 'file' | 'folder';
-    resourceId: string;
-    resourceName: string;
+interface RemoteChange {
+    type: 'create_folder' | 'rename_folder' | 'move_folder' | 'move_file' | 'rename_file' | 'modify' | 'delete_file' | 'delete_folder';
+    priority: number;
+    fileId: string;
+    fileName: string;
+    isFolder: boolean;
+    oldPath?: string;
+    newPath?: string;
     oldName?: string;
     newName?: string;
-    oldParents?: string[];
-    newParents?: string[];
-    modifiedTime: string;
-    removed?: boolean;
-    changeTime: number;
-    deleteReason?: string;  // ('explicitly_trashed' | 'parent_trashed' | 'not_found')
-    filePath?: string;  // local file path
+    modifiedTime: number;
+    dependencies?: string[];
+    details?: any;
 }
 
-interface FolderSnapshot {
-    folderId: string;
-    folderName: string;
-    parentId: string;
-    childFiles: Array<{
-        id: string;
-        name: string;
-        modifiedTime: string;
-        md5Checksum?: string;
-    }>;
-    childFolders: Array<{
-        id: string;
-        name: string;
-        modifiedTime: string;
-    }>;
-    lastSnapshot: number;
-    snapshotHash: string; // For quick comparison
+interface RemoteChangeDetectionResult {
+    changes: RemoteChange[];
+    hasChanges: boolean;
+    conflictingChanges?: RemoteChange[];
+    summary: {
+        created: number;
+        deleted: number;
+        moved: number;
+        renamed: number;
+        modified: number;
+    };
 }
 
-interface ChangeProcessingResult {
-    processed: number;
-    errors: number;
-    skipped: number;
-    conflicts: number;
-    details: string[];
+interface SnapshotComparison {
+    byId: Map<string, {cached?: DriveFile, current?: DriveFile}>;
+    operations: {
+        created: (DriveFile | DriveFolder)[];
+        deleted: {id: string, path: string}[];
+        moved: {id: string, oldPath: string, newPath: string}[];
+        renamed: {id: string, oldName: string, newName: string}[];
+        modified: {id: string, oldHash: string, newHash: string}[];
+    };
 }
 
-interface ChangeDetectionState {
-    lastChangeToken: string;
-    lastPollingTime: number;
-    isPollingActive: boolean;
-    snapshots: Map<string, FolderSnapshot>;
-    pendingChanges: DriveChangeEvent[];
-}
-
-interface SyncChangeResult {
-    deletions: DriveChangeEvent[];     // changeType: 'delete'
-    modifications: DriveChangeEvent[]; // changeType: 'modify' 
-    additions: DriveChangeEvent[];     // changeType: 'create'
-    renames: DriveChangeEvent[];       // changeType: 'rename'
-    moves: DriveChangeEvent[];         // changeType: 'move'
-}
-
-// 2. 파일 ID 매핑 관리 클래스
-class FileIdMapper {
-    private plugin: GDriveSyncPlugin;
-    private idToPathMap: Map<string, string> = new Map();
-    private pathToIdMap: Map<string, string> = new Map();
-
-    constructor(plugin: GDriveSyncPlugin) {
-        this.plugin = plugin;
-        this.loadMappingsFromCache();
-    }
-
-    // 캐시에서 매핑 로드
-    private loadMappingsFromCache(): void {
-        for (const [filePath, state] of Object.entries(this.plugin.settings.fileStateCache)) {
-            if (state.fileId) {
-                this.idToPathMap.set(state.fileId, filePath);
-                this.pathToIdMap.set(filePath, state.fileId);
-            }
-        }
-        console.log(`📋 Loaded ${this.idToPathMap.size} file ID mappings from cache`);
-    }
-
-    // 매핑 추가/업데이트
-    public setMapping(fileId: string, filePath: string): void {
-        // 기존 매핑 정리
-        const oldPath = this.idToPathMap.get(fileId);
-        if (oldPath && oldPath !== filePath) {
-            this.pathToIdMap.delete(oldPath);
-        }
-
-        const oldId = this.pathToIdMap.get(filePath);
-        if (oldId && oldId !== fileId) {
-            this.idToPathMap.delete(oldId);
-        }
-
-        // 새 매핑 설정
-        this.idToPathMap.set(fileId, filePath);
-        this.pathToIdMap.set(filePath, fileId);
-
-        // 캐시에도 저장
-        const state = this.plugin.getFileState(filePath);
-        state.fileId = fileId;
-        this.plugin.setFileState(filePath, state);
-    }
-
-    // ID로 로컬 경로 찾기
-    public getLocalPathById(fileId: string): string | null {
-        return this.idToPathMap.get(fileId) || null;
-    }
-
-    // 경로로 파일 ID 찾기
-    public getFileIdByPath(filePath: string): string | null {
-        return this.pathToIdMap.get(filePath) || null;
-    }
-
-    // 매핑 제거
-    public removeMapping(filePath: string): void {
-        const fileId = this.pathToIdMap.get(filePath);
-        if (fileId) {
-            this.idToPathMap.delete(fileId);
-            this.pathToIdMap.delete(filePath);
-        }
-    }
-
-    // 매핑 업데이트 (파일명 변경 시)
-    public updatePathMapping(oldPath: string, newPath: string): void {
-        const fileId = this.pathToIdMap.get(oldPath);
-        if (fileId) {
-            this.pathToIdMap.delete(oldPath);
-            this.pathToIdMap.set(newPath, fileId);
-            this.idToPathMap.set(fileId, newPath);
-        }
-    
-        // 폴더인 경우 하위 모든 파일/폴더 매핑도 업데이트
-        const affectedPaths = Array.from(this.pathToIdMap.keys())
-            .filter(path => path.startsWith(oldPath + '/'));
-        
-        for (const affectedPath of affectedPaths) {
-            const affectedFileId = this.pathToIdMap.get(affectedPath);
-            if (affectedFileId) {
-                const newAffectedPath = affectedPath.replace(oldPath, newPath);
-                this.pathToIdMap.delete(affectedPath);
-                this.pathToIdMap.set(newAffectedPath, affectedFileId);
-                this.idToPathMap.set(affectedFileId, newAffectedPath);
-            }
-        }
-    }
-}
-
-// Drive Change Detection Service
-class DriveChangeDetectionService {
-    private plugin: GDriveSyncPlugin;
-    private pollingInterval: number = 30000; // 30 seconds
-    private pollingIntervalId: number | null = null;
-    private isPolling: boolean = false;
-    private changeDetectionState: ChangeDetectionState;
-
-    constructor(plugin: GDriveSyncPlugin) {
-        this.plugin = plugin;
-        this.changeDetectionState = {
-            lastChangeToken: '',
-            lastPollingTime: 0,
-            isPollingActive: false,
-            snapshots: new Map(),
-            pendingChanges: []
-        };
-    }
-
-    async getChangesForSync(): Promise<SyncChangeResult> {
-        console.log('🔍 [CHANGE_SERVICE] Getting changes for sync...');
-        
-        const result: SyncChangeResult = {
-            deletions: [],
-            modifications: [],
-            additions: [],
-            renames: [],
-            moves: []
-        };
-        
-        try {
-            // Use existing polling mechanism
-            await this.pollForChanges();
-            
-            // Get pending changes and categorize them
-            const pendingChanges = this.getPendingChanges();
-            this.categorizeChangesForSync(pendingChanges, result);
-            
-            // Additionally check via cache comparison for missed deletions
-            await this.detectCacheMismatchDeletions(result);
-            
-            console.log(`✅ [CHANGE_SERVICE] Sync changes detected: ${result.deletions.length} deletions, ${result.modifications.length} modifications, ${result.additions.length} additions`);
-            
-        } catch (error) {
-            console.error('❌ [CHANGE_SERVICE] Failed to get sync changes:', error);
-            
-            // Fallback: cache-only detection
-            await this.detectCacheMismatchDeletions(result);
-        }
-        
-        return result;
-    }
-
-    private getPendingChanges(): DriveChangeEvent[] {
-        // Return copy of pending changes from existing state
-        return [...this.changeDetectionState.pendingChanges];
-    }
-
-    private categorizeChangesForSync(changes: DriveChangeEvent[], result: SyncChangeResult): void {
-        for (const change of changes) {
-            switch (change.changeType) {
-                case 'delete':
-                    result.deletions.push(change);
-                    break;
-                case 'modify':
-                    result.modifications.push(change);
-                    break;
-                case 'create':
-                    result.additions.push(change);
-                    break;
-                case 'rename':
-                    result.renames.push(change);
-                    break;
-                case 'move':
-                    result.moves.push(change);
-                    break;
-            }
-        }
-    }
-
-    private async detectCacheMismatchDeletions(result: SyncChangeResult): Promise<void> {
-        console.log('🔍 [CHANGE_SERVICE] Detecting cache mismatch deletions...');
-        
-        try {
-            const syncFolders = await this.getSyncScopeFolders();
-            
-            for (const folder of syncFolders) {
-                await this.checkFolderForDeletions(folder, result);
-            }
-            
-            console.log(`✅ [CHANGE_SERVICE] Cache mismatch check complete: ${result.deletions.length} total deletions`);
-            
-        } catch (error) {
-            console.error('❌ [CHANGE_SERVICE] Cache mismatch detection failed:', error);
-        }
-    }
-
-    private async checkFolderForDeletions(
-        folder: {id: string, name: string, path: string},
-        result: SyncChangeResult
-    ): Promise<void> {
-        try {
-            console.log(`🔍 [CHANGE_SERVICE] Checking deletions in folder: ${folder.name}`);
-            
-            const currentRemoteFiles = await this.plugin.getAllFilesFromDrive(folder.id, folder.path);
-            const remoteFilePaths = new Set(currentRemoteFiles.map(f => f.path));
-            
-            const cachedStates = this.getCachedStatesForFolder(folder.path);
-            
-            for (const [cachedPath, cachedState] of cachedStates) {
-                if (cachedState.fileId && !remoteFilePaths.has(cachedPath)) {
-                    const fileStatus = await this.verifyFileStatus(cachedState.fileId);
-                    
-                    if (fileStatus.deleted) {
-                        // 🔥 Create DriveChangeEvent using existing interface
-                        const deleteEvent: DriveChangeEvent = {
-                            changeType: 'delete',
-                            resourceType: 'file',
-                            resourceId: cachedState.fileId,
-                            resourceName: cachedState.originalName || this.getFileNameFromPath(cachedPath),
-                            modifiedTime: new Date().toISOString(),
-                            removed: true,
-                            changeTime: Date.now(),
-                            deleteReason: fileStatus.reason, 
-                            filePath: cachedPath             
-                        };
-                        
-                        result.deletions.push(deleteEvent);
-                        console.log(`🗑️ [CHANGE_SERVICE] Confirmed deletion: ${cachedPath} (${fileStatus.reason})`);
-                    }
-                }
-            }
-            
-        } catch (error) {
-            console.error(`❌ [CHANGE_SERVICE] Error checking folder ${folder.name}:`, error);
-        }
-    }
-    
-    async processPendingDeletions(
-        deletions: DriveChangeEvent[],  // 🔥 Use existing interface
-        progressModal?: SyncProgressModal
-    ): Promise<ChangeProcessingResult> {  // 🔥 Use existing interface
-        console.log(`🗑️ [CHANGE_SERVICE] Processing ${deletions.length} pending deletions...`);
-        
-        const result: ChangeProcessingResult = {
-            processed: 0,
-            errors: 0,
-            skipped: 0,
-            conflicts: 0,  // Not used for deletions, but part of existing interface
-            details: []
-        };
-        
-        for (const deletion of deletions) {
-            try {
-                await this.processSingleDeletion(deletion, result, progressModal);
-            } catch (error) {
-                console.error(`❌ [CHANGE_SERVICE] Error processing deletion ${deletion.filePath || deletion.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Failed: ${deletion.resourceName} - ${error.message}`);
-                progressModal?.addLog(`❌ Failed to delete: ${deletion.resourceName}`);
-            }
-        }
-        
-        console.log(`✅ [CHANGE_SERVICE] Deletion processing complete: ${result.processed} processed, ${result.errors} errors, ${result.skipped} skipped`);
-        return result;
-    }
-
-    private async processSingleDeletion(
-        deletion: DriveChangeEvent,
-        result: ChangeProcessingResult,
-        progressModal?: SyncProgressModal
-    ): Promise<void> {
-        const filePath = deletion.filePath;
-        if (!filePath) {
-            console.log(`⏭️ Deletion event has no path, skipping cache cleanup.`);
-            result.skipped++;
-            return;
-        }
-        
-        // Check if local item exists
-        const localItem = this.plugin.app.vault.getAbstractFileByPath(filePath);
-    
-        if (!localItem) {
-            console.log(`⏭️ Local item not found: ${filePath} - cleaning cache only`);
-            await this.cleanupFileState(filePath);
-            result.processed++;
-            return;
-        }
-    
-        // Apply conflict resolution strategy
-        const shouldDelete = this.shouldDeleteLocalFile();
-        if (!shouldDelete) {
-            console.log(`⏭️ Skipping deletion (local preference): ${filePath}`);
-            result.skipped++;
-            return;
-        }
-    
-        try {
-            console.log(`🗑️ Deleting local item: ${filePath}`);
-            
-            // 💡 폴더인지 파일인지 확인하고 삭제
-            if (localItem instanceof TFolder) {
-                await this.plugin.app.vault.delete(localItem, true); // `true` for permanent delete
-                await this.cleanupFileState(filePath); // Cleanup cache for the folder and its children
-            } else {
-                await this.plugin.app.vault.delete(localItem, true);
-                await this.cleanupFileState(filePath);
-            }
-            
-            result.processed++;
-            console.log(`✅ Successfully deleted: ${filePath}`);
-        } catch (error) {
-            console.error(`❌ Failed to delete ${filePath}:`, error);
-            throw error;
-        }
-    }
-
-    private getCachedStatesForFolder(folderPath: string): Map<string, FileState> {
-        const states = new Map<string, FileState>();
-        
-        for (const [filePath, state] of Object.entries(this.plugin.settings.fileStateCache)) {
-            if (!folderPath) {
-                states.set(filePath, state);
-            } else {
-                if (filePath === folderPath || filePath.startsWith(folderPath + '/')) {
-                    states.set(filePath, state);
-                }
-            }
-        }
-        
-        console.log(`📋 [CHANGE_SERVICE] Found ${states.size} cached states for folder: ${folderPath || 'root'}`);
-        return states;
-    }
-    
-    private async getSyncScopeFolders(): Promise<Array<{id: string, name: string, path: string}>> {
-        const folders: Array<{id: string, name: string, path: string}> = [];
-        
-        if (this.plugin.settings.syncWholeVault) {
-            const rootFolder = await this.plugin.getOrCreateDriveFolder();
-            if (rootFolder) {
-                folders.push({
-                    id: rootFolder.id,
-                    name: rootFolder.name,
-                    path: ''
-                });
-            }
-        } else {
-            folders.push(...this.plugin.settings.selectedDriveFolders);
-        }
-        
-        return folders;
-    }
-
-    private async verifyFileStatus(fileId: string): Promise<{deleted: boolean, reason: string}> {
-        try {
-            const response = await this.plugin.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,trashed,explicitlyTrashed&supportsAllDrives=true`,
-                { method: 'GET' }
-            );
-            
-            if (response.status === 200) {
-                const fileInfo = response.json;
-                
-                if (fileInfo.trashed) {
-                    return { 
-                        deleted: true, 
-                        reason: fileInfo.explicitlyTrashed ? 'explicitly_trashed' : 'parent_trashed'
-                    };
-                } else {
-                    return { deleted: false, reason: 'exists' };
-                }
-                
-            } else if (response.status === 404) {
-                return { deleted: true, reason: 'not_found' };
-            } else {
-                console.warn(`⚠️ [CHANGE_SERVICE] Unexpected response verifying file ${fileId}: ${response.status}`);
-                return { deleted: false, reason: 'verification_failed' };
-            }
-            
-        } catch (error) {
-            console.error(`❌ [CHANGE_SERVICE] Error verifying file ${fileId}:`, error);
-            return { deleted: false, reason: 'verification_error' };
-        }
-    }
-
-    private getFileNameFromPath(filePath: string): string {
-        return filePath.split('/').pop() || filePath;
-    }
-    
-    private shouldDeleteLocalFile(): boolean {
-        const strategy = this.plugin.settings.conflictResolution;
-        
-        switch (strategy) {
-            case 'local':
-                return false;
-            case 'remote':
-            case 'newer':
-            case 'ask':
-                return true;
-            default:
-                return true;
-        }
-    }
-
-    private async cleanupFileState(filePath: string): Promise<void> {
-        const normalizedPath = this.plugin.normalizeFullPath(filePath);
-        
-        if (this.plugin.settings.fileStateCache[normalizedPath]) {
-            delete this.plugin.settings.fileStateCache[normalizedPath];
-            await this.plugin.saveSettings();
-            console.log(`💾 [CHANGE_SERVICE] File state cleaned: ${filePath}`);
-        }
-    }
-
-    
-    async startPolling(): Promise<void> {
-        if (this.isPolling) {
-            console.log('📡 Change detection already running');
-            return;
-        }
-
-        if (!this.plugin.isAuthenticated()) {
-            console.log('❌ Cannot start change detection - not authenticated');
-            return;
-        }
-
-        console.log('🚀 Starting Drive change detection polling...');
-        
-        try {
-            // Initialize change token if not exists
-            if (!this.changeDetectionState.lastChangeToken) {
-                await this.initializeChangeToken();
-            }
-
-            // Create initial snapshots
-            await this.createInitialSnapshots();
-
-            this.isPolling = true;
-            this.changeDetectionState.isPollingActive = true;
-            
-            // Start polling interval
-            this.pollingIntervalId = window.setInterval(async () => {
-                try {
-                    await this.pollForChanges();
-                } catch (error) {
-                    console.error('❌ Polling error:', error);
-                }
-            }, this.pollingInterval);
-
-            console.log(`✅ Change detection started - polling every ${this.pollingInterval / 1000}s`);
-            
-        } catch (error) {
-            console.error('❌ Failed to start change detection:', error);
-            this.isPolling = false;
-            this.changeDetectionState.isPollingActive = false;
-        }
-    }
-
-    async stopPolling(): Promise<void> {
-        console.log('🛑 Stopping Drive change detection...');
-        
-        if (this.pollingIntervalId) {
-            window.clearInterval(this.pollingIntervalId);
-            this.pollingIntervalId = null;
-        }
-        
-        this.isPolling = false;
-        this.changeDetectionState.isPollingActive = false;
-        
-        console.log('✅ Change detection stopped');
-    }
-
-    async pollForChanges(): Promise<void> {
-        if (!this.plugin.isAuthenticated()) {
-            console.log('⚠️ Authentication lost - stopping change detection');
-            //await this.stopPolling();
-            return;
-        }
-
-        try {
-            console.log('🔍 Polling for Drive changes...');
-            this.changeDetectionState.lastPollingTime = Date.now();
-
-            // Step 1: Check Changes API
-            const apiChanges = await this.getChangesFromAPI();
-            
-            // Step 2: Update snapshots and detect detailed changes
-            const detailedChanges = await this.detectDetailedChanges();
-            
-            // Step 3: Merge and classify changes
-            const allChanges = this.mergeChanges(apiChanges, detailedChanges);
-            
-            if (allChanges.length > 0) {
-                console.log(`📋 Found ${allChanges.length} changes to process`);
-                
-                // Step 4: Process changes
-                const processor = new RemoteChangeProcessor(this.plugin);
-                await processor.processChanges(allChanges);
-
-                //  변경 사항 처리 후, 스냅샷과 캐시를 업데이트해야 다음 폴링에서
-                // 이미 처리된 변경 사항을 다시 감지하지 않습니다.
-                await this.plugin.updateChangeDetectionSnapshots();
-                await this.plugin.saveSettings();
-            } else {
-                console.log('✅ No changes detected');
-            }
-
-        } catch (error) {
-            console.error('❌ Error during change polling:', error);
-        }
-    }
-
-    private async initializeChangeToken(): Promise<void> {
-        try {
-            console.log('🎯 Initializing change token...');
-            
-            const response = await this.plugin.makeAuthenticatedRequest(
-                'https://www.googleapis.com/drive/v3/changes/startPageToken?supportsAllDrives=true',
-                { method: 'GET' }
-            );
-
-            if (response.status === 200) {
-                this.changeDetectionState.lastChangeToken = response.json.startPageToken;
-                console.log(`✅ Change token initialized: ${this.changeDetectionState.lastChangeToken}`);
-            } else {
-                throw new Error(`Failed to get start page token: ${response.status}`);
-            }
-
-        } catch (error) {
-            console.error('❌ Failed to initialize change token:', error);
-            throw error;
-        }
-    }
-
-    private async createInitialSnapshots(): Promise<void> {
-        console.log('📸 Creating initial folder snapshots...');
-        
-        try {
-            const snapshotManager = new DriveSnapshotManager(this.plugin);
-            
-            if (this.plugin.settings.syncWholeVault) {
-                const rootFolder = await this.plugin.getOrCreateDriveFolder();
-                if (rootFolder) {
-                    const snapshot = await snapshotManager.createSnapshot(rootFolder.id);
-                    this.changeDetectionState.snapshots.set(rootFolder.id, snapshot);
-                    console.log(`📸 Root snapshot created: ${rootFolder.name}`);
-                }
-            } else {
-                for (const selectedFolder of this.plugin.settings.selectedDriveFolders) {
-                    const snapshot = await snapshotManager.createSnapshot(selectedFolder.id);
-                    this.changeDetectionState.snapshots.set(selectedFolder.id, snapshot);
-                    console.log(`📸 Snapshot created: ${selectedFolder.name}`);
-                }
-            }
-
-            console.log(`✅ Created ${this.changeDetectionState.snapshots.size} initial snapshots`);
-
-        } catch (error) {
-            console.error('❌ Failed to create initial snapshots:', error);
-            throw error;
-        }
-    }
-
-    private async getChangesFromAPI(): Promise<DriveChangeEvent[]> {
-        const changes: DriveChangeEvent[] = [];
-        
-        try {
-            let pageToken = this.changeDetectionState.lastChangeToken;
-            let hasMore = true;
-            
-            while (hasMore) {
-                const params = new URLSearchParams({
-                    pageToken: pageToken,
-                    supportsAllDrives: 'true',
-                    includeItemsFromAllDrives: 'true',
-                    fields: 'nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,parents,mimeType,modifiedTime,trashed))'
-                });
-
-                const response = await this.plugin.makeAuthenticatedRequest(
-                    `https://www.googleapis.com/drive/v3/changes?${params.toString()}`,
-                    { method: 'GET' }
-                );
-
-                if (response.status !== 200) {
-                    console.error('❌ Changes API failed:', response.status);
-                    break;
-                }
-
-                const data = response.json;
-                
-                // Process changes
-                for (const change of data.changes || []) {
-                    const changeEvent = this.parseAPIChange(change);
-                    if (changeEvent) {
-                        changes.push(changeEvent);
-                    }
-                }
-
-                // Update pagination
-                if (data.nextPageToken) {
-                    pageToken = data.nextPageToken;
-                } else {
-                    hasMore = false;
-                    // Update our change token
-                    if (data.newStartPageToken) {
-                        this.changeDetectionState.lastChangeToken = data.newStartPageToken;
-                    }
-                }
-            }
-
-            console.log(`📡 Changes API returned ${changes.length} changes`);
-            return changes;
-
-        } catch (error) {
-            console.error('❌ Error fetching changes from API:', error);
-            return [];
-        }
-    }
-
-    private parseAPIChange(change: any): DriveChangeEvent | null {
-        try {
-            const file = change.file;
-            const fileId = change.fileId;
-            const removed = change.removed;
-    
-            if (!this.isInSyncScope(file)) {
-                return null;
-            }
-    
-            let changeType: DriveChangeEvent['changeType'];
-            const resourceType: DriveChangeEvent['resourceType'] = 
-                file?.mimeType === 'application/vnd.google-apps.folder' ? 'folder' : 'file';
-    
-            // Get cached state for comparison
-            const cachedPath = this.plugin.fileIdMapper.getLocalPathById(fileId);
-            const cachedState = cachedPath ? this.plugin.getFileState(cachedPath) : null;
-            
-            const oldName = cachedState?.originalName;
-            const newName = file?.name;
-    
-            if (removed || (file && file.trashed)) {
-                changeType = 'delete';
-            } else if (file) {
-                // Check for name or parent changes to infer rename/move
-                const oldParents = cachedState?.parents || [];
-                const newParents = file.parents || [];
-    
-                const isNameChanged = newName !== oldName && oldName !== undefined;
-                const isParentsChanged = !this.arraysEqual(oldParents, newParents);
-    
-                if (isNameChanged && isParentsChanged) {
-                    changeType = 'move';
-                } else if (isNameChanged) {
-                    changeType = 'rename';
-                } else if (isParentsChanged) {
-                    changeType = 'move';
-                } else {
-                    changeType = 'modify';
-                }
-                console.error('parseAPIChange :', changeType, ':' , file);
-            } else {
-                // An unknown or unhandled change
-                return null;
-            }
-    
-            return {
-                changeType,
-                resourceType,
-                resourceId: fileId,
-                resourceName: newName || oldName || 'Unknown',
-                oldName: oldName,
-                newName: newName,
-                oldParents: cachedState?.parents,
-                newParents: file?.parents,
-                modifiedTime: file?.modifiedTime || new Date().toISOString(),
-                removed: removed || file?.trashed,
-                changeTime: Date.now()
-            };
-    
-        } catch (error) {
-            console.error('❌ Error parsing API change:', error);
-            return null;
-        }
-    }
-    
-    // Helper function to compare arrays
-    private arraysEqual(a: string[] | undefined, b: string[] | undefined): boolean {
-        if (a === b) return true;
-        if (!a || !b || a.length !== b.length) return false;
-        for (let i = 0; i < a.length; i++) {
-            if (a[i] !== b[i]) return false;
-        }
-        return true;
-    }
-
-    private isInSyncScope(file: any): boolean {
-        if (!file) return false;
-
-        // Check if file is in any of our sync folders
-        const parents = file.parents || [];
-        
-        if (this.plugin.settings.syncWholeVault) {
-            // For whole vault sync, check if in root folder or its descendants
-            // This is a simplified check - could be enhanced
-            return true;
-        } else {
-            // Check if in selected folders
-            return this.plugin.settings.selectedDriveFolders.some(folder => 
-                parents.includes(folder.id)
-            );
-        }
-    }
-
-    private async detectDetailedChanges(): Promise<DriveChangeEvent[]> {
-        const changes: DriveChangeEvent[] = [];
-        const snapshotManager = new DriveSnapshotManager(this.plugin);
-
-        try {
-            for (const [folderId, oldSnapshot] of this.changeDetectionState.snapshots) {
-                // Create new snapshot
-                const newSnapshot = await snapshotManager.createSnapshot(folderId);
-                
-                // Compare snapshots to detect detailed changes
-                const snapshotChanges = await snapshotManager.compareSnapshots(oldSnapshot, newSnapshot);
-                changes.push(...snapshotChanges);
-                
-                // Update stored snapshot
-                this.changeDetectionState.snapshots.set(folderId, newSnapshot);
-            }
-
-            console.log(`📊 Snapshot comparison found ${changes.length} detailed changes`);
-            return changes;
-
-        } catch (error) {
-            console.error('❌ Error in detailed change detection:', error);
-            return [];
-        }
-    }
-
-    private mergeChanges(apiChanges: DriveChangeEvent[], snapshotChanges: DriveChangeEvent[]): DriveChangeEvent[] {
-        const mergedChanges = new Map<string, DriveChangeEvent>();
-    
-        // Add API and snapshot changes to a map, prioritizing more detailed snapshot changes
-        for (const change of [...apiChanges, ...snapshotChanges]) {
-            mergedChanges.set(change.resourceId, change);
-        }
-    
-        const changesArray = Array.from(mergedChanges.values());
-    
-        // 💡 변경: rename 추론 로직 추가
-        const deletions = changesArray.filter(c => c.changeType === 'delete');
-        const creations = changesArray.filter(c => c.changeType === 'create');
-        const renames: DriveChangeEvent[] = [];
-    
-        // 삭제된 항목과 새로 생성된 항목을 비교하여 rename을 추론합니다.
-        for (const creation of creations) {
-            // 새로 생성된 파일/폴더와 이름이 같은 삭제된 항목을 찾습니다.
-            const matchingDeletion = deletions.find(d => 
-                d.resourceName === creation.resourceName && d.resourceType === creation.resourceType
-            );
-    
-            if (matchingDeletion) {
-                // rename 이벤트로 통합
-                renames.push({
-                    changeType: 'rename',
-                    resourceType: creation.resourceType,
-                    resourceId: matchingDeletion.resourceId, // 이전 ID를 사용하여 추적
-                    resourceName: creation.resourceName,
-                    oldName: matchingDeletion.resourceName,
-                    newName: creation.resourceName,
-                    modifiedTime: creation.modifiedTime,
-                    changeTime: Date.now()
-                });
-    
-                // 원본 목록에서 삭제 및 생성을 제거하여 중복 처리를 방지합니다.
-                const deletionIndex = changesArray.indexOf(matchingDeletion);
-                if (deletionIndex > -1) {
-                    changesArray.splice(deletionIndex, 1);
-                }
-                const creationIndex = changesArray.indexOf(creation);
-                if (creationIndex > -1) {
-                    changesArray.splice(creationIndex, 1);
-                }
-            }
-        }
-        
-        // 최종 변경 목록에 rename 이벤트를 추가합니다.
-        changesArray.push(...renames);
-    
-        return changesArray;
-    }
-
-    isActive(): boolean {
-        return this.isPolling && this.changeDetectionState.isPollingActive;
-    }
-
-    getStatus(): ChangeDetectionState {
-        return { ...this.changeDetectionState };
-    }
-    getSnapshots(): Map<string, FolderSnapshot> {
-        return this.changeDetectionState.snapshots;
-    }
-    setSnapshot(folderId: string, snapshot: FolderSnapshot): void {
-        this.changeDetectionState.snapshots.set(folderId, snapshot);
-    }
-    clearSnapshots(): void {
-        this.changeDetectionState.snapshots.clear();
-    }
-    hasSnapshot(folderId: string): boolean {
-        return this.changeDetectionState.snapshots.has(folderId);
-    }
-}
-
-// Drive Snapshot Manager
-class DriveSnapshotManager {
-    private plugin: GDriveSyncPlugin;
-    
-    constructor(plugin: GDriveSyncPlugin) {
-        this.plugin = plugin;
-    }
-
-    async createSnapshot(folderId: string): Promise<FolderSnapshot> {
-        try {
-            console.log(`📸 Creating snapshot for folder: ${folderId}`);
-
-            // Get folder information
-            const folderInfo = await this.getFolderInfo(folderId);
-            
-            // Get child files and folders
-            const children = await this.getChildItems(folderId);
-            
-            const snapshot: FolderSnapshot = {
-                folderId: folderId,
-                folderName: folderInfo.name,
-                parentId: folderInfo.parentId || '',
-                childFiles: children.files,
-                childFolders: children.folders,
-                lastSnapshot: Date.now(),
-                snapshotHash: this.calculateSnapshotHash(children)
-            };
-
-            console.log(`✅ Snapshot created: ${snapshot.folderName} (${snapshot.childFiles.length} files, ${snapshot.childFolders.length} folders)`);
-            return snapshot;
-
-        } catch (error) {
-            console.error(`❌ Failed to create snapshot for ${folderId}:`, error);
-            throw error;
-        }
-    }
-
-    async compareSnapshots(oldSnapshot: FolderSnapshot, newSnapshot: FolderSnapshot): Promise<DriveChangeEvent[]> {
-        const changes: DriveChangeEvent[] = [];
-
-        try {
-            console.log(`🔍 Comparing snapshots for: ${oldSnapshot.folderName}`);
-
-            // Quick hash comparison first
-            if (oldSnapshot.snapshotHash === newSnapshot.snapshotHash) {
-                console.log(`✅ No changes detected (hash match): ${oldSnapshot.folderName}`);
-                return changes;
-            }
-
-            // Detailed comparison
-            // 1. Compare files
-            const fileChanges = this.compareFiles(oldSnapshot.childFiles, newSnapshot.childFiles);
-            changes.push(...fileChanges);
-
-            // 2. Compare folders
-            const folderChanges = await this.compareFolders(oldSnapshot.childFolders, newSnapshot.childFolders);
-            changes.push(...folderChanges);
-
-            console.log(`📊 Snapshot comparison found ${changes.length} changes in ${oldSnapshot.folderName}`);
-            return changes;
-
-        } catch (error) {
-            console.error(`❌ Error comparing snapshots for ${oldSnapshot.folderName}:`, error);
-            return [];
-        }
-    }
-
-    private async getFolderInfo(folderId: string): Promise<{name: string, parentId?: string}> {
-        try {
-            const response = await this.plugin.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,parents&supportsAllDrives=true`,
-                { method: 'GET' }
-            );
-
-            if (response.status === 200) {
-                const folder = response.json;
-                return {
-                    name: folder.name,
-                    parentId: folder.parents?.[0]
-                };
-            } else {
-                throw new Error(`Failed to get folder info: ${response.status}`);
-            }
-
-        } catch (error) {
-            console.error(`❌ Error getting folder info for ${folderId}:`, error);
-            throw error;
-        }
-    }
-
-    private async getChildItems(folderId: string): Promise<{
-        files: Array<{id: string, name: string, modifiedTime: string, md5Checksum?: string}>,
-        folders: Array<{id: string, name: string, modifiedTime: string}>
-    }> {
-        const files: Array<{id: string, name: string, modifiedTime: string, md5Checksum?: string}> = [];
-        const folders: Array<{id: string, name: string, modifiedTime: string}> = [];
-
-        try {
-            let pageToken = '';
-            
-            do {
-                const params = new URLSearchParams({
-                    q: `'${folderId}' in parents and trashed=false`,
-                    fields: 'nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum)',
-                    pageSize: '1000',
-                    supportsAllDrives: 'true',
-                    includeItemsFromAllDrives: 'true'
-                });
-
-                if (pageToken) {
-                    params.append('pageToken', pageToken);
-                }
-
-                const response = await this.plugin.makeAuthenticatedRequest(
-                    `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
-                    { method: 'GET' }
-                );
-
-                if (response.status !== 200) {
-                    throw new Error(`Failed to list children: ${response.status}`);
-                }
-
-                const data = response.json;
-                
-                for (const item of data.files || []) {
-                    if (item.mimeType === 'application/vnd.google-apps.folder') {
-                        folders.push({
-                            id: item.id,
-                            name: item.name,
-                            modifiedTime: item.modifiedTime
-                        });
-                    } else {
-                        files.push({
-                            id: item.id,
-                            name: item.name,
-                            modifiedTime: item.modifiedTime,
-                            md5Checksum: item.md5Checksum
-                        });
-                    }
-                }
-
-                pageToken = data.nextPageToken || '';
-            } while (pageToken);
-
-            return { files, folders };
-
-        } catch (error) {
-            console.error(`❌ Error getting child items for ${folderId}:`, error);
-            throw error;
-        }
-    }
-
-    private calculateSnapshotHash(children: {
-        files: Array<{id: string, name: string, modifiedTime: string, md5Checksum?: string}>,
-        folders: Array<{id: string, name: string, modifiedTime: string}>
-    }): string {
-        // Create a deterministic hash based on child items
-        const fileHashes = children.files
-            .sort((a, b) => a.id.localeCompare(b.id))
-            .map(f => `${f.id}:${f.name}:${f.modifiedTime}:${f.md5Checksum || ''}`);
-        
-        const folderHashes = children.folders
-            .sort((a, b) => a.id.localeCompare(b.id))
-            .map(f => `${f.id}:${f.name}:${f.modifiedTime}`);
-
-        const combined = [...fileHashes, ...folderHashes].join('|');
-        
-        // Simple hash function (could use crypto if available)
-        let hash = 0;
-        for (let i = 0; i < combined.length; i++) {
-            const char = combined.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash; // Convert to 32-bit integer
-        }
-        
-        return hash.toString(16);
-    }
-
-    private compareFiles(
-        oldFiles: Array<{id: string, name: string, modifiedTime: string, md5Checksum?: string}>,
-        newFiles: Array<{id: string, name: string, modifiedTime: string, md5Checksum?: string}>
-    ): DriveChangeEvent[] {
-        const changes: DriveChangeEvent[] = [];
-        
-        const oldFileMap = new Map(oldFiles.map(f => [f.id, f]));
-        const newFileMap = new Map(newFiles.map(f => [f.id, f]));
-
-        // Detect deleted files
-        for (const [fileId, oldFile] of oldFileMap) {
-            if (!newFileMap.has(fileId)) {
-                changes.push({
-                    changeType: 'delete',
-                    resourceType: 'file',
-                    resourceId: fileId,
-                    resourceName: oldFile.name,
-                    modifiedTime: oldFile.modifiedTime,
-                    removed: true,
-                    changeTime: Date.now()
-                });
-            }
-        }
-
-        // Detect new and modified files
-        for (const [fileId, newFile] of newFileMap) {
-            const oldFile = oldFileMap.get(fileId);
-            
-            if (!oldFile) {
-                // New file
-                changes.push({
-                    changeType: 'create',
-                    resourceType: 'file',
-                    resourceId: fileId,
-                    resourceName: newFile.name,
-                    modifiedTime: newFile.modifiedTime,
-                    changeTime: Date.now()
-                });
-            } else {
-                // Check for changes
-                if (oldFile.name !== newFile.name) {
-                    changes.push({
-                        changeType: 'rename',
-                        resourceType: 'file',
-                        resourceId: fileId,
-                        resourceName: newFile.name,
-                        oldName: oldFile.name,
-                        newName: newFile.name,
-                        modifiedTime: newFile.modifiedTime,
-                        changeTime: Date.now()
-                    });
-                } else if (oldFile.modifiedTime !== newFile.modifiedTime || 
-                          oldFile.md5Checksum !== newFile.md5Checksum) {
-                    changes.push({
-                        changeType: 'modify',
-                        resourceType: 'file',
-                        resourceId: fileId,
-                        resourceName: newFile.name,
-                        modifiedTime: newFile.modifiedTime,
-                        changeTime: Date.now()
-                    });
-                }
-            }
-        }
-
-        return changes;
-    }
-
-    
-    private compareFolders(
-        oldFolders: Array<{id: string, name: string, modifiedTime: string}>,
-        newFolders: Array<{id: string, name: string, modifiedTime: string}>
-    ): DriveChangeEvent[] {
-        const changes: DriveChangeEvent[] = [];
-        
-        // Map old folders by ID for quick lookup
-        const oldFolderMap = new Map(oldFolders.map(f => [f.id, f]));
-        const newFolderMap = new Map(newFolders.map(f => [f.id, f]));
-    
-        // 💡 변경: 이름 기반으로 폴더를 찾는 Map을 추가합니다.
-        const oldFoldersByName = new Map(oldFolders.map(f => [f.name, f]));
-        const newFoldersByName = new Map(newFolders.map(f => [f.name, f]));
-    
-        // 1. Detect renames
-        for (const [oldId, oldFolder] of oldFolderMap) {
-            const newFolder = newFolderMap.get(oldId); 
-
-            if (newFolder) { // 💡 newFolder의 존재 여부를 먼저 확인합니다.
-                // ID가 동일한 경우, 이름 변경만 확인합니다.
-                if (oldFolder.name !== newFolder.name) {
-                    changes.push({
-                        changeType: 'rename',
-                        resourceType: 'folder',
-                        resourceId: oldId,
-                        resourceName: newFolder.name,
-                        oldName: oldFolder.name,
-                        newName: newFolder.name,
-                        modifiedTime: newFolder.modifiedTime,
-                        changeTime: Date.now()
-                    });
-                }
-            } else {
-                // ID가 없는 경우, 삭제되었거나 리네임되었을 가능성.
-                // 이름이 같은 새로운 폴더가 있는지 확인합니다.
-                const newFolderWithSameName = newFoldersByName.get(oldFolder.name);
-                if (newFolderWithSameName) {
-                    //  이전 ID와 이름이 일치하는 새로운 폴더를 찾으면
-                    // 이를 'rename'으로 처리하여 'delete'와 'create'로 나뉘는 것을 방지합니다.
-                    changes.push({
-                        changeType: 'rename',
-                        resourceType: 'folder',
-                        resourceId: oldId, // 이전 ID 사용
-                        resourceName: newFolderWithSameName.name,
-                        oldName: oldFolder.name,
-                        newName: newFolderWithSameName.name,
-                        modifiedTime: newFolderWithSameName.modifiedTime,
-                        changeTime: Date.now()
-                    });
-                } else {
-                    // 이름이 같은 새 폴더가 없으면 삭제로 간주합니다.
-                    changes.push({
-                        changeType: 'delete',
-                        resourceType: 'folder',
-                        resourceId: oldId,
-                        resourceName: oldFolder.name,
-                        modifiedTime: oldFolder.modifiedTime,
-                        removed: true,
-                        changeTime: Date.now()
-                    });
-                }
-            }
-        }
-    
-        // 2. Detect genuinely new folders (renames already handled)
-        for (const [newId, newFolder] of newFolderMap) {
-            if (!oldFolderMap.has(newId) && !oldFoldersByName.has(newFolder.name)) {
-                changes.push({
-                    changeType: 'create',
-                    resourceType: 'folder',
-                    resourceId: newId,
-                    resourceName: newFolder.name,
-                    modifiedTime: newFolder.modifiedTime,
-                    changeTime: Date.now()
-                });
-            }
-        }
-    
-        return changes;
-    }
-}
-
-// Remote Change Processor
-class RemoteChangeProcessor {
-    private plugin: GDriveSyncPlugin;
-    
-    constructor(plugin: GDriveSyncPlugin) {
-        this.plugin = plugin;
-    }
-
-    async processChanges(changes: DriveChangeEvent[]): Promise<ChangeProcessingResult> {
-        const result: ChangeProcessingResult = {
-            processed: 0,
-            errors: 0,
-            skipped: 0,
-            conflicts: 0,
-            details: []
-        };
-
-        console.log(`🔄 Processing ${changes.length} remote changes...`);
-
-        // Group changes by type for better processing order
-        const groupedChanges = this.groupChangesByType(changes);
-        
-        try {
-            // Process in order: deletes, creates, renames, moves, modifies
-            await this.processDeleteChanges(groupedChanges.delete || [], result);
-            await this.processCreateChanges(groupedChanges.create || [], result);
-            await this.processRenameChanges(groupedChanges.rename || [], result);
-            await this.processMoveChanges(groupedChanges.move || [], result);
-            await this.processModifyChanges(groupedChanges.modify || [], result);
-
-            console.log(`✅ Change processing completed: ${result.processed} processed, ${result.errors} errors, ${result.skipped} skipped, ${result.conflicts} conflicts`);
-
-        } catch (error) {
-            console.error('❌ Error during change processing:', error);
-            result.errors++;
-            result.details.push(`Fatal error: ${error.message}`);
-        }
-
-        return result;
-    }
-
-    private groupChangesByType(changes: DriveChangeEvent[]): Record<string, DriveChangeEvent[]> {
-        const grouped: Record<string, DriveChangeEvent[]> = {};
-        
-        for (const change of changes) {
-            const type = change.changeType;
-            if (!grouped[type]) {
-                grouped[type] = [];
-            }
-            grouped[type].push(change);
-        }
-
-        return grouped;
-    }
-
-    private async processDeleteChanges(changes: DriveChangeEvent[], result: ChangeProcessingResult): Promise<void> {
-        console.log(`🗑️ Processing ${changes.length} delete changes...`);
-
-        for (const change of changes) {
-            try {
-                await this.handleDelete(change);
-                result.processed++;
-                result.details.push(`✅ Deleted: ${change.resourceName} (${change.resourceType})`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to process delete for ${change.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Delete failed: ${change.resourceName} - ${error.message}`);
-            }
-        }
-    }
-
-    private async processCreateChanges(changes: DriveChangeEvent[], result: ChangeProcessingResult): Promise<void> {
-        console.log(`➕ Processing ${changes.length} create changes...`);
-
-        for (const change of changes) {
-            try {
-                await this.handleCreate(change);
-                result.processed++;
-                result.details.push(`✅ Created: ${change.resourceName} (${change.resourceType})`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to process create for ${change.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Create failed: ${change.resourceName} - ${error.message}`);
-            }
-        }
-    }
-
-    private async processRenameChanges(changes: DriveChangeEvent[], result: ChangeProcessingResult): Promise<void> {
-        console.log(`✏️ Processing ${changes.length} rename changes...`);
-
-        for (const change of changes) {
-            try {
-                await this.handleRename(change);
-                result.processed++;
-                result.details.push(`✅ Renamed: ${change.oldName} → ${change.newName} (${change.resourceType})`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to process rename for ${change.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Rename failed: ${change.oldName} → ${change.newName} - ${error.message}`);
-            }
-        }
-    }
-
-    private async processMoveChanges(changes: DriveChangeEvent[], result: ChangeProcessingResult): Promise<void> {
-        console.log(`📁 Processing ${changes.length} move changes...`);
-
-        for (const change of changes) {
-            try {
-                await this.handleMove(change);
-                result.processed++;
-                result.details.push(`✅ Moved: ${change.resourceName} (${change.resourceType})`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to process move for ${change.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Move failed: ${change.resourceName} - ${error.message}`);
-            }
-        }
-    }
-
-    private async processModifyChanges(changes: DriveChangeEvent[], result: ChangeProcessingResult): Promise<void> {
-        console.log(`📝 Processing ${changes.length} modify changes...`);
-
-        for (const change of changes) {
-            try {
-                await this.handleModify(change);
-                result.processed++;
-                result.details.push(`✅ Modified: ${change.resourceName} (${change.resourceType})`);
-                
-            } catch (error) {
-                console.error(`❌ Failed to process modify for ${change.resourceName}:`, error);
-                result.errors++;
-                result.details.push(`❌ Modify failed: ${change.resourceName} - ${error.message}`);
-            }
-        }
-    }
-
-    private async handleDelete(change: DriveChangeEvent): Promise<void> {
-        console.log(`🗑️ Handling delete: ${change.resourceName} (${change.resourceType})`);
-
-        const localPath = await this.findLocalPathForResource(change.resourceId, change.resourceName);
-        
-        if (!localPath) {
-            console.log(`⏭️ Local item not found for delete: ${change.resourceName}`);
-            return;
-        }
-
-        const localItem = this.plugin.app.vault.getAbstractFileByPath(localPath);
-        
-        if (!localItem) {
-            console.log(`⏭️ Local item already deleted: ${localPath}`);
-            return;
-        }
-
-        // Check conflict resolution strategy
-        if (this.plugin.settings.conflictResolution === 'local') {
-            console.log(`⏭️ Skipping remote delete (local preference): ${localPath}`);
-            return;
-        }
-
-        // Perform local deletion
-        await this.plugin.app.vault.delete(localItem);
-        
-        // Update file state cache
-        await this.removeFileStateAfterDelete(localPath);
-        
-        console.log(`✅ Local delete completed: ${localPath}`);
-    }
-
-    private async handleCreate(change: DriveChangeEvent): Promise<void> {
-        console.log(`➕ Handling create: ${change.resourceName} (${change.resourceType})`);
-
-        if (change.resourceType === 'folder') {
-            await this.handleFolderCreate(change);
-        } else {
-            await this.handleFileCreate(change);
-        }
-    }
-
-    private async handleFolderCreate(change: DriveChangeEvent): Promise<void> {
-        const localPath = await this.calculateLocalPathForNewResource(change.resourceId, change.resourceName, 'folder');
-        
-        if (!localPath) {
-            console.log(`⏭️ Cannot determine local path for new folder: ${change.resourceName}`);
-            return;
-        }
-
-        // Check if folder already exists
-        const existingFolder = this.plugin.app.vault.getAbstractFileByPath(localPath);
-        if (existingFolder) {
-            console.log(`⏭️ Local folder already exists: ${localPath}`);
-            return;
-        }
-
-        // Create local folder
-        await this.plugin.app.vault.createFolder(localPath);
-        console.log(`✅ Local folder created: ${localPath}`);
-    }
-
-    private async handleFileCreate(change: DriveChangeEvent): Promise<void> {
-        const localPath = await this.calculateLocalPathForNewResource(change.resourceId, change.resourceName, 'file');
-        
-        if (!localPath) {
-            console.log(`⏭️ Cannot determine local path for new file: ${change.resourceName}`);
-            return;
-        }
-
-        // Check if file already exists
-        const existingFile = this.plugin.app.vault.getAbstractFileByPath(localPath);
-        if (existingFile) {
-            console.log(`⏭️ Local file already exists: ${localPath}`);
-            return;
-        }
-
-        // Download the file from Google Drive
-        try {
-            const driveFile = await this.getDriveFileInfo(change.resourceId);
-            if (driveFile) {
-                const result = this.plugin.createEmptyResult();
-                await this.plugin.downloadFileFromDrive(driveFile, result, '');
-                console.log(`✅ File downloaded and created: ${localPath}`);
-            }
-        } catch (error) {
-            console.error(`❌ Failed to download new file ${change.resourceName}:`, error);
-            throw error;
-        }
-    }
-
-    private async handleRename(change: DriveChangeEvent): Promise<void> {
-        console.log(`✏️ Handling rename: ${change.oldName} → ${change.newName} (${change.resourceType})`);
-    
-        // Use the fileIdMapper to find the old local path, which is the most reliable way to track renames.
-        // This is the CRITICAL change. Don't rely on the old name, use the stable resourceId.
-        const oldLocalPath = this.plugin.fileIdMapper.getLocalPathById(change.resourceId);
-        if (!oldLocalPath) {
-            console.log(`⏭️ Local item not found for rename (no ID mapping): ${change.oldName}`);
-            return;
-        }
-    
-        const localItem = this.plugin.app.vault.getAbstractFileByPath(oldLocalPath);
-        if (!localItem) {
-            console.log(`⏭️ Local item no longer exists: ${oldLocalPath}`);
-            return;
-        }
-    
-        // Calculate new local path based on the parent of the old path
-        const parentPath = localItem.parent?.path || '';
-        const newLocalPath = parentPath ? `${parentPath}/${change.newName}` : change.newName!;
-    
-        // Check for naming conflicts before performing the rename
-        const existingItem = this.plugin.app.vault.getAbstractFileByPath(newLocalPath);
-        if (existingItem) {
-            console.log(`⚡ Naming conflict detected: ${newLocalPath}`);
-            if (this.plugin.settings.conflictResolution === 'remote') {
-                // Remove the conflicting local item to make way for the new name
-                await this.plugin.app.vault.delete(existingItem);
-                console.log(`🗑️ Removed conflicting local item to resolve conflict: ${newLocalPath}`);
-            } else {
-                console.log(`⏭️ Skipping rename due to conflict and policy: ${oldLocalPath} → ${newLocalPath}`);
-                return;
-            }
-        }
-    
-        // Perform local rename
-        try {
-            await this.plugin.app.vault.rename(localItem, newLocalPath);
-            console.log(`✅ Local rename completed: ${oldLocalPath} → ${newLocalPath}`);
-    
-            // Update all caches (mapper and state) after a successful rename.
-            // This is the most crucial step for fixing the bug.
-            if (localItem instanceof TFolder) {
-                // It's a folder rename, so recursively update all child paths in cache
-                await this.plugin.updateFolderStateAfterRename(oldLocalPath, newLocalPath);
-                this.plugin.fileIdMapper.updatePathMapping(oldLocalPath, newLocalPath);
-                this.plugin.updateFolderCacheAfterRename(oldLocalPath, newLocalPath);
-            } else {
-                // It's a file rename, so update the single file's path
-                await this.plugin.updateFileStateAfterRename(oldLocalPath, newLocalPath);
-                this.plugin.fileIdMapper.updatePathMapping(oldLocalPath, newLocalPath);
-            }
-    
-        } catch (renameError) {
-            console.error(`❌ Failed to rename local item ${oldLocalPath} → ${newLocalPath}:`, renameError);
-            throw renameError;
-        }
-    }
-
-    private async handleMove(change: DriveChangeEvent): Promise<void> {
-        console.log(`📁 Handling move: ${change.resourceName} (${change.resourceType})`);
-
-        // For move operations, we need to determine the new parent folder
-        // This is more complex and may require additional Drive API calls
-        const currentLocalPath = await this.findLocalPathForResource(change.resourceId, change.resourceName);
-        
-        if (!currentLocalPath) {
-            console.log(`⏭️ Local item not found for move: ${change.resourceName}`);
-            return;
-        }
-
-        const localItem = this.plugin.app.vault.getAbstractFileByPath(currentLocalPath);
-        if (!localItem) {
-            console.log(`⏭️ Local item no longer exists: ${currentLocalPath}`);
-            return;
-        }
-
-        // Get current parents from Drive
-        const driveFile = await this.getDriveFileInfo(change.resourceId);
-        if (!driveFile || !driveFile.parents) {
-            console.log(`⏭️ Cannot determine new parent for move: ${change.resourceName}`);
-            return;
-        }
-
-        // Calculate new local path based on new parent
-        const newLocalPath = await this.calculateLocalPathFromDriveParents(change.resourceId, change.resourceName, driveFile.parents);
-        
-        if (!newLocalPath || newLocalPath === currentLocalPath) {
-            console.log(`⏭️ No move needed or cannot determine target: ${change.resourceName}`);
-            return;
-        }
-
-        // Check for conflicts
-        const existingItem = this.plugin.app.vault.getAbstractFileByPath(newLocalPath);
-        if (existingItem) {
-            console.log(`⚡ Move conflict detected: ${newLocalPath}`);
-            
-            if (this.plugin.settings.conflictResolution === 'remote') {
-                await this.plugin.app.vault.delete(existingItem);
-                console.log(`🗑️ Removed conflicting item: ${newLocalPath}`);
-            } else {
-                console.log(`⏭️ Skipping move due to conflict: ${currentLocalPath} → ${newLocalPath}`);
-                return;
-            }
-        }
-
-        // Create parent directories if needed
-        const parentPath = newLocalPath.substring(0, newLocalPath.lastIndexOf('/'));
-        if (parentPath && this.plugin.settings.createMissingFolders) {
-            await this.createLocalFolderStructure(parentPath);
-        }
-
-        // Perform local move
-        await this.plugin.app.vault.rename(localItem, newLocalPath);
-        
-        // Update file state cache
-        await this.updateFileStateAfterRename(currentLocalPath, newLocalPath);
-        
-        console.log(`✅ Local move completed: ${currentLocalPath} → ${newLocalPath}`);
-    }
-
-    private async handleModify(change: DriveChangeEvent): Promise<void> {
-        console.log(`📝 Handling modify: ${change.resourceName} (${change.resourceType})`);
-
-        if (change.resourceType === 'folder') {
-            // Folder modifications are usually metadata changes, skip for now
-            console.log(`⏭️ Skipping folder modify: ${change.resourceName}`);
-            return;
-        }
-
-        // Handle file modification
-        const localPath = await this.findLocalPathForResource(change.resourceId, change.resourceName);
-        
-        if (!localPath) {
-            console.log(`⏭️ Local file not found for modify: ${change.resourceName}`);
-            return;
-        }
-
-        const localFile = this.plugin.app.vault.getAbstractFileByPath(localPath) as TFile;
-        if (!localFile) {
-            console.log(`⏭️ Local file no longer exists: ${localPath}`);
-            return;
-        }
-
-        // Get current Drive file info
-        const driveFile = await this.getDriveFileInfo(change.resourceId);
-        if (!driveFile) {
-            console.log(`⏭️ Cannot get Drive file info: ${change.resourceName}`);
-            return;
-        }
-
-        // Use existing sync decision logic
-        const decision = await this.plugin.decideSyncAction(localFile, driveFile);
-        
-        if (!decision.shouldSync) {
-            console.log(`⏭️ No sync needed for modify: ${change.resourceName} - ${decision.reason}`);
-            return;
-        }
-
-        if (decision.action === 'download') {
-            // Download the updated file
-            const result = this.plugin.createEmptyResult();
-            await this.plugin.downloadFileFromDrive(driveFile, result, '');
-            console.log(`✅ File updated from remote: ${localPath}`);
-        } else if (decision.action === 'conflict') {
-            // Handle conflict based on strategy
-            if (this.plugin.settings.conflictResolution === 'remote' || 
-                this.plugin.settings.conflictResolution === 'newer') {
-                const result = this.plugin.createEmptyResult();
-                await this.plugin.downloadFileFromDrive(driveFile, result, '');
-                console.log(`✅ Conflict resolved (remote): ${localPath}`);
-            } else {
-                console.log(`⏭️ Conflict skipped (local preference): ${localPath}`);
-            }
-        }
-    }
-
-    // Helper methods
-    private async findLocalPathForResource(resourceId: string, resourceName: string): Promise<string | null> {
-        // This is a simplified implementation
-        // In practice, you would maintain a mapping of Drive IDs to local paths
-        
-        if (this.plugin.settings.syncWholeVault) {
-            // Search in entire vault
-            const allFiles = this.plugin.app.vault.getAllLoadedFiles();
-            for (const file of allFiles) {
-                if (file.name === resourceName) {
-                    return file.path;
-                }
-            }
-        } else {
-            // Search in selected folders
-            for (const selectedFolder of this.plugin.settings.selectedDriveFolders) {
-                const allFiles = this.plugin.app.vault.getAllLoadedFiles();
-                for (const file of allFiles) {
-                    if (file.name === resourceName && 
-                        (file.path === selectedFolder.path || file.path.startsWith(selectedFolder.path + '/'))) {
-                        return file.path;
-                    }
-                }
-            }
-        }
-        
-        return null;
-    }
-
-    private async calculateLocalPathForNewResource(resourceId: string, resourceName: string, resourceType: 'file' | 'folder'): Promise<string | null> {
-        // Get parent information from Drive
-        const driveFile = await this.getDriveFileInfo(resourceId);
-        if (!driveFile || !driveFile.parents) {
-            return null;
-        }
-
-        return await this.calculateLocalPathFromDriveParents(resourceId, resourceName, driveFile.parents);
-    }
-
-    private async calculateLocalPathFromDriveParents(resourceId: string, resourceName: string, parents: string[]): Promise<string | null> {
-        // Simplified implementation - in practice, you would need to map Drive folder IDs to local paths
-        // This would require maintaining a mapping table or recursive parent resolution
-        
-        if (this.plugin.settings.syncWholeVault) {
-            // For whole vault sync, assume root level for now
-            return resourceName;
-        } else {
-            // For selected folders, check if parent is one of selected folders
-            for (const selectedFolder of this.plugin.settings.selectedDriveFolders) {
-                if (parents.includes(selectedFolder.id)) {
-                    return selectedFolder.path ? `${selectedFolder.path}/${resourceName}` : resourceName;
-                }
-            }
-        }
-        
-        return null;
-    }
-
-    private async getDriveFileInfo(fileId: string): Promise<any | null> {
-        try {
-            const response = await this.plugin.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,parents,mimeType,modifiedTime,md5Checksum,size&supportsAllDrives=true`,
-                { method: 'GET' }
-            );
-
-            if (response.status === 200) {
-                return response.json;
-            } else {
-                console.error(`❌ Failed to get Drive file info: ${response.status}`);
-                return null;
-            }
-
-        } catch (error) {
-            console.error(`❌ Error getting Drive file info for ${fileId}:`, error);
-            return null;
-        }
-    }
-
-    private async createLocalFolderStructure(folderPath: string): Promise<void> {
-        if (!folderPath) return;
-
-        const pathParts = folderPath.split('/');
-        let currentPath = '';
-
-        for (const part of pathParts) {
-            currentPath = currentPath ? `${currentPath}/${part}` : part;
-            
-            const existingFolder = this.plugin.app.vault.getAbstractFileByPath(currentPath);
-            if (!existingFolder) {
-                try {
-                    await this.plugin.app.vault.createFolder(currentPath);
-                    console.log(`📁 Created local folder: ${currentPath}`);
-                } catch (error) {
-                    if (!error.message.includes('already exists')) {
-                        throw error;
-                    }
-                }
-            }
-        }
-    }
-
-    private async removeFileStateAfterDelete(filePath: string): Promise<void> {
-        const normalizedPath = this.plugin.normalizeFullPath(filePath);
-        if (this.plugin.settings.fileStateCache[normalizedPath]) {
-            delete this.plugin.settings.fileStateCache[normalizedPath];
-            await this.plugin.saveSettings();
-            console.log(`[STATE] File state removed: ${filePath}`);
-        }
-    }
-
-    private async updateFileStateAfterRename(oldPath: string, newPath: string): Promise<void> {
-        const oldState = this.plugin.getFileState(oldPath);
-        if (oldState) {
-            this.plugin.setFileState(newPath, oldState);
-            delete this.plugin.settings.fileStateCache[this.plugin.normalizeFullPath(oldPath)];
-            await this.plugin.saveSettings();
-            console.log(`[STATE] File state updated: ${oldPath} → ${newPath}`);
-        }
-    }
-
-    private async updateFolderStateAfterRename(oldPath: string, newPath: string): Promise<void> {
-        const updatedPaths = new Map<string, string>();
-        
-        // 폴더 내 모든 파일의 상태 캐시 업데이트
-        for (const [filePath, state] of Object.entries(this.plugin.settings.fileStateCache)) {
-            if (filePath.startsWith(oldPath + '/')) {
-                const newFilePath = filePath.replace(oldPath, newPath);
-                updatedPaths.set(filePath, newFilePath);
-                this.plugin.setFileState(newFilePath, state);
-            }
-        }
-        
-         // 이름이 변경된 폴더 자체의 캐시 경로 업데이트
-         const oldState = this.plugin.getFileState(oldPath);
-         if (oldState) {
-             this.plugin.setFileState(newPath, oldState);
-         }
-
-        // 기존 경로들 제거
-        for (const oldFilePath of updatedPaths.keys()) {
-            delete this.plugin.settings.fileStateCache[this.plugin.normalizeFullPath(oldFilePath)];
-        }
-        delete this.plugin.settings.fileStateCache[this.plugin.normalizeFullPath(oldPath)];
-        
-        await this.plugin.saveSettings();
-        console.log(`[STATE] Folder state updated: ${oldPath} → ${newPath} (${updatedPaths.size} files affected)`);
-    }
-}
+const CHANGE_PRIORITIES = {
+    // 🔥 FIX: Rename을 Create보다 먼저 처리
+    RENAME_FOLDER: 1,        // 폴더 이름 변경이 가장 먼저
+    MOVE_FOLDER: 2,          // 그 다음 폴더 이동
+    CREATE_NEW_FOLDER: 3,    // 새 폴더 생성
+    RENAME_FILE: 4,          // 파일 이름 변경
+    MOVE_FILE: 5,            // 파일 이동
+    MODIFY: 6,               // 파일 내용 수정
+    DELETE_FILE: 7,          // 파일 삭제
+    DELETE_FOLDER: 8         // 폴더 삭제 (가장 나중)
+};
 
 // 진행상태 모달
 class SyncProgressModal extends Modal {
@@ -1987,6 +299,35 @@ class SyncProgressModal extends Modal {
         this.logEl.scrollTop = this.logEl.scrollHeight;
     }
 
+    showRemoteChangePhase(changes: RemoteChange[]): void {
+        this.updateStatus(`🔍 Analyzing remote changes... (${changes.length} changes detected)`);
+        this.addLog(`Remote change detection phase started`);
+        this.addLog(`Found ${changes.length} changes in Google Drive`);
+    }
+    showRemoteApplicationPhase(currentChange: RemoteChange, index: number, total: number): void {
+        const icon = this.getChangeIcon(currentChange.type);
+        this.updateProgress(index, total, 
+            `${icon} Applying remote change: ${currentChange.fileName}`);
+        this.addLog(`Applying ${currentChange.type}: ${currentChange.fileName}`);
+    }
+    private getChangeIcon(changeType: string): string {
+        const icons: {[key: string]: string} = {
+            'create_folder': '📁+',
+            'rename_folder': '📁✏️',
+            'move_folder': '📁📍',
+            'move_file': '📄📍',
+            'rename_file': '📄✏️',
+            'modify': '📝',
+            'delete_file': '🗑️📄',
+            'delete_folder': '🗑️📁'
+        };
+        return icons[changeType] || '🔄';
+    }
+    
+    showStandardSyncPhase(): void {
+        this.updateStatus('🔄 Starting standard file synchronization...');
+        this.addLog('Remote changes applied, starting standard sync');
+    }
     markCompleted(result: SyncResult) {
         this.isCompleted = true;
         this.progressBar.style.width = '100%';
@@ -2011,6 +352,7 @@ class SyncProgressModal extends Modal {
         this.addLog(`⏭️ Skipped: ${result.skipped} files`);
         if (result.conflicts > 0) this.addLog(`⚡ Conflicts resolved: ${result.conflicts}`);
         if (result.errors > 0) this.addLog(`❌ Errors: ${result.errors}`);
+        if (result.remoteChangesApplied) this.addLog(`🔄 Remote changes applied: ${result.remoteChangesApplied}`);
         if (result.createdFolders.length > 0) {
             this.addLog(`📁 Created ${result.createdFolders.length} folders`);
         }
@@ -2040,7 +382,9 @@ class SyncProgressModal extends Modal {
     }
 }
 
+
 // Google Drive 폴더 선택 모달
+// 기본 UI를 사용하는 Google Drive 폴더 선택 모달
 class DriveFolderModal extends Modal {
     private plugin: GDriveSyncPlugin;
     private onChoose: (folder: DriveFolder) => void;
@@ -2399,6 +743,7 @@ class DriveFolderModal extends Modal {
                                 path: itemPath,
                                 mimeType: 'application/vnd.google-apps.folder',
                                 parents: item.parents,
+                                modifiedTime: item.modifiedTime,
                                 isShortcut: true,
                                 shortcutTarget: resolvedItem.id
                             };
@@ -2413,6 +758,7 @@ class DriveFolderModal extends Modal {
                             path: itemPath,
                             mimeType: item.mimeType,
                             parents: item.parents,
+                            modifiedTime: item.modifiedTime,
                             isShortcut: false
                         };
                     }
@@ -2531,7 +877,8 @@ class DriveFolderModal extends Modal {
                     name: folderData.name,
                     path: folderData.name,
                     mimeType: folderData.mimeType,
-                    parents: folderData.parents
+                    parents: folderData.parents,
+                    modifiedTime: folderData.modifiedTime
                 };
             }
         } catch (error) {
@@ -2548,6 +895,7 @@ class DriveFolderModal extends Modal {
     }
 }
 
+// 폴더 생성 모달도 기본 UI로 변경
 class CreateFolderModal extends Modal {
     private onSubmit: (folderName: string) => void;
 
@@ -2722,123 +1070,989 @@ export default class GDriveSyncPlugin extends Plugin {
     public isGoogleApiLoaded = false;
     private folderCache: FolderCache = {};
     public settingTab: GDriveSyncSettingTab | null = null;
-    public changeDetectionService: DriveChangeDetectionService | null = null;
-    public fileIdMapper: FileIdMapper;
-
+    private autoSyncTimeout: number | null = null;
+    private hashCache: Map<string, {hash: string, mtime: number, size: number}> = new Map();
     
-    async onload() {
-        await this.loadSettings();
-        
-        this.fileIdMapper = new FileIdMapper(this);
-        const ribbonIconEl = this.addRibbonIcon('cloud', 'Google Drive Sync', (evt) => {
-            this.mainSync(true); 
-        });
-        ribbonIconEl.addClass('gdrive-sync-ribbon-class');
-        
-        // Add status bar sync indicator
-        this.addStatusBarSync();
-        
-        // Add file menu items for sync operations
-        this.addFileMenuItems();
-
-        // Add folder context menu with conditional display
-        this.addFolderContextMenu();
-
-        // Initialize change detection
-        this.initializeChangeDetection();
-
-        // Add change detection commands
-        this.addChangeDetectionCommands();
-        
-
-        // Commands 
-        this.addCommand({
-            id: 'sync-with-gdrive',
-            name: 'Sync with Google Drive',
-            callback: () => {
-                this.mainSync(false); 
-            }
-        });
-    
-        this.addCommand({
-            id: 'download-from-gdrive',
-            name: 'Download from Google Drive',
-            callback: () => {
-                this.downloadFromGoogleDrive(false);
-            }
-        });
-    
-        this.addCommand({
-            id: 'upload-to-gdrive',
-            name: 'Upload to Google Drive',
-            callback: () => {
-                this.uploadToGoogleDrive(false);
-            }
-        });
-    
-        // Add auto sync debug command
-        this.addCommand({
-            id: 'debug-auto-sync',
-            name: 'Debug Auto Sync Status',
-            callback: () => {
-                this.debugAutoSyncStatus();
-            }
-        });
-
-        // Add hotkey
-        this.addCommand({
-            id: 'quick-sync-gdrive',
-            name: 'Quick Sync with Google Drive',
-            hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'S' }], // Ctrl+Shift+S
-            callback: () => {
-                this.mainSync(true); // Show progress
-            }
-        });
-
-
-        // Sync current file only
-        this.addCommand({
-            id: 'sync-current-file',
-            name: 'Sync Current File to Google Drive',
-            editorCallback: (editor, view) => {
-                const file = view.file;
-                if (file) {
-                    this.syncSingleFile(file);
-                } else {
-                    new Notice('No active file to sync');
-                }
-            }
-        });
-
-        // Setup file change detection and auto sync
-        this.setupFileChangeDetection();
-
-        this.settingTab = new GDriveSyncSettingTab(this.app, this);
-        this.addSettingTab(this.settingTab);
-
-        console.log('Plugin loaded - Google Drive folder-based sync');
-        
-        // Add concurrent operation context menus
-        this.addSyncContextMenus();
-        
-        console.log('Phase 1: Sync operations context menus loaded');
-        console.log(`Initial auto sync setting: ${this.settings.autoSync}`);
-
-        // Initialize auto sync
-        if (this.settings.autoSync) {
-            console.log('Initializing auto sync on plugin load...');
-            this.setupAutoSync();
-        } else {
-            console.log('Auto sync disabled on plugin load');
-        }
-    }
-
     public notifySettingsChanged(): void {
         if (this.settingTab) {
             setTimeout(() => {
                 this.settingTab?.refreshDisplay();
             }, 50);
         }
+    }
+
+    /**
+     * Enhanced sync method with remote change detection
+     */
+    async syncFolderWithRemotePriority(folder: TFolder): Promise<SyncResult> {
+        try {
+            console.log(`🔄 Starting enhanced sync for folder: ${folder.path}`);
+
+            if (!this.settings.enableRemoteChangeDetection) {
+                console.log('Remote change detection disabled, using standard sync');
+                return await this.standardSyncFolder(folder);
+            }
+
+            // Phase 1: Detect remote changes
+            const changeResult = await this.detectRemoteChanges(folder.path);
+            
+            if (!changeResult.hasChanges) {
+                console.log('No remote changes detected, proceeding with standard sync');
+                return await this.standardSyncFolder(folder);
+            }
+
+            console.log(`📋 Remote changes detected: ${changeResult.changes.length} changes`);
+
+            // Phase 2: Apply remote changes with priority order
+            const remoteChangesApplied = await this.applyRemoteChanges(changeResult.changes);
+
+            // Phase 3: Standard sync for remaining files
+            const standardResult = await this.standardSyncFolder(folder);
+
+            // Combine results
+            return {
+                ...standardResult,
+                remoteChangesApplied
+            };
+
+        } catch (error) {
+            console.error('Enhanced sync error:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Detect remote changes using snapshot comparison
+     */
+    async detectRemoteChanges(targetFolderPath: string): Promise<RemoteChangeDetectionResult> {
+        try {
+            console.log(`🔍 Detecting remote changes for: ${targetFolderPath}`);
+
+            // Get current Google Drive snapshot
+            const currentSnapshot = await this.getDriveSnapshot(targetFolderPath);
+            const cachedSnapshot = this.settings.lastRemoteSnapshot;
+
+            if (!cachedSnapshot) {
+                console.log('No cached snapshot available, treating as initial sync');
+                await this.updateRemoteSnapshot(currentSnapshot);
+                return {
+                    changes: [],
+                    hasChanges: false,
+                    summary: { created: 0, deleted: 0, moved: 0, renamed: 0, modified: 0 }
+                };
+            }
+
+            // Compare snapshots
+            const comparison = this.compareSnapshots(cachedSnapshot, currentSnapshot);
+            
+            // Infer changes with heuristics
+            const changes = this.inferChangesFromComparison(comparison);
+            
+            // Sort changes by priority and dependencies
+            const sortedChanges = this.sortChangesByPriority(changes);
+
+            // Update cached snapshot
+            await this.updateRemoteSnapshot(currentSnapshot);
+
+            const summary = this.calculateChangeSummary(sortedChanges);
+
+            console.log(`📊 Remote change summary:`, summary);
+
+            return {
+                changes: sortedChanges,
+                hasChanges: sortedChanges.length > 0,
+                summary
+            };
+
+        } catch (error) {
+            console.error('Remote change detection error:', error);
+            throw new Error(`Failed to detect remote changes: ${error.message}`);
+        }
+    }
+
+    /**
+     * Get current snapshot of Google Drive folder
+     */
+    async getDriveSnapshot(targetFolderPath: string): Promise<DriveSnapshot> {
+        const files: DriveFile[] = [];
+        const folders: DriveFolder[] = [];
+
+        try {
+            let targetFolderId: string;
+
+            if (this.settings.syncWholeVault) {
+                const rootFolder = await this.getOrCreateDriveFolder();
+                if (!rootFolder) throw new Error('Failed to access root folder');
+                targetFolderId = rootFolder.id;
+            } else {
+                const selectedFolder = this.settings.selectedDriveFolders.find(f => 
+                    targetFolderPath === f.path || targetFolderPath.startsWith(f.path + '/')
+                );
+                if (!selectedFolder) throw new Error('Target folder not in sync scope');
+                targetFolderId = selectedFolder.id;
+            }
+
+            // Recursively get all files and folders
+            await this.scanDriveFolderRecursive(targetFolderId, '', files, folders);
+
+            return {
+                files,
+                folders,
+                scanTime: Date.now()
+            };
+
+        } catch (error) {
+            console.error('Error creating Drive snapshot:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Recursively scan Google Drive folder
+     */
+    async scanDriveFolderRecursive(
+        folderId: string, 
+        basePath: string, 
+        files: DriveFile[], 
+        folders: DriveFolder[]
+    ): Promise<void> {
+        try {
+            const query = `'${folderId}' in parents and trashed=false`;
+            const params = new URLSearchParams({
+                q: query,
+                fields: 'files(id,name,mimeType,parents,md5Checksum,modifiedTime,size)',
+                pageSize: '1000',
+                supportsAllDrives: 'true',
+                includeItemsFromAllDrives: 'true'
+            });
+
+            const response = await this.makeAuthenticatedRequest(
+                `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
+                { method: 'GET' }
+            );
+
+            if (response.status !== 200) {
+                throw new Error(`Drive API error: ${response.status}`);
+            }
+
+            const data = response.json;
+
+            for (const item of data.files || []) {
+                let itemPath = basePath ? `${basePath}/${item.name}` : item.name;
+
+                if (!this.settings.syncWholeVault && this.settings.selectedDriveFolders.length > 0) {
+                    // 현재 스캔 중인 폴더가 선택된 폴더인지 확인
+                    const currentSyncFolder = this.settings.selectedDriveFolders.find(f => f.id === folderId);
+                    if (currentSyncFolder) {
+                        // 루트 스캔이면 선택된 폴더 경로를 기준으로 설정
+                        if (!basePath) {
+                            itemPath = `${currentSyncFolder.path}/${item.name}`;
+                        }
+                    } else {
+                        // 하위 폴더 스캔이면 basePath 기반으로 설정 (이미 올바름)
+                    }
+                }
+                if (item.mimeType === 'application/vnd.google-apps.folder') {
+                    // It's a folder
+                    folders.push({
+                        id: item.id,
+                        name: item.name,
+                        path: itemPath,
+                        mimeType: item.mimeType,
+                        parents: item.parents,
+                        modifiedTime: item.modifiedTime
+                    });
+
+                    // Recursively scan subfolders
+                    await this.scanDriveFolderRecursive(item.id, itemPath, files, folders);
+                } else {
+                    // It's a file
+                    files.push({
+                        id: item.id,
+                        name: item.name,
+                        path: itemPath,
+                        mimeType: item.mimeType,
+                        parents: item.parents,
+                        md5Checksum: item.md5Checksum,
+                        modifiedTime: item.modifiedTime,
+                        size: item.size
+                    });
+                }
+            }
+
+        } catch (error) {
+            console.error(`Error scanning folder ${folderId}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Compare two snapshots to identify differences
+     */
+    compareSnapshots(cached: DriveSnapshot, current: DriveSnapshot): SnapshotComparison {
+        const result: SnapshotComparison = {
+            byId: new Map(),
+            operations: {
+                created: [],
+                deleted: [],
+                moved: [],
+                renamed: [],
+                modified: []
+            }
+        };
+
+        // Combine files and folders for unified processing
+        const allCachedItems = [...cached.files, ...cached.folders];
+        const allCurrentItems = [...current.files, ...current.folders];
+
+        // Create ID-based mapping
+        const allIds = new Set([
+            ...allCachedItems.map(f => f.id),
+            ...allCurrentItems.map(f => f.id)
+        ]);
+
+        for (const id of allIds) {
+            const cachedItem = allCachedItems.find(f => f.id === id);
+            const currentItem = allCurrentItems.find(f => f.id === id);
+
+            result.byId.set(id, {cached: cachedItem, current: currentItem});
+
+            // Classify changes
+            if (!cachedItem && currentItem) {
+                result.operations.created.push(currentItem);
+            } else if (cachedItem && !currentItem) {
+                result.operations.deleted.push({id, path: cachedItem.path});
+            } else if (cachedItem && currentItem) {
+                // Path change = move
+                if (cachedItem.path !== currentItem.path) {
+                    result.operations.moved.push({
+                        id,
+                        oldPath: cachedItem.path,
+                        newPath: currentItem.path
+                    });
+                }
+                
+                // Name change = rename
+                if (cachedItem.name !== currentItem.name) {
+                    result.operations.renamed.push({
+                        id,
+                        oldName: cachedItem.name,
+                        newName: currentItem.name
+                    });
+                }
+                
+                // Content change (for files only)
+                if ('md5Checksum' in cachedItem && 'md5Checksum' in currentItem &&
+                    cachedItem.md5Checksum !== currentItem.md5Checksum) {
+                    result.operations.modified.push({
+                        id,
+                        oldHash: cachedItem.md5Checksum || '',
+                        newHash: currentItem.md5Checksum || ''
+                    });
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Infer remote changes from snapshot comparison
+     */
+    inferChangesFromComparison(comparison: SnapshotComparison): RemoteChange[] {
+        const changes: RemoteChange[] = [];
+
+        // Handle renamed items
+        for (const item of comparison.operations.renamed) {
+            const currentItem = Array.from(comparison.byId.values())
+                .find(v => v.current?.id === item.id)?.current;
+            const cachedItem = Array.from(comparison.byId.values())
+                .find(v => v.cached?.id === item.id)?.cached;
+
+            let oldPath = cachedItem?.path || item.oldName;
+
+            changes.push({
+                type: currentItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    'rename_folder' : 'rename_file',
+                priority: currentItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    CHANGE_PRIORITIES.RENAME_FOLDER : CHANGE_PRIORITIES.RENAME_FILE,
+                fileId: item.id,
+                fileName: item.oldName,
+                isFolder: currentItem?.mimeType === 'application/vnd.google-apps.folder' || false,
+                oldName: item.oldName,
+                newName: item.newName,
+                oldPath: oldPath, 
+                modifiedTime: currentItem ? new Date(currentItem.modifiedTime).getTime() : Date.now()
+            });
+        }
+
+        // Handle created items
+        for (const item of comparison.operations.created) {
+            changes.push({
+                type: item.mimeType === 'application/vnd.google-apps.folder' ? 'create_folder' : 'modify',
+                priority: item.mimeType === 'application/vnd.google-apps.folder' ? 
+                    CHANGE_PRIORITIES.CREATE_NEW_FOLDER : CHANGE_PRIORITIES.MODIFY,
+                fileId: item.id,
+                fileName: item.name,
+                isFolder: item.mimeType === 'application/vnd.google-apps.folder',
+                newPath: item.path,
+                modifiedTime: new Date(item.modifiedTime).getTime()
+            });
+        }
+
+        // Handle deleted items
+        for (const item of comparison.operations.deleted) {
+            const cachedItem = Array.from(comparison.byId.values())
+                .find(v => v.cached?.id === item.id)?.cached;
+            
+            changes.push({
+                type: cachedItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    'delete_folder' : 'delete_file',
+                priority: cachedItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    CHANGE_PRIORITIES.DELETE_FOLDER : CHANGE_PRIORITIES.DELETE_FILE,
+                fileId: item.id,
+                fileName: item.path.split('/').pop() || '',
+                isFolder: cachedItem?.mimeType === 'application/vnd.google-apps.folder' || false,
+                oldPath: item.path,
+                modifiedTime: Date.now()
+            });
+        }
+
+        // Handle moved items
+        for (const item of comparison.operations.moved) {
+            const currentItem = Array.from(comparison.byId.values())
+                .find(v => v.current?.id === item.id)?.current;
+            
+            changes.push({
+                type: currentItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    'move_folder' : 'move_file',
+                priority: currentItem?.mimeType === 'application/vnd.google-apps.folder' ? 
+                    CHANGE_PRIORITIES.MOVE_FOLDER : CHANGE_PRIORITIES.MOVE_FILE,
+                fileId: item.id,
+                fileName: currentItem?.name || '',
+                isFolder: currentItem?.mimeType === 'application/vnd.google-apps.folder' || false,
+                oldPath: item.oldPath,
+                newPath: item.newPath,
+                modifiedTime: currentItem ? new Date(currentItem.modifiedTime).getTime() : Date.now()
+            });
+        }
+
+        // Handle modified items
+        for (const item of comparison.operations.modified) {
+            const currentItem = Array.from(comparison.byId.values())
+                .find(v => v.current?.id === item.id)?.current;
+            
+            changes.push({
+                type: 'modify',
+                priority: CHANGE_PRIORITIES.MODIFY,
+                fileId: item.id,
+                fileName: currentItem?.name || '',
+                isFolder: false,
+                modifiedTime: currentItem ? new Date(currentItem.modifiedTime).getTime() : Date.now(),
+                details: {
+                    oldHash: item.oldHash,
+                    newHash: item.newHash
+                }
+            });
+        }
+
+        const sortedChanges = this.sortChangesByPriorityAndDependency(changes);
+    
+        console.log(`📋 [INFER] Total changes inferred: ${sortedChanges.length}`);
+        sortedChanges.forEach((change, index) => {
+            console.log(`  ${index + 1}. ${change.type} - ${change.fileName} (priority: ${change.priority})`);
+        });
+        
+        return sortedChanges;
+    }
+
+    private sortChangesByPriorityAndDependency(changes: RemoteChange[]): RemoteChange[] {
+        // 기본 우선순위 정렬
+        const deleteChanges = changes.filter(c => c.type.startsWith('delete_'));
+        const otherChanges = changes.filter(c => !c.type.startsWith('delete_'));
+        
+        // 삭제가 아닌 변경사항들은 기존 우선순위로 정렬
+        const sortedOthers = otherChanges.sort((a, b) => {
+            if (a.priority !== b.priority) {
+                return a.priority - b.priority;
+            }
+            
+            if (a.isFolder && !b.isFolder) return -1;
+            if (!a.isFolder && b.isFolder) return 1;
+            
+            if (a.isFolder && b.isFolder) {
+                const depthA = (a.newPath || a.oldPath || '').split('/').length;
+                const depthB = (b.newPath || b.oldPath || '').split('/').length;
+                return depthA - depthB;
+            }
+            
+            return 0;
+        });
+
+        const sortedDeletes = this.sortDeleteChangesByDependency(deleteChanges);
+        const result = [...sortedOthers, ...sortedDeletes];
+        
+        return result;
+    }
+
+    private sortDeleteChangesByDependency(deleteChanges: RemoteChange[]): RemoteChange[] {
+        const fileDeletes: RemoteChange[] = [];
+        const folderDeletes: RemoteChange[] = [];
+        
+        // 파일과 폴더 삭제 분리
+        deleteChanges.forEach(change => {
+            if (change.isFolder) {
+                folderDeletes.push(change);
+            } else {
+                fileDeletes.push(change);
+            }
+        });
+        
+        // 🔥 FIX: 폴더 삭제는 깊이 순으로 정렬 (깊은 폴더부터 삭제)
+        const sortedFolderDeletes = folderDeletes.sort((a, b) => {
+            const depthA = (a.oldPath || '').split('/').length;
+            const depthB = (b.oldPath || '').split('/').length;
+            return depthB - depthA; // 깊은 것부터 (역순)
+        });
+        
+        console.log(`🗑️ [SORT_DELETE] Delete order: ${fileDeletes.length} files first, then ${sortedFolderDeletes.length} folders (deepest first)`);
+        
+        // 파일 먼저, 그 다음 폴더 (깊은 것부터)
+        return [...fileDeletes, ...sortedFolderDeletes];
+    }
+
+    /**
+     * Sort changes by priority and resolve dependencies
+     */
+    sortChangesByPriority(changes: RemoteChange[]): RemoteChange[] {
+        // Basic priority sort
+        const sorted = changes.sort((a, b) => a.priority - b.priority);
+
+        // Additional dependency resolution can be added here
+        // For now, the priority order handles most cases correctly
+
+        return sorted;
+    }
+
+    /**
+     * Apply remote changes to local filesystem
+     */
+    async applyRemoteChanges(changes: RemoteChange[]): Promise<number> {
+        if (changes.length === 0) {
+            console.log('No remote changes to apply');
+            return 0;
+        }
+
+        const deduplicatedChanges = this.removeDuplicateChanges(changes);
+        console.log(`🔄 Applying ${changes.length} remote changes...`);
+        let appliedCount = 0;
+
+        for (const change of changes) {
+            try {
+                console.log(`Applying change: ${change.type} for ${change.fileName}`);
+                
+                await this.applyRemoteChange(change);
+                appliedCount++;
+                
+            } catch (error) {
+                console.error(`Failed to apply remote change for ${change.fileName}:`, error);
+                // Continue with other changes even if one fails
+            }
+        }
+
+        console.log(`✅ Applied ${appliedCount}/${changes.length} remote changes`);
+        return appliedCount;
+    }
+    private removeDuplicateChanges(changes: RemoteChange[]): RemoteChange[] {
+        const seenIds = new Set<string>();
+        const seenPaths = new Set<string>();
+        const deduplicated: RemoteChange[] = [];
+        
+        for (const change of changes) {
+            let shouldInclude = true;
+            const key = `${change.type}-${change.fileId}`;
+            
+            // 같은 파일/폴더의 같은 타입 변경은 한 번만
+            if (seenIds.has(key)) {
+                console.log(`🧹 [DEDUP] Removing duplicate: ${change.type} for ${change.fileName} (${change.fileId})`);
+                shouldInclude = false;
+            }
+            
+            // 같은 경로의 폴더 생성은 한 번만
+            if (change.type === 'create_folder' && change.newPath) {
+                if (seenPaths.has(change.newPath)) {
+                    console.log(`🧹 [DEDUP] Removing duplicate folder create: ${change.newPath}`);
+                    shouldInclude = false;
+                }
+                seenPaths.add(change.newPath);
+            }
+            
+            if (shouldInclude) {
+                seenIds.add(key);
+                deduplicated.push(change);
+            }
+        }
+        
+        return deduplicated;
+    }
+    /**
+     * Apply a single remote change
+     */
+    async applyRemoteChange(change: RemoteChange): Promise<void> {
+        switch (change.type) {
+            case 'create_folder':
+                await this.applyRemoteCreateFolder(change);
+                break;
+            case 'rename_folder':
+                await this.applyRemoteRenameFolder(change);
+                break;
+            case 'move_folder':
+                await this.applyRemoteMoveFolder(change);
+                break;
+            case 'move_file':
+                await this.applyRemoteMoveFile(change);
+                break;
+            case 'rename_file':
+                await this.applyRemoteRenameFile(change);
+                break;
+            case 'modify':
+                await this.applyRemoteModifyFile(change);
+                break;
+            case 'delete_file':
+                await this.applyRemoteDeleteFile(change);
+                break;
+            case 'delete_folder':
+                await this.applyRemoteDeleteFolder(change);
+                break;
+            default:
+                console.warn(`Unknown remote change type: ${change.type}`);
+        }
+    }
+
+    /**
+     * Apply remote folder creation
+     */
+    async applyRemoteCreateFolder(change: RemoteChange): Promise<void> {
+        if (!change.newPath) {
+            console.warn(`⚠️ Remote create folder missing newPath: ${change.fileName}`);
+            return;
+        }
+    
+        try {
+            let targetPath = change.newPath;
+            
+            // 선택된 폴더 모드에서는 상대 경로로 변환
+            if (!this.settings.syncWholeVault && this.settings.selectedDriveFolders.length > 0) {
+                // 현재 동기화 대상 폴더 찾기
+                const parentFolder = this.settings.selectedDriveFolders.find(f => 
+                    change.newPath!.startsWith(f.path) || f.path.startsWith(change.newPath!)
+                );
+                
+                if (parentFolder) {
+                    // 상대 경로가 아니라면 부모 폴더 기준으로 조정
+                    if (!targetPath.startsWith(parentFolder.path + '/') && targetPath !== parentFolder.path) {
+                        targetPath = `${parentFolder.path}/${change.fileName}`;
+                        console.log(`📁 Adjusted create folder path: ${change.newPath} → ${targetPath}`);
+                    }
+                }
+            }
+            
+            console.log(`📁+ Creating local folder: ${targetPath} (original: ${change.newPath})`);
+            
+            const folderExists = await this.app.vault.adapter.exists(targetPath);
+            if (!folderExists) {
+                await this.app.vault.createFolder(targetPath);
+                console.log(`✅ Created local folder: ${targetPath}`);
+            } else {
+                console.log(`ℹ️ Folder already exists: ${targetPath}`);
+            }
+        } catch (error) {
+            console.error(`❌ Failed to create folder ${change.newPath}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote folder rename
+     */
+    async applyRemoteRenameFolder(change: RemoteChange): Promise<void> {
+        if (!change.oldName || !change.newName) {
+            console.warn('Missing oldName or newName for folder rename');
+            return;
+        }
+    
+        try {
+            console.log(`📁✏️ Applying remote folder rename: ${change.oldName} → ${change.newName}`);
+            
+            // 🔥 FIX: 폴더 찾기 로직 개선
+            let folder: TAbstractFile | null = null;
+            
+            // 1. oldPath로 먼저 찾기
+            if (change.oldPath) {
+                folder = this.app.vault.getAbstractFileByPath(change.oldPath);
+                console.log(`🔍 Searching by oldPath: ${change.oldPath} - ${folder ? 'Found' : 'Not found'}`);
+            }
+            
+            // 2. oldPath로 못 찾으면 oldName으로 찾기
+            if (!folder && change.oldName) {
+                console.log(`🔍 Searching by oldName: ${change.oldName}`);
+                const allFolders = this.app.vault.getAllLoadedFiles()
+                    .filter(f => f instanceof TFolder) as TFolder[];
+                
+                const foundFolder = allFolders.find(f => f.name === change.oldName);
+                folder = foundFolder || null;
+            }
+            
+            if (folder instanceof TFolder) {
+                // 🔥 FIX: 새 경로 계산 개선
+                const parentPath = folder.parent?.path || '';
+                const newPath = parentPath ? `${parentPath}/${change.newName}` : change.newName;
+                
+                console.log(`🔄 Renaming folder: ${folder.path} → ${newPath}`);
+                
+                await this.app.vault.rename(folder, newPath);
+                console.log(`✅ Successfully renamed folder: ${change.oldName} → ${change.newName}`);
+            } else {
+                console.warn(`⚠️ Local folder not found for rename: oldPath=${change.oldPath}, oldName=${change.oldName}`);
+            }
+        } catch (error) {
+            console.error(`❌ Failed to rename folder ${change.oldName}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote folder move
+     */
+    async applyRemoteMoveFolder(change: RemoteChange): Promise<void> {
+        if (!change.oldPath || !change.newPath) return;
+
+        try {
+            const folder = this.app.vault.getAbstractFileByPath(change.oldPath);
+            if (folder instanceof TFolder) {
+                await this.app.vault.rename(folder, change.newPath);
+                await this.updateFolderStateAfterMove(change.oldPath, change.newPath);
+                console.log(`📁📍 Moved local folder: ${change.oldPath} → ${change.newPath}`);
+            }
+        } catch (error) {
+            console.error(`Failed to move folder ${change.oldPath}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote file move
+     */
+    async applyRemoteMoveFile(change: RemoteChange): Promise<void> {
+        if (!change.oldPath || !change.newPath) return;
+
+        try {
+            const file = this.app.vault.getAbstractFileByPath(change.oldPath);
+            if (file instanceof TFile) {
+                // Ensure target directory exists
+                const targetDir = change.newPath.substring(0, change.newPath.lastIndexOf('/'));
+                if (targetDir && !await this.app.vault.adapter.exists(targetDir)) {
+                    await this.app.vault.createFolder(targetDir);
+                }
+                
+                await this.app.vault.rename(file, change.newPath);
+                console.log(`📄📍 Moved local file: ${change.oldPath} → ${change.newPath}`);
+            }
+        } catch (error) {
+            console.error(`Failed to move file ${change.oldPath}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote file rename
+     */
+    async applyRemoteRenameFile(change: RemoteChange): Promise<void> {
+        if (!change.oldName || !change.newName) {
+            console.warn('Missing oldName or newName for file rename');
+            return;
+        }
+
+        try {
+            let file: TAbstractFile | null = null;
+            console.log(`📄✏️ Applying remote file rename: ${change.oldName} → ${change.newName}`);
+            if (change.oldPath) {
+                file = this.app.vault.getAbstractFileByPath(change.oldPath || '');
+            }
+           
+            if (!file && change.oldName) {
+                const allFiles = this.app.vault.getFiles();
+                const foundFile = allFiles.find(f => f.name === change.oldName);
+                file = foundFile || null;
+            }
+
+            if (file instanceof TFile) {
+                const parentPath = file.parent?.path || '';
+                const newPath = parentPath ? `${parentPath}/${change.newName}` : change.newName;
+            
+                await this.app.vault.rename(file, newPath);
+                console.log(`📄✏️ Renamed local file: ${change.oldName} → ${change.newName}`);
+            } else {
+                console.log(`⏭️ Local file not found for rename`);
+            }
+        } catch (error) {
+            console.error(`Failed to rename file ${change.oldName}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote file modification (download updated content)
+     */
+    async applyRemoteModifyFile(change: RemoteChange): Promise<void> {
+        try {
+            // This will be handled by the standard sync process
+            // We just need to mark that this file should be downloaded
+            console.log(`📝 Remote modification detected for: ${change.fileName} (will be handled by standard sync)`);
+        } catch (error) {
+            console.error(`Failed to handle file modification ${change.fileName}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote file deletion
+     */
+    async applyRemoteDeleteFile(change: RemoteChange): Promise<void> {
+        if (!change.oldPath) return;
+
+        try {
+            let file = this.app.vault.getAbstractFileByPath(change.oldPath);
+            if (!file && change.fileName) {
+                console.log(`🔍 Searching by filename: ${change.fileName}`);
+                const allFiles = this.app.vault.getFiles();
+                file = allFiles.find(f => f.name === change.fileName)|| null;
+                if (file) {
+                    console.log(`✅ Found file by name: ${file.path}`);
+                }
+            }
+
+            if (file instanceof TFile) {
+                await this.app.vault.delete(file);
+                console.log(`🗑️📄 Deleted local file: ${change.oldPath}`);
+            }
+        } catch (error) {
+            console.error(`Failed to delete file ${change.oldPath}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Apply remote folder deletion
+     */
+    async applyRemoteDeleteFolder(change: RemoteChange): Promise<void> {
+        if (!change.oldPath) return;
+
+        try {
+            let folder = this.app.vault.getAbstractFileByPath(change.oldPath);
+            if (!folder && change.fileName) {
+                console.log(`🔍 Searching by folder name: ${change.fileName}`);
+                const allFolders = this.app.vault.getAllLoadedFiles()
+                    .filter(f => f instanceof TFolder) as TFolder[];
+                folder = allFolders.find(f => f.name === change.fileName) || null;
+                if (folder) {
+                    console.log(`✅ Found folder by name: ${folder.path}`);
+                }
+            }
+
+            if (folder instanceof TFolder) {
+                try {
+                    // 🔥 QUICK FIX: 일반 삭제 시도
+                    await this.app.vault.delete(folder);
+                    console.log(`✅ [DELETE_FOLDER] Successfully deleted: ${folder.path}`);
+                    
+                } catch (error) {
+                    if (error.message && error.message.includes('ENOTEMPTY')) {
+                        console.warn(`⚠️ [DELETE_FOLDER] Folder not empty, attempting force delete...`);
+                        
+                        // 🔥 QUICK FIX: 강제 삭제 - 모든 하위 항목 먼저 삭제
+                        await this.forceDeleteFolderContents(folder);
+                        
+                        // 이제 빈 폴더 삭제
+                        await this.app.vault.delete(folder);
+                        console.log(`✅ [DELETE_FOLDER] Force deleted successfully: ${change.oldPath}`);
+                    } else {
+                        throw error; // 다른 에러는 다시 throw
+                    }
+                }
+                
+            } else {
+                console.log(`ℹ️ [DELETE_FOLDER] Folder not found (already deleted): ${change.oldPath}`);
+            }
+        } catch (error) {
+            console.error(`Failed to delete folder ${change.oldPath}:`, error);
+            throw error;
+        }
+    }
+    private async forceDeleteFolderContents(folder: TFolder): Promise<void> {
+        console.log(`💪 [FORCE_DELETE] Deleting contents of: ${folder.path}`);
+        
+        // 모든 하위 항목 가져오기 (복사본)
+        const children = [...folder.children];
+        
+        for (const child of children) {
+            try {
+                console.log(`  🗑️ [FORCE_DELETE] Deleting: ${child.name} (${child instanceof TFolder ? 'folder' : 'file'})`);
+                
+                if (child instanceof TFolder) {
+                    // 하위 폴더면 재귀적으로 내용 삭제 후 폴더 삭제
+                    await this.forceDeleteFolderContents(child);
+                    await this.app.vault.delete(child);
+                } else {
+                    // 파일이면 바로 삭제
+                    await this.app.vault.delete(child);
+                }
+                
+            } catch (childError) {
+                console.error(`  ❌ [FORCE_DELETE] Failed to delete child ${child.name}:`, childError);
+                // 하위 항목 삭제 실패해도 계속 진행
+            }
+        }
+        
+        console.log(`✅ [FORCE_DELETE] Folder contents cleared: ${folder.path}`);
+    }
+    /**
+     * Calculate summary of changes
+     */
+    calculateChangeSummary(changes: RemoteChange[]): {created: number, deleted: number, moved: number, renamed: number, modified: number} {
+        const summary = {
+            created: 0,
+            deleted: 0,
+            moved: 0,
+            renamed: 0,
+            modified: 0
+        };
+
+        for (const change of changes) {
+            switch (change.type) {
+                case 'create_folder':
+                    summary.created++;
+                    break;
+                case 'delete_file':
+                case 'delete_folder':
+                    summary.deleted++;
+                    break;
+                case 'move_file':
+                case 'move_folder':
+                    summary.moved++;
+                    break;
+                case 'rename_file':
+                case 'rename_folder':
+                    summary.renamed++;
+                    break;
+                case 'modify':
+                    summary.modified++;
+                    break;
+            }
+        }
+
+        return summary;
+    }
+
+    /**
+     * Update cached remote snapshot
+     */
+    async updateRemoteSnapshot(snapshot: DriveSnapshot): Promise<void> {
+        this.settings.lastRemoteSnapshot = snapshot;
+        await this.saveSettings();
+        console.log(`💾 Updated remote snapshot cache (${snapshot.files.length} files, ${snapshot.folders.length} folders)`);
+    }
+
+    /**
+     * Standard folder sync (existing implementation preserved)
+     */
+    async standardSyncFolder(folder: TFolder): Promise<SyncResult> {
+        // This would call the existing sync implementation
+        // For now, return a basic result
+        console.log(`🔄 Running standard sync for folder: ${folder.path}`);
+        
+        try {
+            // 🔥 FIX: 특정 폴더만 동기화하도록 수정
+            let result: SyncResult;
+            
+            if (this.settings.syncWholeVault) {
+                // Whole vault mode - 전체 볼트 동기화
+                result = await this.bidirectionalSync(false);
+            } else {
+                // Selected folder mode - 해당 폴더만 동기화
+                const selectedFolder = this.findParentSyncFolder(folder.path);
+                
+                if (!selectedFolder) {
+                    console.warn(`❌ Folder "${folder.name}" is not within any configured sync folder`);
+                    return {
+                        uploaded: 0,
+                        downloaded: 0,
+                        skipped: 0,
+                        conflicts: 0,
+                        errors: 1,
+                        createdFolders: []
+                    };
+                }
+    
+                console.log(`📁 Found parent sync folder: ${selectedFolder.name} for target folder: ${folder.name}`);
+    
+                // 🔥 FIX: 기존 syncFolderToGoogleDrive 로직 재사용
+                let localFiles: TFile[];
+                let driveFiles: any[];
+    
+                if (folder.path === selectedFolder.path) {
+                    // 정확히 일치하는 폴더
+                    console.log(`📁 Syncing entire configured folder: ${selectedFolder.name}`);
+                    localFiles = await this.getLocalFilesForDriveFolder(selectedFolder);
+                    driveFiles = await this.getAllFilesFromDrive(selectedFolder.id, selectedFolder.path);
+                } else {
+                    // 하위 폴더
+                    console.log(`📁 Syncing subfolder: ${folder.name} within ${selectedFolder.name}`);
+                    localFiles = await this.getLocalFilesForTargetFolder(folder.path);
+                    driveFiles = await this.getDriveFilesForTargetFolder(folder.path, selectedFolder.id, selectedFolder.path);
+                }
+    
+                console.log(`📊 Standard sync - Local files: ${localFiles.length}, Drive files: ${driveFiles.length}`);
+    
+                result = await this.performBidirectionalSyncWithGlobalProgress(
+                    localFiles, 
+                    driveFiles, 
+                    selectedFolder.id, 
+                    selectedFolder.path,
+                    undefined, // No progress modal for nested sync
+                    0, 
+                    localFiles.length + driveFiles.length
+                );
+            }
+            
+            console.log(`✅ Standard sync completed:`, result);
+            return result;
+            
+        } catch (error) {
+            console.error(`❌ Standard sync failed for ${folder.path}:`, error);
+            return {
+                uploaded: 0,
+                downloaded: 0,
+                skipped: 0,
+                conflicts: 0,
+                errors: 1,
+                createdFolders: []
+            };
+        }
+    }
+
+    // 🔥 파일 상태 캐시 관리 메서드들
+    private getFileState(filePath: string): FileState {
+        const normalizedPath = this.normalizeFullPath(filePath);
+        return this.settings.fileStateCache[normalizedPath] || {};
+    }
+
+    private setFileState(filePath: string, state: Partial<FileState>): void {
+        const normalizedPath = this.normalizeFullPath(filePath);
+        if (!this.settings.fileStateCache[normalizedPath]) {
+            this.settings.fileStateCache[normalizedPath] = {};
+        }
+        Object.assign(this.settings.fileStateCache[normalizedPath], state);
     }
 
     // Calculate hash with performance optimization for large files
@@ -2884,17 +2098,8 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
-    // Hash cache management for performance
-    private hashCache: Map<string, {hash: string, mtime: number, size: number}> = new Map();
-
     // Cached hash calculation to avoid redundant computation
     private async getCachedFileHash(file: TFile): Promise<string> {
-        const currentFile = this.app.vault.getAbstractFileByPath(file.path);
-        if (!(currentFile instanceof TFile)) {
-            console.log(`⚠️ File no longer exists for hash calculation: ${file.path}`);
-            return 'deleted-file-hash'; // 삭제된 파일용 더미 해시
-        }
-
         const cacheKey = file.path;
         const cached = this.hashCache.get(cacheKey);
         
@@ -2920,72 +2125,25 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // Master sync decision logic - determines what action to take
-    public async decideSyncAction(localFile: TFile, driveFile?: any): Promise<SyncDecision> {
+    private async decideSyncAction(localFile: TFile, driveFile?: any): Promise<SyncDecision> {
         const fileName = localFile.name;
         const filePath = localFile.path;
         
         try {
-            // 🔥 Early check: ensure local file still exists
-            const currentLocalFile = this.app.vault.getAbstractFileByPath(filePath);
-            if (!(currentLocalFile instanceof TFile)) {
-                console.log(`🗑️ ${fileName}: Local file no longer exists during decision`);
+            // Case 1: New file (no remote counterpart)
+            if (!driveFile) {
                 return {
                     shouldSync: true,
-                    action: 'deleted',
-                    reason: 'local-file-deleted-during-processing'
+                    action: 'upload',
+                    reason: 'new-local-file',
+                    localHash: await this.getCachedFileHash(localFile)
                 };
             }
-            
-            if (!driveFile) {
-                // Case 1: New file (no remote counterpart)
-                const fileState = this.getFileState(filePath);
     
-                if (fileState.fileId || fileState.lastSyncTime) {
-                    // 이전에 동기화된 적이 있음 - 원격에서 삭제된 것으로 판단
-                    console.log(`🗑️ ${fileName}: Previously synced but not found in remote - deleted remotely`);
-            
-                    try {
-                        await this.app.vault.delete(currentLocalFile);
-                        
-                        // 캐시에서도 제거
-                        const normalizedPath = this.normalizeFullPath(filePath);
-                        if (this.settings.fileStateCache[normalizedPath]) {
-                            delete this.settings.fileStateCache[normalizedPath];
-                            await this.saveSettings();
-                        }
-                        
-                        console.log(`✅ ${fileName}: Local file deleted to match remote deletion`);
-                        
-                        return {
-                            shouldSync: true, 
-                            action: 'deleted', 
-                            reason: 'remote-deleted-applied-locally'
-                        };
-                    } catch (error) {
-                        console.error(`❌ Failed to delete local file ${fileName}:`, error);
-                        return {
-                            shouldSync: false,
-                            action: 'skip',
-                            reason: 'remote-deleted-but-local-delete-failed',
-                            localHash: await this.getCachedFileHash(currentLocalFile)
-                        };
-                    }
-                } else {
-                    // 진짜 새 파일
-                    return {
-                        shouldSync: true,
-                        action: 'upload',
-                        reason: 'new-local-file',
-                        localHash: await this.getCachedFileHash(currentLocalFile)
-                    };
-                }
-            }
-    
-            // ... rest of the existing logic remains the same ...
             // Calculate current state
-            const currentLocalHash = await this.getCachedFileHash(currentLocalFile);
+            const currentLocalHash = await this.getCachedFileHash(localFile);
             const currentRemoteHash = driveFile.md5Checksum;
-            const currentLocalModTime = currentLocalFile.stat.mtime;
+            const currentLocalModTime = localFile.stat.mtime;
             const currentRemoteModTime = new Date(driveFile.modifiedTime).getTime();
     
             // 🔥 Case 2: Identical hash - content is same, no sync needed
@@ -3107,7 +2265,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 details: { error: error.message }
             };
         }
-    } 
+    }
 
     // Log sync decisions for debugging and monitoring
     private logSyncDecision(decision: SyncDecision, fileName: string): void {
@@ -3118,8 +2276,16 @@ export default class GDriveSyncPlugin extends Plugin {
             'skip': '⏭️',
             'conflict': '⚡'
         }[decision.action] || '❓';
-        
-        console.log(`[${timestamp}] ${icon} SYNC: ${decision.action.toUpperCase()} - ${fileName} (${decision.shouldSync ? '✅' : '❌'}) Reason: ${decision.reason}`);
+    
+        const hashInfo = decision.localHash && decision.remoteHash 
+            ? ` | Hash: local=${decision.localHash.substring(0, 8)}... vs remote=${decision.remoteHash.substring(0, 8)}...` 
+            : '';
+            
+        const detailsInfo = decision.details
+            ? ` | Details: ${JSON.stringify(decision.details)}`
+            : '';
+    
+        console.log(`[${timestamp}] ${icon} SYNC DECISION: ${decision.action} "${fileName}" | Should sync: ${decision.shouldSync ? '✅' : '❌'} | Reason: ${decision.reason}${hashInfo}${detailsInfo}`);
     }
 
     public clearFileStateCache(): void {
@@ -3265,200 +2431,113 @@ export default class GDriveSyncPlugin extends Plugin {
         return folderId;
     }
 
-    // Initialize change detection system
-    private initializeChangeDetection(): void {
-        this.changeDetectionService = new DriveChangeDetectionService(this);
-
-        this.restoreSnapshotsFromSettings();
-    }
-
-    private async restoreSnapshotsFromSettings(): Promise<void> {
-        if (!this.changeDetectionService || !this.settings.persistentSnapshots) {
-            return;
-        }
+    async onload() {
+        await this.loadSettings();
     
-        try {
-            const snapshotManager = new DriveSnapshotManager(this);
-            const restoredCount = Object.keys(this.settings.persistentSnapshots).length;
-            
-            if (restoredCount > 0) {
-                // DriveChangeDetectionService의 internal state에 직접 접근하는 대신
-                // 새로운 스냅샷을 생성하도록 수정
-                console.log(`📸 Found ${restoredCount} stored snapshots - will refresh them`);
-                
-                // 실제 복원은 첫 번째 변경 감지 시에 스냅샷을 새로 생성하도록 처리
-            }
-        } catch (error) {
-            console.error('❌ Error restoring snapshots:', error);
-        }
-    }
-
-    private async backupSnapshotsToSettings(): Promise<void> {
-        if (!this.changeDetectionService) {
-            return;
-        }
-    
-        try {
-            const status = this.changeDetectionService.getStatus();
-            this.settings.persistentSnapshots = {};
-            
-            // Map을 일반 객체로 변환
-            for (const [folderId, snapshot] of status.snapshots) {
-                this.settings.persistentSnapshots[folderId] = snapshot;
-            }
-            
-            await this.saveSettings();
-            console.log(`💾 Backed up ${status.snapshots.size} snapshots to settings`);
-        } catch (error) {
-            console.error('❌ Error backing up snapshots:', error);
-        }
-    }
-
-    private async performPreSyncChangeCheck(progressModal?: SyncProgressModal): Promise<void> {
-        try {
-            console.log('🔍 Starting pre-sync change check');
-            progressModal?.addLog('🔍 Checking for remote changes...');
-            
-            if (!this.changeDetectionService) {
-                this.initializeChangeDetection();
-            }
-            
-            // 폴링이 꺼져있어도 수동으로 변경사항 체크
-            const syncChanges = await this.changeDetectionService!.getChangesForSync();
-            console.log('🔍 [DEBUG] Sync changes result:', syncChanges);
-
-            if (syncChanges.deletions.length > 0) {
-                progressModal?.addLog(`🗑️ Found ${syncChanges.deletions.length} remote deletions`);
-                
-                // Process deletions using existing ChangeProcessingResult
-                const deletionResult = await this.changeDetectionService!.processPendingDeletions(
-                    syncChanges.deletions, 
-                    progressModal
-                );
-                
-                progressModal?.addLog(`✅ Processed ${deletionResult.processed} deletions (${deletionResult.errors} errors, ${deletionResult.skipped} skipped)`);
-            }
-            
-            progressModal?.addLog('✅ Remote changes applied');
-        } catch (error) {
-            console.error('⚠️ Pre-sync change check failed:', error);
-            progressModal?.addLog(`⚠️ Change check failed: ${error.message}`);
-        }
-    }    
-
-    // Add change detection commands
-    private addChangeDetectionCommands(): void {
-        this.addCommand({
-            id: 'start-change-detection',
-            name: 'Start Change Detection',
-            callback: () => {
-                this.startChangeDetection();
-            }
+        const ribbonIconEl = this.addRibbonIcon('cloud', 'Google Drive Sync', (evt) => {
+            this.mainSync(true); 
         });
-
-        this.addCommand({
-            id: 'stop-change-detection',
-            name: 'Stop Change Detection',
-            callback: () => {
-                this.stopChangeDetection();
-            }
-        });
-
-        this.addCommand({
-            id: 'check-remote-changes',
-            name: 'Check for Remote Changes',
-            callback: () => {
-                this.manualChangeCheck();
-            }
-        });
-
-        this.addCommand({
-            id: 'debug-change-detection',
-            name: 'Debug Change Detection Status',
-            callback: () => {
-                this.debugChangeDetection();
-            }
-        });
-    }
-
-    // Start change detection
-    async startChangeDetection(): Promise<void> {
-        if (!this.isAuthenticated()) {
-            new Notice('❌ Please authenticate with Google Drive first');
-            return;
-        }
-
-        if (!this.changeDetectionService) {
-            this.initializeChangeDetection();
-        }
-
-        try {
-            await this.changeDetectionService!.startPolling();
-            new Notice('✅ Change detection started');
-            
-            // Update settings to remember change detection was enabled
-            this.settings.changeDetectionEnabled = true;
-            await this.saveSettings();
-            
-        } catch (error) {
-            console.error('❌ Failed to start change detection:', error);
-            new Notice('❌ Failed to start change detection');
-        }
-    }    
-
-    // Phase 2: Stop change detection
-    async stopChangeDetection(): Promise<void> {
-        if (this.changeDetectionService) {
-            await this.changeDetectionService.stopPolling();
-            new Notice('🛑 Change detection stopped');
-            
-            // Update settings
-            this.settings.changeDetectionEnabled = false;
-            await this.saveSettings();
-        }
-    }
-
-    // Phase 2: Manual change check
-    async manualChangeCheck(): Promise<void> {
-        if (!this.isAuthenticated()) {
-            new Notice('❌ Please authenticate with Google Drive first');
-            return;
-        }
-
-        try {
-            new Notice('🔍 Checking for remote changes...');
-            
-            if (!this.changeDetectionService) {
-                this.initializeChangeDetection();
-            }
-
-            // Perform one-time change check
-            await this.changeDetectionService!.pollForChanges();
-            new Notice('✅ Remote change check completed');
-            
-        } catch (error) {
-            console.error('❌ Manual change check failed:', error);
-            new Notice('❌ Failed to check for remote changes');
-        }
-    }
-
-    // Phase 2: Debug change detection
-    debugChangeDetection(): void {
-        const status = this.changeDetectionService?.getStatus();
-        const debugInfo = {
-            isActive: this.changeDetectionService?.isActive() || false,
-            lastChangeToken: status?.lastChangeToken || 'None',
-            lastPollingTime: status?.lastPollingTime ? new Date(status.lastPollingTime).toLocaleString() : 'Never',
-            snapshotCount: status?.snapshots.size || 0,
-            pendingChanges: status?.pendingChanges.length || 0,
-            autoSyncEnabled: this.settings.autoSync,
-            changeDetectionEnabled: this.settings.changeDetectionEnabled
-        };
-
-        console.log('=== CHANGE DETECTION DEBUG INFO ===');
-        console.table(debugInfo);
+        ribbonIconEl.addClass('gdrive-sync-ribbon-class');
         
-        new Notice(`Change Detection: ${debugInfo.isActive ? '✅ Active' : '❌ Inactive'} (Check console for details)`);
+        // Add status bar sync indicator
+        this.addStatusBarSync();
+        
+        // Add file menu items for sync operations
+        this.addFileMenuItems();
+
+        // Add folder context menu with conditional display
+        this.addFolderContextMenu();
+
+        // Commands 
+        this.addCommand({
+            id: 'sync-with-gdrive',
+            name: 'Sync with Google Drive',
+            callback: () => {
+                this.mainSync(false); 
+            }
+        });
+    
+        this.addCommand({
+            id: 'download-from-gdrive',
+            name: 'Download from Google Drive',
+            callback: () => {
+                this.downloadFromGoogleDrive(false);
+            }
+        });
+    
+        this.addCommand({
+            id: 'upload-to-gdrive',
+            name: 'Upload to Google Drive',
+            callback: () => {
+                this.uploadToGoogleDrive(false);
+            }
+        });
+    
+        // Add auto sync debug command
+        this.addCommand({
+            id: 'debug-auto-sync',
+            name: 'Debug Auto Sync Status',
+            callback: () => {
+                this.debugAutoSyncStatus();
+            }
+        });
+
+        this.addCommand({
+            id: 'clear-remote-snapshot-cache',
+            name: 'Clear Remote Snapshot Cache',
+            callback: () => {
+                this.settings.lastRemoteSnapshot = undefined;
+                this.saveSettings();
+                new Notice('✅ Remote snapshot cache cleared');
+            }
+        });
+
+        // Add hotkey
+        this.addCommand({
+            id: 'quick-sync-gdrive',
+            name: 'Quick Sync with Google Drive',
+            hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'S' }], // Ctrl+Shift+S
+            callback: () => {
+                this.mainSync(true); // Show progress
+            }
+        });
+
+
+        // Sync current file only
+        this.addCommand({
+            id: 'sync-current-file',
+            name: 'Sync Current File to Google Drive',
+            editorCallback: (editor, view) => {
+                const file = view.file;
+                if (file) {
+                    this.syncSingleFile(file);
+                } else {
+                    new Notice('No active file to sync');
+                }
+            }
+        });
+
+        // Setup file change detection and auto sync
+        this.setupFileChangeDetection();
+
+        this.settingTab = new GDriveSyncSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
+
+        console.log('Plugin loaded - Google Drive folder-based sync');
+        
+        // Add concurrent operation context menus
+        this.addSyncContextMenus();
+        
+        console.log('Phase 1: Sync operations context menus loaded');
+        console.log(`Initial auto sync setting: ${this.settings.autoSync}`);
+
+        // Initialize auto sync
+        if (this.settings.autoSync) {
+            console.log('Initializing auto sync on plugin load...');
+            this.setupAutoSync();
+        } else {
+            console.log('Auto sync disabled on plugin load');
+        }
     }
 
     private addSyncContextMenus(): void {
@@ -3955,7 +3034,7 @@ export default class GDriveSyncPlugin extends Plugin {
         // 이동은 이름 변경과 동일한 처리
         await this.updateFileStateAfterRename(oldPath, newPath);
     }
-    public async updateFileStateAfterRename(oldPath: string, newPath: string): Promise<void> {
+    private async updateFileStateAfterRename(oldPath: string, newPath: string): Promise<void> {
         // 파일 상태 캐시에서 경로 업데이트
         const oldState = this.getFileState(oldPath);
         if (oldState) {
@@ -4118,7 +3197,7 @@ export default class GDriveSyncPlugin extends Plugin {
         // 폴더 이동은 폴더 이름 변경과 동일한 처리
         await this.updateFolderStateAfterRename(oldPath, newPath);
     }    
-    public async updateFolderStateAfterRename(oldPath: string, newPath: string): Promise<void> {
+    private async updateFolderStateAfterRename(oldPath: string, newPath: string): Promise<void> {
         const updatedPaths = new Map<string, string>();
         
         // 폴더 내 모든 파일의 상태 캐시 업데이트
@@ -4135,8 +3214,33 @@ export default class GDriveSyncPlugin extends Plugin {
             delete this.settings.fileStateCache[this.normalizeFullPath(oldFilePath)];
         }
         
+        // 폴더 캐시도 업데이트
+        this.updateFolderCacheAfterMove(oldPath, newPath);
+
         await this.saveSettings();
         console.log(`[STATE] Folder state updated: ${oldPath} → ${newPath} (${updatedPaths.size} files affected)`);
+    }
+
+    private updateFolderCacheAfterMove(oldPath: string, newPath: string): void {
+        const updatedFolderCache: FolderCache = {};
+        
+        // 기존 폴더 캐시 순회하며 경로 업데이트
+        for (const [cachedPath, folderId] of Object.entries(this.folderCache)) {
+            if (cachedPath.startsWith(oldPath + '/') || cachedPath === oldPath) {
+                // 이동된 경로로 업데이트
+                const newCachedPath = cachedPath.replace(oldPath, newPath);
+                updatedFolderCache[newCachedPath] = folderId;
+                console.log(`📁 Folder cache updated: ${cachedPath} → ${newCachedPath}`);
+            } else {
+                // 영향받지 않은 경로는 그대로 유지
+                updatedFolderCache[cachedPath] = folderId;
+            }
+        }
+        
+        // 폴더 캐시 교체
+        this.folderCache = updatedFolderCache;
+        
+        console.log(`💾 Folder cache updated after move: ${oldPath} → ${newPath}`);
     }
 
     private async moveDriveFolder(folderPath: string, targetFolderPath: string): Promise<void> {
@@ -4458,8 +3562,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }, 5000);
     }
 
-    private autoSyncTimeout: number | null = null;
-  
     // 🔥 상태바에 동기화 상태 표시
     private addStatusBarSync(): void {
         const statusBarItemEl = this.addStatusBarItem();
@@ -4851,37 +3953,36 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // 🔥 폴더 동기화 메서드
-    private async syncFolderToGoogleDrive(folder: TFolder, showProgress: boolean = true): Promise<void> {
+    private async syncFolderToGoogleDrive(folder: TFolder): Promise<void> {
         try {
             if (!this.isAuthenticated()) {
                 new Notice('❌ Please authenticate with Google Drive first');
                 return;
             }
     
-            new Notice(`🔄 Starting bidirectional sync for folder ${folder.name}...`);
-            
-            let parentSyncFolder: { id: string, name: string, path: string };
+            console.log(`🔄 Sync folder to GDrive: ${folder.path} - using enhanced sync with remote change detection`);
     
-            if (this.settings.syncWholeVault) {
-                const rootFolder = await this.getOrCreateDriveFolder();
-                if (!rootFolder) {
-                    new Notice('❌ Failed to access Google Drive root folder');
-                    return;
-                }
-                parentSyncFolder = { id: rootFolder.id, name: rootFolder.name, path: '' };
+            // 🔥 FIX: Enhanced sync with remote change detection 사용
+            const result = await this.syncFolderWithRemotePriority(folder);
+    
+            // Result summary logic
+            const messages: string[] = [];
+            if (result.uploaded > 0) messages.push(`${result.uploaded} uploaded`);
+            if (result.downloaded > 0) messages.push(`${result.downloaded} downloaded`);
+            if (result.skipped > 0) messages.push(`${result.skipped} skipped`);
+            if (result.conflicts > 0) messages.push(`${result.conflicts} conflicts resolved`);
+            if (result.remoteChangesApplied) messages.push(`${result.remoteChangesApplied} remote changes applied`);
+            
+            const summary = messages.length > 0 ? messages.join(', ') : 'No changes';
+            
+            if (result.errors === 0) {
+                new Notice(`✅ Folder sync completed: ${summary}`);
             } else {
-                const foundFolder = this.findParentSyncFolder(folder.path);
-                if (!foundFolder) {
-                    new Notice(`❌ Folder "${folder.name}" is not within any configured sync folder. Please add a parent folder in settings.`);
-                    return;
-                }
-                parentSyncFolder = foundFolder;
+                new Notice(`⚠️ Folder sync completed with ${result.errors} errors: ${summary}`);
             }
-            
-            // 🔥 추가: 폴더 및 하위 폴더들의 rename 체크 및 처리
-            await this.checkAndSyncAllFolderRenames(folder, parentSyncFolder);
-            
-            await this.bidirectionalSyncForFolder(folder, parentSyncFolder, showProgress);
+    
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettings();
     
         } catch (error) {
             console.error('Folder sync error:', error);
@@ -4889,677 +3990,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
     
-    private async checkAndSyncAllFolderChanges(
-        rootFolder: TFolder, 
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Checking for folder changes (rename/move) in: ${rootFolder.path} and all subfolders`);
-            
-            // 1. 먼저 Google Drive에서 이동된 폴더들을 감지
-            await this.detectAndProcessMovedFolders(rootFolder, parentSyncFolder);
-            
-            // 2. 루트 폴더 자체 체크
-            await this.checkAndSyncAllFolderRenames(rootFolder, parentSyncFolder);
-            
-            // 3. 모든 하위 폴더들 재귀적으로 체크
-            if (this.settings.includeSubfolders) {
-                await this.checkSubfoldersRecursively(rootFolder, parentSyncFolder);
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error checking all folder changes for ${rootFolder.name}:`, error);
-        }
-    }
-    private async checkAndSyncAllFolderRenames(
-        rootFolder: TFolder, 
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Checking for folder renames in: ${rootFolder.path} and all subfolders`);
-            
-            // 1. 루트 폴더 자체 체크
-            await this.checkAndSyncFolderRename(rootFolder, parentSyncFolder);
-            
-            // 2. 모든 하위 폴더들 재귀적으로 체크
-            if (this.settings.includeSubfolders) {
-                await this.checkSubfoldersRecursively(rootFolder, parentSyncFolder);
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error checking all folder renames for ${rootFolder.name}:`, error);
-        }
-    }
-    
-    private async detectAndProcessMovedFolders(
-        rootFolder: TFolder,
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Detecting moved folders for: ${rootFolder.path}`);
-            
-            await this.detectMovedFoldersInSyncScope(parentSyncFolder);
-            
-        } catch (error) {
-            console.error(`❌ Error detecting moved folders:`, error);
-        }
-    }
-    private async detectMovedFoldersInSyncScope(
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Checking for moved folders in sync scope: ${parentSyncFolder.path}`);
-            
-            // 1. 캐시에서 fileId가 있는 모든 폴더들 수집
-            const cachedFolders = this.getCachedFoldersWithFileId(parentSyncFolder.path);
-            console.log(`📋 Found ${cachedFolders.length} cached folders with fileId`);
-            
-            // 2. 각 캐시된 폴더에 대해 Google Drive에서 현재 위치 확인
-            for (const cachedFolder of cachedFolders) {
-                await this.checkAndProcessSingleFolderMove(cachedFolder, parentSyncFolder);
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error in detectMovedFoldersInSyncScope:`, error);
-        }
-    }
-    private getCachedFoldersWithFileId(basePath: string): Array<{path: string, fileId: string, originalName?: string}> {
-        const foldersWithId: Array<{path: string, fileId: string, originalName?: string}> = [];
-        
-        for (const [cachedPath, cachedState] of Object.entries(this.settings.fileStateCache)) {
-            // 베이스 경로 내의 항목이고 fileId가 있는 경우
-            if (cachedState.fileId && 
-                (cachedPath === basePath || cachedPath.startsWith(basePath + '/') || !basePath)) {
-                
-                // 로컬에서 해당 경로가 폴더인지 확인 (또는 폴더였던 것으로 추정)
-                const localItem = this.app.vault.getAbstractFileByPath(cachedPath);
-                const isCurrentFolder = localItem instanceof TFolder;
-                
-                // 현재 폴더이거나, 로컬에 없지만 originalName이 있어서 폴더로 추정되는 경우
-                if (isCurrentFolder || (!localItem && cachedState.originalName)) {
-                    foldersWithId.push({
-                        path: cachedPath,
-                        fileId: cachedState.fileId,
-                        originalName: cachedState.originalName
-                    });
-                }
-            }
-        }
-        
-        console.log(`📋 Cached folders with fileId:`, foldersWithId.map(f => ({ path: f.path, name: f.originalName })));
-        return foldersWithId;
-    }
-    private async checkAndProcessSingleFolderMove(
-        cachedFolder: {path: string, fileId: string, originalName?: string},
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Checking folder move for: ${cachedFolder.path} (fileId: ${cachedFolder.fileId})`);
-            
-            // Google Drive에서 현재 위치 확인
-            const driveFileInfo = await this.getDriveFileInfo(cachedFolder.fileId);
-            
-            if (!driveFileInfo || driveFileInfo.trashed) {
-                console.log(`⚠️ Drive folder not found or trashed: ${cachedFolder.path}`);
-                await this.cleanupMissingFolder(cachedFolder.path);
-                return;
-            }
-            
-            // Drive에서의 현재 경로 계산
-            const currentDrivePath = await this.calculateDriveFilePath(driveFileInfo, parentSyncFolder);
-            
-            if (!currentDrivePath) {
-                console.log(`⚠️ Could not calculate current drive path for: ${cachedFolder.path}`);
-                return;
-            }
-            
-            console.log(`📍 Drive path: "${currentDrivePath}" vs Cached path: "${cachedFolder.path}"`);
-            
-            // 경로가 다른 경우 = 이동됨
-            if (currentDrivePath !== cachedFolder.path) {
-                console.log(`🎯 Folder move detected: "${cachedFolder.path}" → "${currentDrivePath}"`);
-                
-                await this.processFolderMove(cachedFolder.path, currentDrivePath, driveFileInfo.name);
-            } else {
-                console.log(`✅ Folder path unchanged: ${cachedFolder.path}`);
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error checking single folder move for ${cachedFolder.path}:`, error);
-        }
-    }
-    private async cleanupMissingFolder(path: string): Promise<void> {
-        try {
-            const localFolder = this.app.vault.getAbstractFileByPath(path);
-            
-            if (localFolder instanceof TFolder) {
-                // 충돌 해결 전략에 따라 처리
-                if (this.settings.conflictResolution === 'remote') {
-                    console.log(`🗑️ Removing local folder (remote deleted): ${path}`);
-                    await this.app.vault.delete(localFolder, true);
-                } else {
-                    console.log(`⏭️ Keeping local folder (local preference): ${path}`);
-                    return; // 로컬 우선이면 폴더 유지
-                }
-            }
-            
-            // 캐시 정리
-            await this.cleanupCacheForPath(path);
-            
-        } catch (error) {
-            console.error(`❌ Error cleaning up missing folder ${path}:`, error);
-        }
-    }
-    private async processFolderMove(
-        oldPath: string, 
-        newPath: string, 
-        folderName: string
-    ): Promise<void> {
-        try {
-            console.log(`🔄 Processing folder move: "${oldPath}" → "${newPath}"`);
-            
-            const oldLocalFolder = this.app.vault.getAbstractFileByPath(oldPath);
-            const newLocalFolder = this.app.vault.getAbstractFileByPath(newPath);
-            
-            // 🔥 Case 1: 이전 위치에 폴더가 있고, 새 위치에 없는 경우 → 로컬에서 이동
-            if (oldLocalFolder instanceof TFolder && !newLocalFolder) {
-                console.log(`📂 Moving local folder: ${oldPath} → ${newPath}`);
-                
-                // 새 경로의 상위 폴더가 없으면 생성
-                const newParentPath = newPath.substring(0, newPath.lastIndexOf('/'));
-                if (newParentPath && !this.app.vault.getAbstractFileByPath(newParentPath)) {
-                    await this.app.vault.createFolder(newParentPath);
-                    console.log(`📁 Created parent folder: ${newParentPath}`);
-                }
-                
-                // 폴더 이동 (이름 변경)
-                await this.app.vault.rename(oldLocalFolder, newPath);
-                
-                // 캐시 업데이트
-                await this.updateCacheAfterFolderMove(oldPath, newPath);
-                
-                new Notice(`✅ Folder moved: "${oldPath}" → "${newPath}"`);
-            }
-            // 🔥 Case 2: 이전 위치에 있고, 새 위치에도 있는 경우 → 이전 위치 삭제
-            else if (oldLocalFolder instanceof TFolder && newLocalFolder instanceof TFolder) {
-                console.log(`🗑️ Removing duplicate folder at old location: ${oldPath}`);
-                
-                await this.app.vault.delete(oldLocalFolder, true);
-                await this.cleanupCacheForPath(oldPath);
-                
-                new Notice(`✅ Removed duplicate folder: "${oldPath}"`);
-            }
-            // 🔥 Case 3: 이전 위치에 없고, 새 위치에만 있는 경우 → 캐시만 업데이트
-            else if (!oldLocalFolder && newLocalFolder instanceof TFolder) {
-                console.log(`💾 Updating cache for existing folder at new location: ${newPath}`);
-                
-                await this.updateCacheAfterFolderMove(oldPath, newPath);
-            }
-            // 🔥 Case 4: 둘 다 없는 경우 → 새 위치로 다운로드 예정이므로 캐시만 정리
-            else if (!oldLocalFolder && !newLocalFolder) {
-                console.log(`🧹 Cleaning up cache for moved folder (will be downloaded): ${oldPath} → ${newPath}`);
-                
-                await this.cleanupCacheForPath(oldPath);
-                
-                // 새 위치에 대한 기본 캐시 설정
-                this.setFileState(newPath, {
-                    fileId: this.getFileState(oldPath).fileId,
-                    originalName: folderName
-                });
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error processing folder move:`, error);
-            throw error;
-        }
-    }
-    private async cleanupCacheForPath(path: string): Promise<void> {
-        try {
-            const keysToRemove: string[] = [];
-            
-            // 해당 경로와 하위 모든 경로의 캐시 항목들 찾기
-            for (const cachedPath of Object.keys(this.settings.fileStateCache)) {
-                if (cachedPath === path || cachedPath.startsWith(path + '/')) {
-                    keysToRemove.push(cachedPath);
-                }
-            }
-            
-            // 캐시에서 제거
-            for (const key of keysToRemove) {
-                delete this.settings.fileStateCache[key];
-            }
-            
-            await this.saveSettings();
-            
-            console.log(`💾 Cleaned up cache for path: ${path} (${keysToRemove.length} items removed)`);
-            
-        } catch (error) {
-            console.error(`❌ Error cleaning up cache for path ${path}:`, error);
-        }
-    }
-    private async updateCacheAfterFolderMove(oldPath: string, newPath: string): Promise<void> {
-        try {
-            // 이전 경로와 관련된 모든 캐시 항목들을 새 경로로 업데이트하거나 정리
-            const keysToRemove: string[] = [];
-            const itemsToUpdate: Array<{newKey: string, state: FileState}> = [];
-            
-            for (const [cachedPath, cachedState] of Object.entries(this.settings.fileStateCache)) {
-                if (cachedPath === oldPath || cachedPath.startsWith(oldPath + '/')) {
-                    keysToRemove.push(cachedPath);
-                    
-                    // 새 경로로 업데이트할 항목들은 따로 저장
-                    if (cachedPath.startsWith(oldPath + '/')) {
-                        const relativePath = cachedPath.substring(oldPath.length + 1);
-                        const newCachedPath = `${newPath}/${relativePath}`;
-                        itemsToUpdate.push({ newKey: newCachedPath, state: cachedState });
-                    } else if (cachedPath === oldPath) {
-                        itemsToUpdate.push({ newKey: newPath, state: cachedState });
-                    }
-                }
-            }
-            
-            // 이전 경로들 제거
-            for (const key of keysToRemove) {
-                delete this.settings.fileStateCache[key];
-            }
-            
-            // 새 경로들 추가
-            for (const item of itemsToUpdate) {
-                this.settings.fileStateCache[item.newKey] = item.state;
-            }
-            
-            await this.saveSettings();
-            
-            console.log(`💾 Cache updated after folder move: ${oldPath} → ${newPath} (${keysToRemove.length} items processed)`);
-            
-        } catch (error) {
-            console.error(`❌ Error updating cache after folder move:`, error);
-        }
-    }
-    private async calculateDriveFilePath(
-        driveFileInfo: any,
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<string | null> {
-        try {
-            if (!driveFileInfo.parents || driveFileInfo.parents.length === 0) {
-                return null;
-            }
-            
-            const parentId = driveFileInfo.parents[0];
-            
-            // 상위 폴더 경로를 재귀적으로 구성
-            const parentPath = await this.buildPathFromDriveParent(parentId, parentSyncFolder);
-            
-            if (parentPath === null) {
-                return null;
-            }
-            
-            return parentPath ? `${parentPath}/${driveFileInfo.name}` : driveFileInfo.name;
-            
-        } catch (error) {
-            console.error(`❌ Error calculating drive file path:`, error);
-            return null;
-        }
-    }
-    private async buildPathFromDriveParent(
-        parentId: string,
-        baseSyncFolder: { id: string, name: string, path: string }
-    ): Promise<string | null> {
-        try {
-            // 베이스 폴더에 도달한 경우
-            if (parentId === baseSyncFolder.id) {
-                return baseSyncFolder.path;
-            }
-            
-            // 상위 폴더 정보 가져오기
-            const parentInfo = await this.getDriveFileInfo(parentId);
-            if (!parentInfo || parentInfo.trashed) {
-                return null;
-            }
-            
-            // 더 상위 폴더가 있는 경우 재귀적으로 경로 구성
-            if (parentInfo.parents && parentInfo.parents.length > 0) {
-                const grandParentPath = await this.buildPathFromDriveParent(parentInfo.parents[0], baseSyncFolder);
-                if (grandParentPath === null) {
-                    return null;
-                }
-                return grandParentPath ? `${grandParentPath}/${parentInfo.name}` : parentInfo.name;
-            }
-            
-            return null;
-            
-        } catch (error) {
-            console.error(`❌ Error building path from drive parent:`, error);
-            return null;
-        }
-    }
-    private async collectAllLocalFolderPaths(rootFolder: TFolder): Promise<string[]> {
-        const folderPaths: string[] = [];
-        
-        const collectRecursively = (folder: TFolder) => {
-            folderPaths.push(folder.path);
-            
-            for (const child of folder.children) {
-                if (child instanceof TFolder) {
-                    collectRecursively(child);
-                }
-            }
-        };
-        
-        collectRecursively(rootFolder);
-        return folderPaths;
-    }
-    
-   
-    private async checkSubfoldersRecursively(
-        currentFolder: TFolder,
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            for (const child of currentFolder.children) {
-                if (child instanceof TFolder) {
-                    console.log(`🔍 Checking subfolder: ${child.path}`);
-                    
-                    // 하위 폴더의 rename 체크
-                    await this.checkAndSyncFolderRename(child, parentSyncFolder);
-                    
-                    // 더 깊은 하위 폴더들도 재귀적으로 체크
-                    await this.checkSubfoldersRecursively(child, parentSyncFolder);
-                }
-            }
-        } catch (error) {
-            console.error(`❌ Error checking subfolders in ${currentFolder.path}:`, error);
-        }
-    }
-    private async checkAndSyncFolderRename(
-        localFolder: TFolder, 
-        parentSyncFolder: { id: string, name: string, path: string }
-    ): Promise<void> {
-        try {
-            console.log(`🔍 Checking for folder rename: ${localFolder.name} at ${localFolder.path}`);
-            
-            // 로컬 폴더의 상대 경로 계산
-            const relativePath = this.getRelativePath(localFolder.path, parentSyncFolder.path);
-            
-            // 🔥 수정: Google Drive에서 현재 실제 폴더명 확인
-            const currentDriveFolderName = await this.getCurrentDriveFolderName(localFolder, parentSyncFolder, relativePath);
-            
-            if (currentDriveFolderName && currentDriveFolderName !== localFolder.name) {
-                console.log(`📝 Folder rename detected: Local="${localFolder.name}" vs Drive="${currentDriveFolderName}" at ${localFolder.path}`);
-                
-                // 충돌 해결 전략에 따라 처리
-                await this.resolveFolderNameConflict(localFolder, currentDriveFolderName, parentSyncFolder, relativePath);
-            } else if (currentDriveFolderName) {
-                console.log(`✅ Folder names match: "${localFolder.name}" at ${localFolder.path}`);
-            } else {
-                console.log(`⚠️ Could not find corresponding Drive folder for: ${localFolder.path}`);
-            }
-            
-            // 현재 폴더명을 캐시에 저장 (동기화 완료 후)
-            this.setFileState(localFolder.path, {
-                originalName: localFolder.name,
-                lastSyncTime: Date.now()
-            });
-            
-        } catch (error) {
-            console.error(`❌ Error checking folder rename for ${localFolder.name} at ${localFolder.path}:`, error);
-            // 에러가 발생해도 동기화는 계속 진행
-        }
-    }
-    private async resolveFolderNameConflict(
-        localFolder: TFolder,
-        driveFolderName: string,
-        parentSyncFolder: { id: string, name: string, path: string },
-        relativePath: string
-    ): Promise<void> {
-        try {
-            const strategy = "remote" //this.settings.conflictResolution;
-            console.log(`⚡ Resolving folder name conflict with strategy: ${strategy}`);
-            console.log(`   Local: "${localFolder.name}" vs Drive: "${driveFolderName}"`);
-            
-            switch (strategy) {
-                // case 'local':
-                //     // 로컬 우선: Drive 폴더명을 로컬에 맞춰 변경
-                //     console.log(`📤 Renaming Drive folder: "${driveFolderName}" → "${localFolder.name}"`);
-                //     await this.renameDriveFolderToLocal(localFolder, driveFolderName, parentSyncFolder, relativePath);
-                //     new Notice(`✅ Drive folder renamed: "${driveFolderName}" → "${localFolder.name}"`);
-                //     break;
-                    
-                case 'remote':
-                    // 원격 우선: 로컬 폴더명을 Drive에 맞춰 변경
-                    console.log(`📥 Renaming local folder: "${localFolder.name}" → "${driveFolderName}"`);
-                    await this.renameLocalFolderToDrive(localFolder, driveFolderName);
-                    new Notice(`✅ Local folder renamed: "${localFolder.name}" → "${driveFolderName}"`);
-                    break;
-                    
-                default:
-                    // 기본값: 원격 우선
-                    console.log(`📥 Default: Renaming local folder: "${localFolder.name}" → "${driveFolderName}"`);
-                    await this.renameLocalFolderToDrive(localFolder, driveFolderName);
-                    new Notice(`✅ Local folder renamed: "${localFolder.name}" → "${driveFolderName}"`);
-                    break;
-            }
-            
-        } catch (error) {
-            console.error(`❌ Error resolving folder name conflict:`, error);
-            throw error;
-        }
-    }
-    
-    private async renameLocalFolderToDrive(
-        localFolder: TFolder,
-        driveFolderName: string
-    ): Promise<void> {
-        try {
-            const parentPath = localFolder.parent?.path || '';
-            const newPath = parentPath ? `${parentPath}/${driveFolderName}` : driveFolderName;
-            
-            // 로컬 폴더 이름 변경
-            await this.app.vault.rename(localFolder, newPath);
-            
-            // 캐시 업데이트
-            await this.updateFolderStateAfterRename(localFolder.path, newPath);
-            this.fileIdMapper.updatePathMapping(localFolder.path, newPath);
-            this.updateFolderCacheAfterRename(localFolder.path, newPath);
-            
-            console.log(`✅ Local folder renamed: ${localFolder.path} → ${newPath}`);
-            
-        } catch (error) {
-            console.error(`❌ Error renaming local folder:`, error);
-            throw error;
-        }
-    }
-    private async getCurrentDriveFolderName(
-        localFolder: TFolder,
-        parentSyncFolder: { id: string, name: string, path: string },
-        relativePath: string
-    ): Promise<string | null> {
-        try {
-            // 🔥 중요: 하위 폴더인 경우 정확한 상위 폴더 ID 계산
-            let searchParentId = parentSyncFolder.id;
-            
-            if (relativePath.includes('/')) {
-                const pathParts = relativePath.split('/');
-                pathParts.pop(); // 현재 폴더명 제거
-                const parentPath = pathParts.join('/');
-                
-                if (parentPath) {
-                    console.log(`🔍 Finding parent folder ID for path: ${parentPath} in base: ${parentSyncFolder.path}`);
-                    searchParentId = await this.getCachedFolderId(parentPath, parentSyncFolder.id);
-                    console.log(`✅ Found parent folder ID: ${searchParentId} for path: ${parentPath}`);
-                }
-            }
-            
-            // 1. 먼저 캐시된 fileId가 있으면 직접 조회
-            const cachedState = this.getFileState(localFolder.path);
-            if (cachedState.fileId) {
-                console.log(`🔍 Using cached fileId: ${cachedState.fileId} for ${localFolder.path}`);
-                const folderInfo = await this.getDriveFileInfo(cachedState.fileId);
-                if (folderInfo && !folderInfo.trashed) {
-                    console.log(`✅ Found folder by cached ID: "${folderInfo.name}" for ${localFolder.path}`);
-                    return folderInfo.name;
-                }
-            }
-            
-            // 2. 캐시된 ID가 없거나 유효하지 않으면 이름으로 검색
-            console.log(`🔍 Searching by name in parent: ${searchParentId} for local folder: ${localFolder.name}`);
-            const folderByName = await this.findFolderInDrive(localFolder.name, searchParentId);
-            if (folderByName) {
-                console.log(`✅ Found folder by name: "${folderByName.name}" for ${localFolder.path}`);
-                // 찾은 경우 캐시 업데이트
-                this.setFileState(localFolder.path, {
-                    fileId: folderByName.id,
-                    originalName: folderByName.name
-                });
-                return folderByName.name;
-            }
-            
-            // 3. 이름으로도 못 찾으면 해당 위치의 모든 폴더 조회해서 추론
-            console.log(`🔍 Searching all folders in parent: ${searchParentId} to find potential match`);
-            const allFolders = await this.listFoldersInDriveParent(searchParentId);
-            console.log(`📋 Found ${allFolders.length} folders in Drive parent:`, allFolders.map(f => f.name));
-            
-            // 현재 위치에 폴더가 하나만 있다면 그것이 대상일 가능성이 높음
-            if (allFolders.length === 1) {
-                const potentialFolder = allFolders[0];
-                console.log(`🎯 Only one folder found, assuming it's the renamed version: "${potentialFolder.name}" for ${localFolder.path}`);
-                
-                // 캐시 업데이트
-                this.setFileState(localFolder.path, {
-                    fileId: potentialFolder.id,
-                    originalName: potentialFolder.name
-                });
-                
-                return potentialFolder.name;
-            }
-            
-            console.log(`❌ Could not determine Drive folder name for: ${localFolder.path}`);
-            return null;
-            
-        } catch (error) {
-            console.error(`❌ Error getting current Drive folder name for ${localFolder.path}:`, error);
-            return null;
-        }
-    }
-    private async listFoldersInDriveParent(parentFolderId: string): Promise<any[]> {
-        try {
-            const params = new URLSearchParams({
-                q: `'${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-                fields: 'files(id,name)',
-                supportsAllDrives: 'true',
-                includeItemsFromAllDrives: 'true'
-            });
-            
-            const response = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files?${params.toString()}`,
-                { method: 'GET' }
-            );
-            
-            if (response.status === 200) {
-                return response.json.files || [];
-            }
-            
-            return [];
-        } catch (error) {
-            console.error(`❌ Error listing folders in parent ${parentFolderId}:`, error);
-            return [];
-        }
-    }
-    
-    private async bidirectionalSyncForFolder(
-        folder: TFolder,
-        parentSyncFolder: { id: string, name: string, path: string },
-        showProgress: boolean // 💡 ADD THIS PARAMETER
-    ): Promise<SyncResult> {
-        console.log(`🔄 Starting bidirectional sync for folder: ${folder.name}`);
-        const result = this.createEmptyResult();
-        let progressModal = showProgress ? new SyncProgressModal(this.app) : undefined;
-        if (progressModal) progressModal.open();
-    
-        try {
-            const parentSyncFolder = this.settings.syncWholeVault ? { id: (await this.getOrCreateDriveFolder())?.id, path: '' } : this.findParentSyncFolder(folder.path);
-    
-            if (!parentSyncFolder?.id) {
-                throw new Error("Could not find a valid parent sync folder in Drive.");
-            }
-    
-            // Step 1: Get ALL local and remote files for the target folder.
-            progressModal?.addLog('🔍 Analyzing local and remote file states...');
-            const localFiles = await this.getLocalFilesForTargetFolder(folder.path);
-            const driveFiles = await this.getDriveFilesForTargetFolder(folder.path, parentSyncFolder.id, parentSyncFolder.path);
-    
-            // Step 2: Run the core bidirectional logic with these files.
-            const syncResult = await this.performBidirectionalSyncWithGlobalProgress(
-                localFiles,
-                driveFiles,
-                parentSyncFolder.id,
-                parentSyncFolder.path,
-                progressModal,
-                0,
-                localFiles.length + driveFiles.length
-            );
-    
-            Object.assign(result, syncResult);
-    
-            this.settings.lastSyncTime = Date.now();
-            await this.saveSettings();
-    
-            if (showProgress) {
-                progressModal?.markCompleted(result);
-            } else {
-                this.reportSyncResult(result);
-            }
-    
-        } catch (error) {
-            console.error('Bidirectional sync failed:', error);
-            if (progressModal) {
-                progressModal.addLog(`❌ Sync failed: ${error.message}`);
-                progressModal.markCompleted({ ...result, errors: 1 });
-            } else {
-                new Notice(`❌ Sync failed for ${folder.name}: ${error.message}`);
-            }
-        }
-    
-        return result;
-    }
-    public async updateFolderCacheAfterRename(folderPath: string, newName: string): Promise<void> {
-        try {
-            // 현재 폴더의 캐시 정보 업데이트
-            const currentState = this.getFileState(folderPath);
-            this.setFileState(folderPath, {
-                ...currentState,
-                originalName: newName,
-                lastSyncTime: Date.now()
-            });
-            
-            // 하위 폴더들의 캐시 정보도 업데이트
-            const folderBasePath = folderPath + '/';
-            for (const [cachedPath, cachedState] of Object.entries(this.settings.fileStateCache)) {
-                if (cachedPath.startsWith(folderBasePath)) {
-                    // 하위 파일/폴더들의 lastSyncTime 업데이트
-                    this.setFileState(cachedPath, {
-                        ...cachedState,
-                        lastSyncTime: Date.now()
-                    });
-                }
-            }
-            
-            // 폴더 캐시에서 이전 경로 정보 정리
-            this.cleanupFolderCacheForRename(folderPath);
-            
-            await this.saveSettings();
-            console.log(`💾 Updated cache after folder rename: ${folderPath} → ${newName}`);
-            
-        } catch (error) {
-            console.error(`❌ Error updating cache after folder rename:`, error);
-        }
-    }
-    private cleanupFolderCacheForRename(folderPath: string): void {
-        // 해당 폴더 경로와 관련된 캐시 항목들을 정리
-        // 이미 존재하는 this.folderCache는 경로 기반이므로 자동으로 정리됨
-        // 추가 정리가 필요한 경우 여기에 로직 추가
-        console.log(`🧹 Cleaned up folder cache for: ${folderPath}`);
-    }
     // 🔥 NEW: Find parent sync folder that contains the given folder path
     private findParentSyncFolder(folderPath: string): {id: string, name: string, path: string} | null {
         for (const selectedFolder of this.settings.selectedDriveFolders) {
@@ -5682,17 +4112,12 @@ export default class GDriveSyncPlugin extends Plugin {
         console.log('Unloading plugin...');
         this.stopAutoSync();
         
-        // 자동 동기화 타이머 정리
+        // 🔥 NEW: 자동 동기화 타이머 정리
         if (this.autoSyncTimeout) {
             clearTimeout(this.autoSyncTimeout);
             this.autoSyncTimeout = null;
         }
         
-        // Stop change detection
-        if (this.changeDetectionService) {
-            this.changeDetectionService.stopPolling();
-        }
-
         console.log('Plugin unloaded');
     }   
 
@@ -5713,15 +4138,8 @@ export default class GDriveSyncPlugin extends Plugin {
 
     async saveSettings() {
         console.log(`Saving settings... Auto sync: ${this.settings.autoSync}`);
-
-        // Save change token to settings
-        if (this.changeDetectionService) {
-            const status = this.changeDetectionService.getStatus();
-            this.settings.lastChangeToken = status.lastChangeToken;
-        }
         await this.saveData(this.settings);
-
-
+        
         // 설정 변경 후 Auto Sync 상태 재동기화
         if (this.settings.autoSync && !this.isAutoSyncActive()) {
             console.log('Auto sync enabled but not active - setting up...');
@@ -5729,15 +4147,6 @@ export default class GDriveSyncPlugin extends Plugin {
         } else if (!this.settings.autoSync && this.isAutoSyncActive()) {
             console.log('Auto sync disabled but still active - stopping...');
             this.stopAutoSync();
-        }
-
-        // Phase 2: Handle change detection state
-        if (this.settings.changeDetectionEnabled && !this.changeDetectionService?.isActive()) {
-            console.log('Change detection enabled but not active - starting...');
-            this.startChangeDetection();
-        } else if (!this.settings.changeDetectionEnabled && this.changeDetectionService?.isActive()) {
-            console.log('Change detection disabled but still active - stopping...');
-            this.stopChangeDetection();
         }
     }
 
@@ -5938,69 +4347,50 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // API 호출 전에 토큰 검증을 추가하는 헬퍼 메서드
-    async makeAuthenticatedRequest(url: string, options: any = {}): Promise<any> {
-        let retryCount = 0;
-        const maxRetries = 2;
+    async makeAuthenticatedRequest(url: string, options: any): Promise<any> {
+        if (!await this.ensureValidToken()) {
+            throw new Error('Authentication failed');
+        }
     
-        while (retryCount <= maxRetries) {
+        const response = await requestUrl({
+            url,
+            method: options.method || 'GET',
+            headers: {
+                'Authorization': `Bearer ${this.settings.accessToken}`,
+                ...options.headers
+            },
+            body: options.body,
+            throw: false
+        });
+    
+        if (url.includes('alt=media')) {
+            return {
+                status: response.status,
+                json: null, // JSON 파싱 시도하지 않음
+                arrayBuffer: response.arrayBuffer,
+                text: response.text
+            };
+        }
+
+        let jsonData = null;
+        if (response.text) {
             try {
-                // 토큰 유효성 확인 및 자동 갱신
-                const tokenValid = await this.ensureValidToken();
-                if (!tokenValid) {
-                    throw new Error('Authentication failed. Please sign in again.');
-                }
-    
-                // 기본 헤더에 Authorization 추가
-                const headers = {
-                    'Authorization': `Bearer ${this.settings.accessToken}`,
-                    ...options.headers
-                };
-    
-                const response = await requestUrl({
-                    ...options,
-                    url,
-                    headers,
-                    throw: false
-                });
-    
-                // 401 에러인 경우 토큰 갱신 후 재시도
-                if (response.status === 401 && retryCount < maxRetries) {
-                    console.log(`🔄 Token expired during request, attempting refresh (retry ${retryCount + 1}/${maxRetries})`);
-                    
-                    const refreshed = await this.refreshAccessToken();
-                    if (!refreshed) {
-                        throw new Error('Failed to refresh access token. Please sign in again.');
-                    }
-                    
-                    retryCount++;
-                    continue; // 재시도
-                }
-    
-                // 403 에러인 경우 (API 할당량 초과 등)
-                if (response.status === 403) {
-                    const errorData = response.json || {};
-                    if (errorData.error?.message?.includes('quota')) {
-                        throw new Error('Google Drive API quota exceeded. Please try again later.');
-                    }
-                }
-    
-                return response;
-    
+                jsonData = JSON.parse(response.text);
             } catch (error) {
-                if (retryCount >= maxRetries) {
-                    console.error(`❌ Request failed after ${maxRetries} retries:`, error);
-                    throw error;
+                console.warn(`JSON parsing failed for URL: ${url}`, error);
+                // Media content이거나 텍스트 파일인 경우 JSON 파싱 실패는 정상
+                if (!url.includes('alt=media')) {
+                    console.error('Unexpected JSON parsing failure:', response.text.substring(0, 100));
                 }
-                
-                retryCount++;
-                console.log(`⚠️ Request failed, retrying (${retryCount}/${maxRetries}):`, error.message);
-                
-                // 재시도 전 잠시 대기
-                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
             }
         }
     
-        throw new Error('Request failed after all retries');
+        return {
+            status: response.status,
+            json: jsonData,
+            arrayBuffer: response.arrayBuffer,
+            text: response.text
+        };
     }
 
     private getRelativePath(filePath: string, baseFolder: string): string {
@@ -6015,7 +4405,6 @@ export default class GDriveSyncPlugin extends Plugin {
         return filePath;
     }
 
-    
     // Enhanced bidirectional sync with intelligent decision making
     private async performBidirectionalSyncWithGlobalProgress(
         localFiles: TFile[], 
@@ -6028,54 +4417,30 @@ export default class GDriveSyncPlugin extends Plugin {
     ): Promise<SyncResult> {
         const result = this.createEmptyResult();
         
-        // 🔥 Track processed deletions to avoid duplicate processing
-        const processedDeletions = new Set<string>();
-
-        // Detect remote deletions before processing
-        await this.detectAndProcessRemoteDeletions(
-            localFiles,  
-            driveFiles,  
-            baseFolder,  
-            result,  
-            progressModal,
-            processedDeletions 
-        );
-
-        // Create file mappings (exclude already deleted files)
+        // Create file mappings
         const localFileMap = new Map<string, TFile>();
         localFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
-            const normalizedPath = this.normalizePath(relativePath);
-            
-            // 🔥 Skip files that were already deleted
-            if (!processedDeletions.has(normalizedPath)) {
-                localFileMap.set(normalizedPath, file);
-            }
+            const normalizedPath = this.normalizePath(relativePath); // 추가
+            localFileMap.set(normalizedPath, file);
         });
 
         const driveFileMap = new Map<string, any>();
         driveFiles.forEach(file => {
             const relativePath = this.getRelativePath(file.path, baseFolder);
-            const normalizedPath = this.normalizePath(relativePath);
+            const normalizedPath = this.normalizePath(relativePath); // 추가
             driveFileMap.set(normalizedPath, file);
         });
 
         const allPaths = new Set([...localFileMap.keys(), ...driveFileMap.keys()]);
         let processedInThisFolder = 0;
 
-        console.log(`🔄 Processing ${allPaths.size} unique file paths in folder: ${baseFolder || 'root'} (${processedDeletions.size} deletions already processed)`);
+        console.log(`🔄 Processing ${allPaths.size} unique file paths in folder: ${baseFolder || 'root'}`);
 
         for (const filePath of allPaths) {
             if (progressModal?.shouldCancel()) {
                 console.log('🛑 Sync cancelled by user');
                 return result;
-            }
-
-            // 🔥 Skip files that were already processed as deletions
-            if (processedDeletions.has(filePath)) {
-                console.log(`⏭️ Skipping already processed deletion: ${filePath}`);
-                processedInThisFolder++;
-                continue;
             }
 
             const localFile = localFileMap.get(filePath);
@@ -6096,7 +4461,6 @@ export default class GDriveSyncPlugin extends Plugin {
                         progressModal?.addLog(`⏭️ Skip: ${filePath} (${decision.reason})`);
                     } else {
                         const syncResult = await this.executeSyncDecision(decision, localFile, driveFile, rootFolderId, baseFolder);
-                        console.log(`🔍 DEBUG: File ${filePath}, decision: ${decision.action}, syncResult: ${syncResult.action}`);
                         this.updateResultFromSyncExecution(result, syncResult, progressModal, filePath);
                     }
 
@@ -6135,166 +4499,17 @@ export default class GDriveSyncPlugin extends Plugin {
             
             // Progress report every 10 files
             if (processedInThisFolder % 10 === 0) {
-                progressModal?.addLog(`📊 Progress: ${result.uploaded}↑ ${result.downloaded}↓ ${result.deleted}🗑️ ${result.skipped}⏭️ ${result.errors}❌`);
+                progressModal?.addLog(`📊 Progress: ${result.uploaded}↑ ${result.downloaded}↓ ${result.skipped}⏭️ ${result.errors}❌`);
             }
             
             // Small delay to prevent UI blocking
             await new Promise(resolve => setTimeout(resolve, 10));
         }
 
-        console.log(`✅ Folder sync completed: ${baseFolder || 'root'} - ${processedInThisFolder} files processed, ${processedDeletions.size} deletions handled`);
+        console.log(`✅ Folder sync completed: ${baseFolder || 'root'} - ${processedInThisFolder} files processed`);
         return result;
     }
-
     
-    // Remote deletion detection and processing
-    private async detectAndProcessRemoteDeletions(
-        localFiles: TFile[], 
-        driveFiles: any[], 
-        baseFolder: string,
-        result: SyncResult,
-        progressModal?: SyncProgressModal,
-        processedDeletions?: Set<string> 
-    ): Promise<void> {
-        try {
-            console.log(`🔍 [DELETION_DETECT] Checking for remote deletions in folder: ${baseFolder || 'root'}`);
-            
-            // Create sets for comparison
-            const localFilePaths = new Set(
-                localFiles.map(file => this.normalizePath(this.getRelativePath(file.path, baseFolder)))
-            );
-            
-            const remoteFilePaths = new Set(
-                driveFiles.map(file => this.normalizePath(this.getRelativePath(file.path, baseFolder)))
-            );
-            
-            // Find files that exist in cache but not in remote (potential deletions)
-            const cachedFilePaths = this.getCachedFilePathsForFolder(baseFolder);
-            const potentialDeletions: string[] = [];
-            
-            for (const cachedPath of cachedFilePaths) {
-                const normalizedCachedPath = this.normalizePath(cachedPath);
-                
-                // File exists in cache and locally, but not in remote = remote deletion
-                if (localFilePaths.has(normalizedCachedPath) && !remoteFilePaths.has(normalizedCachedPath)) {
-                    potentialDeletions.push(cachedPath);
-                }
-            }
-            
-            console.log(`🔍 [DELETION_DETECT] Found ${potentialDeletions.length} potential remote deletions`);
-            
-            if (potentialDeletions.length === 0) {
-                return;
-            }
-            
-            progressModal?.addLog(`🗑️ Processing ${potentialDeletions.length} remote deletions...`);
-            
-            // Process each potential deletion
-            for (const deletedFilePath of potentialDeletions) {
-                try {
-                    const deletionResult = await this.processRemoteDeletion(deletedFilePath, baseFolder, result, progressModal);
-                    
-                    if (deletionResult.success) {
-                        result.deleted++;
-                        progressModal?.addLog(`🗑️ Processed deletion: ${deletedFilePath}`);
-                    } else if (deletionResult.skipped) {
-                        result.skipped++;
-                        progressModal?.addLog(`⏭️ Skipped deletion: ${deletedFilePath}`);
-                    }
-
-                    if (deletionResult.success || deletionResult.skipped) {
-                        if (processedDeletions) {
-                            const relativePath = this.getRelativePath(deletedFilePath, baseFolder);
-                            const normalizedPath = this.normalizePath(relativePath);
-                            processedDeletions.add(normalizedPath);
-                            console.log(`📋 [DELETION_TRACK] Marked as processed: ${normalizedPath}`);
-                        }
-                    }
-                } catch (error) {
-                    console.error(`❌ [DELETION_DETECT] Error processing deletion for ${deletedFilePath}:`, error);
-                    result.errors++;
-                    progressModal?.addLog(`❌ Failed to process deletion: ${deletedFilePath}`);
-                }
-            }
-            
-        } catch (error) {
-            console.error(`❌ [DELETION_DETECT] Error in deletion detection:`, error);
-            progressModal?.addLog(`⚠️ Remote deletion detection failed: ${error.message}`);
-        }
-    }
-
-    // Get cached file paths for a specific folder
-    private getCachedFilePathsForFolder(baseFolder: string): string[] {
-        const cachedPaths: string[] = [];
-        
-        for (const filePath of Object.keys(this.settings.fileStateCache)) {
-            if (!baseFolder) {
-                // Root folder - include all paths
-                cachedPaths.push(filePath);
-            } else {
-                // Specific folder - include only matching paths
-                if (filePath === baseFolder || filePath.startsWith(baseFolder + '/')) {
-                    cachedPaths.push(filePath);
-                }
-            }
-        }
-        
-        console.log(`📋 [CACHE] Found ${cachedPaths.length} cached file paths for folder: ${baseFolder || 'root'}`);
-        return cachedPaths;
-    }
-
-    // Process individual remote deletion
-    private async processRemoteDeletion(
-        deletedFilePath: string,
-        baseFolder: string,
-        result: SyncResult,
-        progressModal?: SyncProgressModal
-    ): Promise<{ success: boolean; skipped: boolean; error?: string }> {
-        console.log(`🗑️ [REMOTE_DELETE] Processing: ${deletedFilePath}`);
-        
-        // Get the local file
-        const localFile = this.app.vault.getAbstractFileByPath(deletedFilePath);
-        
-        if (!(localFile instanceof TFile)) {
-            console.log(`⚠️ [REMOTE_DELETE] Local file not found: ${deletedFilePath} - cleaning cache only`);
-            await this.removeFileStateAfterRemoteDeletion(deletedFilePath);
-            return { success: true, skipped: false };
-        }
-        
-        // Check conflict resolution strategy
-        if (this.settings.conflictResolution === 'local') {
-            console.log(`⏭️ [REMOTE_DELETE] Skipping deletion (local preference): ${deletedFilePath}`);
-            progressModal?.addLog(`⏭️ Keeping local file (policy): ${localFile.name}`);
-            return { success: false, skipped: true };
-        }
-        
-        // For 'remote', 'newer', or 'ask' - respect remote deletion
-        try {
-            console.log(`🗑️ [REMOTE_DELETE] Deleting local file: ${deletedFilePath}`);
-            
-            await this.app.vault.delete(localFile);
-            await this.removeFileStateAfterRemoteDeletion(deletedFilePath);
- 
-            console.log(`✅ [REMOTE_DELETE] Successfully deleted: ${deletedFilePath}`);
-            return { success: true, skipped: false };
-            
-        } catch (error) {
-            console.error(`❌ [REMOTE_DELETE] Failed to delete ${deletedFilePath}:`, error);
-            return { success: false, skipped: false, error: error.message };
-        }
-    }    
-
-    // Remove file state after remote deletion
-    private async removeFileStateAfterRemoteDeletion(filePath: string): Promise<void> {
-        const normalizedPath = this.normalizeFullPath(filePath);
-        
-        if (this.settings.fileStateCache[normalizedPath]) {
-            delete this.settings.fileStateCache[normalizedPath];
-            await this.saveSettings();
-            console.log(`💾 [CACHE] Removed state for remotely deleted file: ${filePath}`);
-        }
-    }
-
     //Execute sync decision with proper error handling
     private async executeSyncDecision(
         decision: SyncDecision,
@@ -6302,14 +4517,8 @@ export default class GDriveSyncPlugin extends Plugin {
         driveFile: any,
         rootFolderId: string,
         baseFolder: string
-    ): Promise<{action: 'uploaded' | 'downloaded' | 'deleted' |'skipped' | 'error', error?: string, isConflictResolution?: boolean}> {
+    ): Promise<{action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string, isConflictResolution?: boolean}> {
         try {
-            const currentFile = this.app.vault.getAbstractFileByPath(localFile.path);
-            if (!(currentFile instanceof TFile)) {
-                console.log(`⚠️ File no longer exists during sync decision execution: ${localFile.path}`);
-                return {action: 'skipped'};
-            }
-            
             switch (decision.action) {
                 case 'upload':
                     const uploadResult = await this.uploadSingleFileSafe(localFile, rootFolderId, baseFolder);
@@ -6318,10 +4527,6 @@ export default class GDriveSyncPlugin extends Plugin {
                 case 'download':
                     const downloadResult = await this.downloadFileFromDriveSafe(driveFile, baseFolder);
                     return downloadResult.success ? {action: 'downloaded'} : {action: 'error', error: downloadResult.error};
-
-                case 'deleted':
-                    console.log(`✅ Remote deletion already processed for: ${localFile.name}`);
-                    return {action: 'deleted'};
 
                 case 'conflict':
                     const conflictResult = await this.resolveConflictWithStrategy(decision, localFile, driveFile, rootFolderId, baseFolder);
@@ -6388,7 +4593,7 @@ export default class GDriveSyncPlugin extends Plugin {
     // Update result counters from sync execution
     private updateResultFromSyncExecution(
         result: SyncResult,
-        syncResult: {action: 'uploaded' | 'downloaded' | 'deleted' |'skipped' | 'error', error?: string, isConflictResolution?: boolean},
+        syncResult: {action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string, isConflictResolution?: boolean},
         progressModal?: SyncProgressModal,
         filePath?: string
     ): void {
@@ -6411,10 +4616,6 @@ export default class GDriveSyncPlugin extends Plugin {
                     progressModal?.addLog(`📥 Downloaded: ${filePath}`);
                 }
                 break;
-            case 'deleted': 
-                result.deleted++;
-                progressModal?.addLog(`🗑️ Deleted: ${filePath}`);
-                break;                
             case 'skipped':
                 result.skipped++;
                 progressModal?.addLog(`⏭️ Skipped: ${filePath}`);
@@ -6423,6 +4624,33 @@ export default class GDriveSyncPlugin extends Plugin {
                 result.errors++;
                 progressModal?.addLog(`❌ Error: ${filePath} - ${syncResult.error}`);
                 break;
+        }
+    }
+
+    // Enhanced conflict resolution with proper logic
+    private async resolveFileConflictSafe(
+        localFile: TFile, 
+        driveFile: any, 
+        rootFolderId: string, 
+        baseFolder: string
+    ): Promise<{action: 'uploaded' | 'downloaded' | 'skipped' | 'error', error?: string}> {
+        try {
+            const decision = await this.decideSyncAction(localFile, driveFile);
+            this.logSyncDecision(decision, localFile.name);
+    
+            if (!decision.shouldSync) {
+                return {action: 'skipped'};
+            }
+    
+            if (decision.action === 'conflict') {
+                return await this.resolveConflictWithStrategy(decision, localFile, driveFile, rootFolderId, baseFolder);
+            } else {
+                return await this.executeSyncDecision(decision, localFile, driveFile, rootFolderId, baseFolder);
+            }
+    
+        } catch (error) {
+            console.error(`❌ Error in conflict resolution for ${localFile.path}:`, error);
+            return {action: 'error', error: error.message || 'Unknown error'};
         }
     }
 
@@ -6540,54 +4768,6 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
 
-    // Better alternative: Simple Upload for large files
-    private async uploadLargeFileSimple(fileName: string, content: ArrayBuffer, folderId: string, metadata: any): Promise<any> {
-        try {
-            console.log(`Using simple upload for large file: ${fileName}`);
-            
-            // Step 1: Create file metadata only
-            const metadataResponse = await this.makeAuthenticatedRequest(
-                'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true',
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(metadata)
-                }
-            );
-
-            if (metadataResponse.status !== 200 && metadataResponse.status !== 201) {
-                throw new Error(`File creation failed: ${metadataResponse.status}`);
-            }
-
-            const fileId = metadataResponse.json.id;
-            console.log(`File metadata created: ${fileId}`);
-
-            // Step 2: Upload file content (without Base64 conversion)
-            const contentResponse = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,modifiedTime,md5Checksum,version,size&supportsAllDrives=true`,
-                {
-                    method: 'PATCH',
-                    headers: { 
-                        'Content-Type': 'application/octet-stream'
-                    },
-                    body: content // Direct ArrayBuffer transmission (no Base64 conversion needed)
-                }
-            );
-
-            if (contentResponse.status === 200 || contentResponse.status === 201) {
-                console.log(`File content uploaded successfully: ${fileName}`);
-                return contentResponse;
-            } else {
-                throw new Error(`Content upload failed: ${contentResponse.status}`);
-            }
-
-        } catch (error) {
-            console.error(`Simple upload failed for ${fileName}:`, error);
-            throw error;
-        }
-    }   
-
-
     private async uploadTextFileToDriveMultipart(
         fileName: string, 
         content: string, 
@@ -6677,29 +4857,29 @@ export default class GDriveSyncPlugin extends Plugin {
 
     private async resolveToActualFolderId(folderId: string): Promise<string> {
         try {
-            console.log(`🔗 [RESOLVE] Input folderId: ${folderId}`);
+            //console.log(`🔗 [RESOLVE] Input folderId: ${folderId}`);
             
             const response = await this.makeAuthenticatedRequest(
                 `https://www.googleapis.com/drive/v3/files/${folderId}?fields=id,name,mimeType,shortcutDetails,capabilities&supportsAllDrives=true`,
                 { method: 'GET' }
             );
             
-            console.log(`🔗 [RESOLVE] Response status: ${response.status}`);
+            //console.log(`🔗 [RESOLVE] Response status: ${response.status}`);
             
             if (response.status === 200) {
                 const folderInfo = response.json;
-                console.log(`🔗 [RESOLVE] Folder info:`, {
-                    id: folderInfo.id,
-                    name: folderInfo.name,
-                    mimeType: folderInfo.mimeType,
-                    isShortcut: folderInfo.mimeType === 'application/vnd.google-apps.shortcut',
-                    canAddChildren: folderInfo.capabilities?.canAddChildren
-                });
+                // console.log(`🔗 [RESOLVE] Folder info:`, {
+                //     id: folderInfo.id,
+                //     name: folderInfo.name,
+                //     mimeType: folderInfo.mimeType,
+                //     isShortcut: folderInfo.mimeType === 'application/vnd.google-apps.shortcut',
+                //     canAddChildren: folderInfo.capabilities?.canAddChildren
+                // });
                 
                 if (folderInfo.mimeType === 'application/vnd.google-apps.shortcut' && 
                     folderInfo.shortcutDetails?.targetId) {
                     const targetId = folderInfo.shortcutDetails.targetId;
-                    console.log(`🔗 [RESOLVE] Shortcut detected, resolving target: ${folderId} → ${targetId}`);
+                    //console.log(`🔗 [RESOLVE] Shortcut detected, resolving target: ${folderId} → ${targetId}`);
                     
                     // 🔥 NEW: Get target folder capabilities
                     const targetResponse = await this.makeAuthenticatedRequest(
@@ -6709,22 +4889,22 @@ export default class GDriveSyncPlugin extends Plugin {
                     
                     if (targetResponse.status === 200) {
                         const targetInfo = targetResponse.json;
-                        console.log(`🔗 [RESOLVE] Target info:`, {
-                            id: targetInfo.id,
-                            name: targetInfo.name,
-                            mimeType: targetInfo.mimeType,
-                            canAddChildren: targetInfo.capabilities?.canAddChildren
-                        });
+                        // console.log(`🔗 [RESOLVE] Target info:`, {
+                        //     id: targetInfo.id,
+                        //     name: targetInfo.name,
+                        //     mimeType: targetInfo.mimeType,
+                        //     canAddChildren: targetInfo.capabilities?.canAddChildren
+                        // });
                         
                         // 🔥 NEW: Verify target is a folder with proper permissions
                         if (targetInfo.mimeType !== 'application/vnd.google-apps.folder') {
-                            console.warn(`⚠️ [RESOLVE] Shortcut target is not a folder: ${targetInfo.mimeType}`);
+                            //console.warn(`⚠️ [RESOLVE] Shortcut target is not a folder: ${targetInfo.mimeType}`);
                             return folderId; // Fallback to original ID
                         }
                         
                         // 🔥 NEW: Check write permissions
                         if (targetInfo.capabilities?.canAddChildren === false) {
-                            console.warn(`⚠️ [RESOLVE] No permission to add children to target folder: ${targetInfo.name}`);
+                            //console.warn(`⚠️ [RESOLVE] No permission to add children to target folder: ${targetInfo.name}`);
                             // Don't throw error here, let createFolderInDrive handle it
                         }
                         
@@ -6741,7 +4921,7 @@ export default class GDriveSyncPlugin extends Plugin {
                     console.warn(`⚠️ [RESOLVE] No permission to add children to folder: ${folderInfo.name}`);
                 }
                 
-                console.log(`🔗 [RESOLVE] Using original folder ID: ${folderId}`);
+                //console.log(`🔗 [RESOLVE] Using original folder ID: ${folderId}`);
                 return folderId;
             } else {
                 console.error(`❌ [RESOLVE] Failed to get folder info: ${response.status}`);
@@ -6942,42 +5122,26 @@ export default class GDriveSyncPlugin extends Plugin {
     
                 const syncResult = await this.syncFileToGoogleDrive(file, rootFolderId, baseFolder);
                 
-                // 🔥 Enhanced result handling with proper logging
                 if (syncResult === 'skipped') {
                     result.skipped++;
-                    console.log(`📊 SKIP: ${file.name} - current totals: uploaded=${result.uploaded}, deleted=${result.deleted}, skipped=${result.skipped}, errors=${result.errors}`);
-                    progressModal?.addLog(`⏭️ ${file.name} (skipped)`);
-                } else if (syncResult === 'deleted') {
-                    result.deleted++;
-                    console.log(`📊 DELETE: ${file.name} - current totals: uploaded=${result.uploaded}, deleted=${result.deleted}, skipped=${result.skipped}, errors=${result.errors}`);
-                    progressModal?.addLog(`🗑️ ${file.name} (already deleted)`);
+                    // 간명한 로그: 개별 스킵 메시지는 콘솔에만, 진행 모달에는 요약만
                 } else if (syncResult === true) {
                     result.uploaded++;
-                    console.log(`📊 UPLOAD: ${file.name} - current totals: uploaded=${result.uploaded}, deleted=${result.deleted}, skipped=${result.skipped}, errors=${result.errors}`);
                     progressModal?.addLog(`✅ ${file.name}`);
                 } else {
                     result.errors++;
-                    console.log(`📊 ERROR: ${file.name} - syncResult was: ${syncResult} - current totals: uploaded=${result.uploaded}, deleted=${result.deleted}, skipped=${result.skipped}, errors=${result.errors}`);
-                    progressModal?.addLog(`❌ ${file.name} (sync failed)`);
+                    progressModal?.addLog(`❌ ${file.name}`);
                 }
             } catch (error) {
-                // 🔥 Catch-all error handling
-                if (error.code === 'ENOENT' || error.message?.includes('not found')) {
-                    result.deleted++;
-                    console.log(`📊 DELETE (catch): ${file.name} - file not found during processing`);
-                    progressModal?.addLog(`🗑️ ${file.name} (deleted during sync)`);
-                } else {
-                    result.errors++;
-                    console.log(`📊 ERROR (catch): ${file.name} - ${error.message}`);
-                    progressModal?.addLog(`❌ ${file.name}: ${error.message || 'Error'}`);
-                }
+                result.errors++;
+                progressModal?.addLog(`❌ ${file.name}: ${error.message || 'Error'}`);
             }
     
             processedFiles++;
             
             // 배치 상태 요약 로그 (매 10개 파일마다)
             if (processedFiles % 10 === 0) {
-                progressModal?.addLog(`📊 Progress: ${result.uploaded} uploaded, ${result.deleted} deleted, ${result.skipped} skipped, ${result.errors} errors`);
+                progressModal?.addLog(`📊 Progress: ${result.uploaded} uploaded, ${result.skipped} skipped, ${result.errors} errors`);
             }
             
             await new Promise(resolve => setTimeout(resolve, 10));
@@ -7162,8 +5326,6 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     
         try {
-            await this.performPreSyncChangeCheck(progressModal);
-
             // 🔥 모든 동기화 대상을 미리 수집하여 전체 진행률 계산
             const syncTargets: Array<{
                 localFiles: TFile[], 
@@ -7297,7 +5459,7 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // Smart download with early exit checks
-    public async downloadFileFromDrive(driveFile: any, result: SyncResult, baseFolder: string = ''): Promise<void> {
+    private async downloadFileFromDrive(driveFile: any, result: SyncResult, baseFolder: string = ''): Promise<void> {
         let filePath = driveFile.path;
         
         if (baseFolder && !filePath.startsWith(baseFolder + '/') && filePath !== baseFolder) {
@@ -7678,17 +5840,16 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // 동기화 결과 객체 생성
-    public createEmptyResult(): SyncResult {
+    private createEmptyResult(): SyncResult {
         return {
             uploaded: 0,
             downloaded: 0,
-            deleted: 0,
             skipped: 0,
             conflicts: 0,
             errors: 0,
             createdFolders: []
         };
-    }    
+    }
 
     // 동기화 결과 보고
     private reportSyncResult(result: SyncResult): void {
@@ -7696,20 +5857,16 @@ export default class GDriveSyncPlugin extends Plugin {
         
         if (result.uploaded > 0) messages.push(`${result.uploaded} uploaded`);
         if (result.downloaded > 0) messages.push(`${result.downloaded} downloaded`);
-        if (result.deleted > 0) messages.push(`${result.deleted} deleted`);
         if (result.skipped > 0) messages.push(`${result.skipped} skipped`);
         if (result.conflicts > 0) messages.push(`${result.conflicts} conflicts resolved`);
         if (result.createdFolders.length > 0) messages.push(`${result.createdFolders.length} folders created`);
         
         const summary = messages.length > 0 ? messages.join(', ') : 'No changes';
-        const successfulOperations = result.uploaded + result.downloaded + result.deleted + result.conflicts;
-
+        
         if (result.errors === 0) {
             new Notice(`✅ Sync completed: ${summary}`);
-        } else if (successfulOperations > 0) {
-            new Notice(`⚠️ Sync completed with ${result.errors} errors: ${summary}`);
         } else {
-            new Notice(`❌ Sync failed with ${result.errors} errors: ${summary}`);
+            new Notice(`⚠️ Sync completed with ${result.errors} errors: ${summary}`);
         }
 
         if (result.createdFolders.length > 0) {
@@ -7812,15 +5969,9 @@ export default class GDriveSyncPlugin extends Plugin {
     }
 
     // Modified syncFileToGoogleDrive with enhanced state tracking
-    private async syncFileToGoogleDrive(file: TFile, rootFolderId: string, baseFolder: string = ''): Promise<boolean | 'deleted' | 'skipped'> {
+    private async syncFileToGoogleDrive(file: TFile, rootFolderId: string, baseFolder: string = ''): Promise<boolean | 'skipped'> {
         try {
-            // 🔥 CRITICAL: Check if file still exists at the very beginning
-            const currentFile = this.app.vault.getAbstractFileByPath(file.path);
-            if (!(currentFile instanceof TFile)) {
-                console.log(`🗑️ File no longer exists (already deleted): ${file.path}`);
-                return 'deleted'; // Return 'deleted' instead of false
-            }
-            
+            // Entry log with essential sync information
             console.log(`🔄 Syncing: ${file.path}`);
             
             // ... existing folder structure handling code ...
@@ -7841,41 +5992,21 @@ export default class GDriveSyncPlugin extends Plugin {
             
             // Check existing file and make decision
             const existingFile = await this.findFileInDrive(fileName, targetFolderId);
-            const decision = await this.decideSyncAction(currentFile, existingFile); // Use currentFile
+            const decision = await this.decideSyncAction(file, existingFile);
     
             if (!decision.shouldSync) {
                 return 'skipped';
             }
     
-            if (decision.action === 'deleted') {
-                console.log(`🗑️ ${file.path}: File was deleted remotely and local deletion completed`);
-                return 'deleted';
-            }
-            
-            // 🔥 Double-check file existence before reading content
-            const fileForReading = this.app.vault.getAbstractFileByPath(file.path);
-            if (!(fileForReading instanceof TFile)) {
-                console.log(`🗑️ File deleted during sync process: ${file.path}`);
-                return 'deleted';
-            }
-            
             // File content reading
             let content: string | ArrayBuffer;
-            try {
-                if (this.isTextFile(file.name)) {
-                    content = await this.app.vault.read(fileForReading);
-                } else {
-                    content = await this.app.vault.readBinary(fileForReading);
-                }
-            } catch (readError) {
-                if (readError.code === 'ENOENT' || readError.message?.includes('not found')) {
-                    console.log(`🗑️ File was deleted while reading content: ${file.path}`);
-                    return 'deleted';
-                }
-                throw readError; // Re-throw other errors
+            if (this.isTextFile(file.name)) {
+                content = await this.app.vault.read(file);
+            } else {
+                content = await this.app.vault.readBinary(file);
             }
             
-            const localModTime = fileForReading.stat.mtime;
+            const localModTime = file.stat.mtime;
             let success = false;
             let remoteFileData: any = null;
     
@@ -7894,14 +6025,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
             // Update state cache
             if (success && remoteFileData) {
-                // 🔥 Final check before updating state
-                const finalFile = this.app.vault.getAbstractFileByPath(file.path);
-                if (finalFile instanceof TFile) {
-                    await this.updateFileStateAfterSync(file.path, finalFile, remoteFileData);
-                } else {
-                    console.log(`⚠️ File deleted after successful upload: ${file.path}`);
-                    return 'deleted';
-                }
+                await this.updateFileStateAfterSync(file.path, file, remoteFileData);
             }
     
             // Result log with action summary
@@ -7910,15 +6034,6 @@ export default class GDriveSyncPlugin extends Plugin {
             return success;
     
         } catch (error) {
-            // 🔥 Enhanced error handling for deletion scenarios
-            if (error.code === 'ENOENT' || 
-                error.message?.includes('not found') || 
-                error.message?.includes('does not exist') ||
-                error.message?.includes('ENOENT')) {
-                console.log(`🗑️ File was deleted during sync process: ${file.path}`);
-                return 'deleted';
-            }
-    
             console.error(`❌ Sync failed [${file.path}]:`, error.message || error);
             return false;
         }
@@ -7953,8 +6068,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 remoteHash: remoteHash,
                 remoteModTime: remoteModTime,
                 lastSyncTime: Date.now(),
-                version: remoteFileData.version,
-                parents: remoteFileData.parents
+                version: remoteFileData.version
             });
             
             await this.saveSettings();
@@ -8212,37 +6326,16 @@ export default class GDriveSyncPlugin extends Plugin {
     private normalizePath(path: string): string {
         return path.normalize('NFC');
     }
-
-    public async getDriveFileInfo(fileId: string): Promise<any | null> {
-        try {
-            const response = await this.makeAuthenticatedRequest(
-                `https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,mimeType,modifiedTime,size,parents,md5Checksum,version,shortcutDetails&supportsAllDrives=true`,
-                { method: 'GET' }
-            );
-
-            if (response.status === 200) {
-                return response.json;
-            } else {
-                console.error(`❌ Failed to get Drive file info: ${response.status}`, response.json);
-                return null;
-            }
-        } catch (error) {
-            console.error(`❌ Error getting Drive file info for ${fileId}:`, error);
-            return null;
-        }
+    
+    private normalizeFullPath(filePath: string): string {
+        return filePath.split('/').map(part => part.normalize('NFC')).join('/');
     }
+    
     private async findFileInDrive(fileName: string, folderId: string): Promise<any | null> {
         try {
             const actualFolderId = await this.resolveToActualFolderId(folderId);
             const normalizedFileName = this.normalizeFileName(fileName);
             
-            const fileState = this.getFileState(this.getRelativePath(fileName, folderId));
-            if (fileState.fileId) {
-                const fileById = await this.getDriveFileInfo(fileState.fileId);
-                if (fileById && fileById.name === normalizedFileName) {
-                    return fileById;
-                }
-            }
             console.log(`🔍 Searching: "${normalizedFileName}" in ${actualFolderId}`);
             
             const params = new URLSearchParams({
@@ -8379,116 +6472,89 @@ export default class GDriveSyncPlugin extends Plugin {
             console.log('❌ Auto sync is disabled - no interval set');
         }
         
-        // Phase 2: Also start change detection if enabled
-        if (this.settings.autoSync && this.isAuthenticated()) {
-            setTimeout(() => {
-                this.startChangeDetection();
-            }, 2000);
-        }
-
         console.log(`Final auto sync status: ${this.isAutoSyncActive()}`);
     }
 
-    async mainSync(showProgress: boolean = true): Promise<SyncResult> {
-        if (!this.settings.clientId || !this.settings.clientSecret || !this.settings.apiKey) {
-            new Notice('Please configure Google Drive API credentials in settings');
-            return this.createEmptyResult();
-        }
-    
-        if (!this.settings.syncWholeVault && this.settings.selectedDriveFolders.length === 0) {
-            new Notice('Please select Google Drive folders to sync or enable "Sync Whole Vault" in settings');
-            return this.createEmptyResult();
-        }
-    
-        // 진행 상황을 표시하지 않는 경우에만 간단한 알림
-        if (!showProgress) {
-            new Notice('Starting Google Drive sync...');
-        }
-    
-        // Phase 2: Update change detection snapshots after sync
-        if (this.changeDetectionService?.isActive()) {
-            try {
-                console.log('🔄 Updating change detection snapshots after sync...');
-                await this.updateChangeDetectionSnapshots();
-            } catch (error) {
-                console.error('❌ Failed to update snapshots after sync:', error);
-            }
-        }
-
+    async mainSync(showProgress: boolean = true): Promise<void> {
         try {
             if (!this.isAuthenticated()) {
-                const message = 'Please authenticate first using the Desktop App method.';
-                new Notice(`❌ ${message}`);
-                return this.createEmptyResult();
+                new Notice('❌ Please authenticate with Google Drive first');
+                return;
             }
-    
-            let result: SyncResult;
-    
-            // 설정된 sync direction에 따라 실행
-            if (this.settings.syncDirection === 'upload') {
-                result = await this.uploadToGoogleDrive(showProgress);
-            } else if (this.settings.syncDirection === 'download') {
-                result = await this.downloadFromGoogleDrive(showProgress);
-            } else {
-                result = await this.bidirectionalSync(showProgress);
-            }
-    
-            await this.backupSnapshotsToSettings();
 
-            return result;
+            let progressModal: SyncProgressModal | undefined;
+            if (showProgress) {
+                progressModal = new SyncProgressModal(this.app);
+                progressModal.open();
+            }
+
+            // Enhanced sync with remote change detection
+            if (this.settings.syncWholeVault) {
+                console.log('📁 Whole vault sync mode - using enhanced sync');
+                const vaultFolder = this.app.vault.getRoot();
+                const result = await this.syncFolderWithRemotePriority(vaultFolder);
+                
+                if (progressModal) {
+                    progressModal.markCompleted(result);
+                } else {
+                    this.showSyncResult(result);
+                }
+            } else {
+                console.log('📂 Selected folders sync mode - using enhanced sync');
+                let totalResult: SyncResult = {
+                    uploaded: 0,
+                    downloaded: 0,
+                    skipped: 0,
+                    conflicts: 0,
+                    errors: 0,
+                    createdFolders: [],
+                    remoteChangesApplied: 0
+                };
+
+                for (const selectedFolder of this.settings.selectedDriveFolders) {
+                    console.log(`✅ Local folder found: ${selectedFolder.path} - calling enhanced sync`);
+                    const localFolder = this.app.vault.getAbstractFileByPath(selectedFolder.path);
+                    if (localFolder instanceof TFolder) {
+                        const result = await this.syncFolderWithRemotePriority(localFolder);
+                        
+                        totalResult.uploaded += result.uploaded;
+                        totalResult.downloaded += result.downloaded;
+                        totalResult.skipped += result.skipped;
+                        totalResult.conflicts += result.conflicts;
+                        totalResult.errors += result.errors;
+                        totalResult.createdFolders.push(...result.createdFolders);
+                        totalResult.remoteChangesApplied = (totalResult.remoteChangesApplied || 0) + (result.remoteChangesApplied || 0);
+                    }
+                }
+
+                if (progressModal) {
+                    progressModal.markCompleted(totalResult);
+                } else {
+                    this.showSyncResult(totalResult);
+                }
+            }
+
+            this.settings.lastSyncTime = Date.now();
+            await this.saveSettings();
     
         } catch (error) {
             console.error('Sync failed:', error);
             new Notice('❌ Google Drive sync failed');
-            return this.createEmptyResult();
+            return 
         }
     }
+    private showSyncResult(result: SyncResult): void {
+        const messages: string[] = [];
+        if (result.uploaded > 0) messages.push(`📤 ${result.uploaded} uploaded`);
+        if (result.downloaded > 0) messages.push(`📥 ${result.downloaded} downloaded`);
+        if (result.skipped > 0) messages.push(`⏭️ ${result.skipped} skipped`);
+        if (result.conflicts > 0) messages.push(`⚡ ${result.conflicts} conflicts`);
+        if (result.errors > 0) messages.push(`❌ ${result.errors} errors`);
+        if (result.remoteChangesApplied) messages.push(`🔄 ${result.remoteChangesApplied} remote changes`);
 
-    // Phase 2: Update snapshots after sync operations
-    public async updateChangeDetectionSnapshots(): Promise<void> {
-        if (!this.changeDetectionService) return;
-
-        const snapshotManager = new DriveSnapshotManager(this);
-        const status = this.changeDetectionService.getStatus();
-        
-        try {
-            // Update all tracked folder snapshots
-            for (const folderId of status.snapshots.keys()) {
-                const newSnapshot = await snapshotManager.createSnapshot(folderId);
-                status.snapshots.set(folderId, newSnapshot);
-            }
-            
-            console.log(`✅ Updated ${status.snapshots.size} snapshots after sync`);
-            
-        } catch (error) {
-            console.error('❌ Error updating snapshots:', error);
-        }
+        const summary = messages.length > 0 ? messages.join(', ') : 'No changes';
+        new Notice(`✅ Sync completed: ${summary}`);
     }
-    
-    // Phase 2: Add helper methods that may be needed by change detection classes
-    
-    // Make these existing private methods accessible to change detection classes
-    public normalizeFullPath(filePath: string): string {
-        return filePath.split('/').map(part => part.normalize('NFC')).join('/');
-    }
-
-    public getFileState(filePath: string): FileState {
-        const normalizedPath = this.normalizeFullPath(filePath);
-        return this.settings.fileStateCache[normalizedPath] || {};
-    }
-
-    public setFileState(filePath: string, state: Partial<FileState>): void {
-        const normalizedPath = this.normalizeFullPath(filePath);
-        if (!this.settings.fileStateCache[normalizedPath]) {
-            this.settings.fileStateCache[normalizedPath] = {};
-        }
-        Object.assign(this.settings.fileStateCache[normalizedPath], state);
-
-        if (state.parents) {
-            this.settings.fileStateCache[normalizedPath].parents = state.parents;
-        }
-    }
-
     async testDriveAPIConnection(): Promise<boolean> {
         try {
             if (!this.isAuthenticated()) {
@@ -9016,9 +7082,33 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         // Sync configuration section
         this.createSyncSection(containerEl);
 
-        // Phase 2: Change Detection section
-        this.createChangeDetectionSection(containerEl);
 
+        containerEl.createEl('h3', {text: 'Remote Change Detection'});
+        new Setting(containerEl)
+            .setName('Enable Remote Change Detection')
+            .setDesc('Automatically detect and apply changes made in Google Drive before syncing')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enableRemoteChangeDetection)
+                .onChange(async (value) => {
+                    this.plugin.settings.enableRemoteChangeDetection = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        if (this.plugin.settings.lastRemoteSnapshot) {
+            const snapshot = this.plugin.settings.lastRemoteSnapshot;
+            new Setting(containerEl)
+                .setName('Remote Snapshot Cache')
+                .setDesc(`Last scan: ${new Date(snapshot.scanTime).toLocaleString()}, ${snapshot.files.length} files, ${snapshot.folders.length} folders`)
+                .addButton(button => button
+                    .setButtonText('Clear Cache')
+                    .onClick(async () => {
+                        this.plugin.settings.lastRemoteSnapshot = undefined;
+                        await this.plugin.saveSettings();
+                        this.display(); // Refresh display
+                        new Notice('✅ Remote snapshot cache cleared');
+                    }));
+        }
+        
         // Advanced settings section
         this.createAdvancedSection(containerEl);
 
@@ -9026,188 +7116,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
         this.createDebugSection(containerEl);
     }
 
-    private createChangeDetectionSection(containerEl: HTMLElement): void {
-        containerEl.createEl('h3', { text: 'Change Detection' });
-
-        // Change detection toggle
-        const changeDetectionSetting = new Setting(containerEl)
-            .setName('Real-time Change Detection')
-            .setDesc('Automatically detect and apply changes made by other users')
-            .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.changeDetectionEnabled)
-                .onChange(async (value) => {
-                    this.plugin.settings.changeDetectionEnabled = value;
-                    await this.plugin.saveSettings();
-                    
-                    if (value) {
-                        await this.plugin.startChangeDetection();
-                        new Notice('✅ Change detection enabled');
-                    } else {
-                        await this.plugin.stopChangeDetection();
-                        new Notice('❌ Change detection disabled');
-                    }
-                    
-                    this.updateChangeDetectionStatus();
-                }));
-
-        // Add change detection status to description
-        this.updateChangeDetectionStatus(changeDetectionSetting);
-
-        // Polling interval setting
-        new Setting(containerEl)
-            .setName('Change Detection Interval')
-            .setDesc('How often to check for remote changes (in seconds)')
-            .addSlider(slider => {
-                const currentValue = this.plugin.settings.changePollingInterval / 1000;
-                return slider
-                    .setLimits(10, 300, 10) // 10 seconds to 5 minutes
-                    .setValue(currentValue)
-                    .setDynamicTooltip()
-                    .onChange(async (value) => {
-                        this.plugin.settings.changePollingInterval = value * 1000;
-                        await this.plugin.saveSettings();
-                        
-                        // Update description
-                        const setting = slider.sliderEl.closest('.setting-item') as HTMLElement;
-                        if (setting) {
-                            const desc = setting.querySelector('.setting-item-description') as HTMLElement;
-                            if (desc) {
-                                desc.textContent = `Check for changes every ${value} second${value !== 1 ? 's' : ''}`;
-                            }
-                        }
-                        
-                        // Restart change detection with new interval if active
-                        if (this.plugin.settings.changeDetectionEnabled) {
-                            await this.plugin.stopChangeDetection();
-                            setTimeout(async () => {
-                                await this.plugin.startChangeDetection();
-                            }, 1000);
-                            new Notice(`Change detection interval updated to ${value} second${value !== 1 ? 's' : ''}`);
-                        }
-                    });
-            });
-
-        // Manual change check button
-        new Setting(containerEl)
-            .setName('Manual Change Check')
-            .setDesc('Manually check for remote changes without enabling automatic detection')
-            .addButton(button => button
-                .setButtonText('Check Now')
-                .onClick(async () => {
-                    button.setButtonText('Checking...');
-                    button.setDisabled(true);
-                    
-                    try {
-                        await this.plugin.manualChangeCheck();
-                    } finally {
-                        button.setButtonText('Check Now');
-                        button.setDisabled(false);
-                    }
-                }))
-            .addButton(button => button
-                .setButtonText('Debug Status')
-                .onClick(() => {
-                    this.plugin.debugChangeDetection();
-                }));
-
-        // Change detection info
-        this.createChangeDetectionInfo(containerEl);
-    }
-    private createChangeDetectionInfo(containerEl: HTMLElement): void {
-        const infoContainer = containerEl.createEl('div', {
-            attr: { 
-                style: 'margin: 15px 0; padding: 12px; background: var(--background-secondary); border-radius: 6px; border-left: 4px solid var(--interactive-accent);'
-            }
-        });
-
-        infoContainer.createEl('h4', { 
-            text: 'How Change Detection Works',
-            attr: { style: 'margin-top: 0; color: var(--interactive-accent);' }
-        });
-
-        const infoList = infoContainer.createEl('ul', {
-            attr: { style: 'margin: 8px 0; padding-left: 20px; line-height: 1.5;' }
-        });
-
-        const infoItems = [
-            'Monitors Google Drive for changes made by other users or devices',
-            'Uses Google Drive Changes API combined with folder snapshots for accuracy',
-            'Automatically applies remote changes to your local vault',
-            'Respects your conflict resolution settings',
-            'Works alongside regular sync operations'
-        ];
-
-        infoItems.forEach(item => {
-            infoList.createEl('li', { 
-                text: item,
-                attr: { style: 'margin: 4px 0;' }
-            });
-        });
-
-        const warningContainer = containerEl.createEl('div', {
-            attr: { 
-                style: 'margin: 15px 0; padding: 12px; background: var(--background-modifier-error-hover); border-radius: 6px; border-left: 4px solid var(--text-error);'
-            }
-        });
-
-        warningContainer.createEl('h4', { 
-            text: '⚠️ Important Notes',
-            attr: { style: 'margin-top: 0; color: var(--text-error);' }
-        });
-
-        const warningList = warningContainer.createEl('ul', {
-            attr: { style: 'margin: 8px 0; padding-left: 20px; line-height: 1.5;' }
-        });
-
-        const warningItems = [
-            'Change detection requires continuous internet connection',
-            'May increase Google Drive API usage',
-            'Large vaults may experience longer detection delays',
-            'Always backup your vault before enabling'
-        ];
-
-        warningItems.forEach(item => {
-            warningList.createEl('li', { 
-                text: item,
-                attr: { style: 'margin: 4px 0;' }
-            });
-        });
-    }
-
-    private updateChangeDetectionStatus(setting?: Setting): void {
-        if (!setting) {
-            // Find the change detection setting
-            const changeDetectionEl = document.querySelector('.setting-item-name:contains("Real-time Change Detection")')?.closest('.setting-item') as HTMLElement;
-            if (!changeDetectionEl) return;
-            
-            const descEl = changeDetectionEl.querySelector('.setting-item-description') as HTMLElement;
-            if (descEl) {
-                this.updateChangeDetectionDescription(descEl);
-            }
-        } else {
-            this.updateChangeDetectionDescription(setting.descEl);
-        }
-    }
-
-    private updateChangeDetectionDescription(descEl: HTMLElement): void {
-        const isEnabled = this.plugin.settings.changeDetectionEnabled;
-        const isActive = this.plugin.changeDetectionService?.isActive() || false;
-        const intervalSeconds = this.plugin.settings.changePollingInterval / 1000;
-        
-        let baseDesc = 'Automatically detect and apply changes made by other users';
-        let statusText = '';
-        
-        if (isEnabled && isActive) {
-            statusText = ` ✅ Active - checking every ${intervalSeconds} second${intervalSeconds !== 1 ? 's' : ''}`;
-        } else if (isEnabled && !isActive) {
-            statusText = ' ⚠️ Enabled but not running';
-        } else {
-            statusText = ' ❌ Disabled';
-        }
-        
-        descEl.textContent = baseDesc + statusText;
-    }
-    
     private createStatusSection(containerEl: HTMLElement): void {
         const statusSetting = new Setting(containerEl)
             .setName('Connection Status')
@@ -9549,54 +7457,6 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                 .onClick(() => {
                     this.plugin.debugAutoSyncStatus();
                 }));    
-                
-        // Phase 2: Change detection specific debug actions
-        new Setting(containerEl)
-            .setName('Change Detection Management')
-            .setDesc('Advanced change detection operations')
-            .addButton(button => button
-                .setButtonText('Reset Change Token')
-                .setWarning()
-                .onClick(async () => {
-                    if (confirm('Reset change token? This will restart change detection from current state.')) {
-                        this.plugin.settings.lastChangeToken = '';
-                        await this.plugin.saveSettings();
-                        
-                        if (this.plugin.settings.changeDetectionEnabled) {
-                            await this.plugin.stopChangeDetection();
-                            setTimeout(async () => {
-                                await this.plugin.startChangeDetection();
-                            }, 1000);
-                        }
-                        
-                        new Notice('✅ Change token reset');
-                        button.setButtonText('Reset!');
-                        setTimeout(() => {
-                            button.setButtonText('Reset Change Token');
-                        }, 2000);
-                    }
-                }))
-            .addButton(button => button
-                .setButtonText('Force Snapshot Update')
-                .onClick(async () => {
-                    button.setButtonText('Updating...');
-                    button.setDisabled(true);
-                    
-                    try {
-                        if (this.plugin.changeDetectionService?.isActive()) {
-                            await this.plugin.updateChangeDetectionSnapshots();
-                            new Notice('✅ Snapshots updated');
-                        } else {
-                            new Notice('❌ Change detection not active');
-                        }
-                    } catch (error) {
-                        new Notice('❌ Failed to update snapshots');
-                        console.error('Snapshot update error:', error);
-                    } finally {
-                        button.setButtonText('Force Snapshot Update');
-                        button.setDisabled(false);
-                    }
-                }));
 
         // Export/Import settings
         new Setting(containerEl)
@@ -9656,15 +7516,7 @@ class GDriveSyncSettingTab extends PluginSettingTab {
             lastSync: this.plugin.settings.lastSyncTime > 0 ? 
                 new Date(this.plugin.settings.lastSyncTime).toLocaleString() : 'Never',
             autoSyncActive: this.plugin.isAutoSyncActive(),
-            syncIntervalMinutes: this.plugin.settings.syncInterval / 60000,
-            // Phase 2: Change detection debug info
-            changeDetectionEnabled: this.plugin.settings.changeDetectionEnabled,
-            changeDetectionActive: this.plugin.changeDetectionService?.isActive() || false,
-            lastChangeToken: this.plugin.settings.lastChangeToken || 'None',
-            changePollingIntervalSeconds: this.plugin.settings.changePollingInterval / 1000,
-            snapshotCount: this.plugin.changeDetectionService?.getStatus()?.snapshots.size || 0,
-            pendingChanges: this.plugin.changeDetectionService?.getStatus()?.pendingChanges.length || 0
-
+            syncIntervalMinutes: this.plugin.settings.syncInterval / 60000
         };
 
         const debugSetting = new Setting(containerEl)
@@ -9753,4 +7605,5 @@ class GDriveSyncSettingTab extends PluginSettingTab {
     }
 
     private authCodeInput?: TextComponent;
+
 }
