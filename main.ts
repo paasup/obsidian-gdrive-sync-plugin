@@ -1085,55 +1085,76 @@ export default class GDriveSyncPlugin extends Plugin {
      * Enhanced sync method with remote change detection
      */
     async syncFolderWithRemotePriority(folder: TFolder): Promise<SyncResult> {
+        // Show initial progress
+        const progressNotice = new Notice('Analyzing remote changes...', 0);
+
         try {
-            console.log(`🔄 Starting enhanced sync for folder: ${folder.path}`);
+            console.log(`Starting enhanced sync for folder: ${folder.path}`);
 
             if (!this.settings.enableRemoteChangeDetection) {
                 console.log('Remote change detection disabled, using standard sync');
+
+                progressNotice.setMessage('Starting standard sync...');
                 return await this.standardSyncFolder(folder);
             }
+            try {
+                // Phase 1: Detect remote changes with progress feedback
+                const changeResult = await this.detectRemoteChangesWithProgress(folder.path, progressNotice);
+                
+                if (!changeResult.hasChanges) {
+                    console.log('No remote changes detected, proceeding with standard sync');
+                    progressNotice.setMessage('Starting standard sync...');
+                    
+                    const standardResult = await this.standardSyncFolder(folder);
+                    return standardResult;
+                }
 
-            // Phase 1: Detect remote changes
-            const changeResult = await this.detectRemoteChanges(folder.path);
-            
-            if (!changeResult.hasChanges) {
-                console.log('No remote changes detected, proceeding with standard sync');
-                return await this.standardSyncFolder(folder);
+                console.log(`Remote changes detected: ${changeResult.changes.length} changes`);
+                progressNotice.setMessage(`Found ${changeResult.changes.length} remote changes - applying...`);
+
+                // Phase 2: Apply remote changes
+                const remoteChangesApplied = await this.applyRemoteChanges(changeResult.changes);
+
+                // Phase 3: Standard sync for remaining files
+                progressNotice.setMessage('Starting file sync...');
+                const standardResult = await this.standardSyncFolder(folder);
+
+                // Combine results
+                return {
+                    ...standardResult,
+                    remoteChangesApplied
+                };
+
+            } catch (error) {
+                throw error;
             }
-
-            console.log(`📋 Remote changes detected: ${changeResult.changes.length} changes`);
-
-            // Phase 2: Apply remote changes with priority order
-            const remoteChangesApplied = await this.applyRemoteChanges(changeResult.changes);
-
-            // Phase 3: Standard sync for remaining files
-            const standardResult = await this.standardSyncFolder(folder);
-
-            // Combine results
-            return {
-                ...standardResult,
-                remoteChangesApplied
-            };
-
         } catch (error) {
             console.error('Enhanced sync error:', error);
             throw error;
+        } finally {
+            await this.saveSettings();
+            progressNotice.hide();
         }
     }
 
     /**
      * Detect remote changes using snapshot comparison
      */
-    async detectRemoteChanges(targetFolderPath: string): Promise<RemoteChangeDetectionResult> {
+    async detectRemoteChangesWithProgress(
+        targetFolderPath: string, 
+        progressNotice: Notice
+    ): Promise<RemoteChangeDetectionResult> {
         try {
             console.log(`🔍 Detecting remote changes for: ${targetFolderPath}`);
-
+            progressNotice.setMessage(`Scanning Google Drive folder: ${targetFolderPath}...`);
+            
             // Get current Google Drive snapshot
-            const currentSnapshot = await this.getDriveSnapshot(targetFolderPath);
+            const currentSnapshot = await this.getDriveSnapshotWithProgress(targetFolderPath, progressNotice);
             const cachedSnapshot = this.settings.lastRemoteSnapshot;
 
             if (!cachedSnapshot) {
                 console.log('No cached snapshot available, treating as initial sync');
+                progressNotice.setMessage('First-time sync - caching folder structure...');
                 await this.updateRemoteSnapshot(currentSnapshot);
                 return {
                     changes: [],
@@ -1141,6 +1162,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     summary: { created: 0, deleted: 0, moved: 0, renamed: 0, modified: 0 }
                 };
             }
+
+            progressNotice.setMessage('Comparing with cached data...');
 
             // Filter cached snapshot to only include files from target folder scope
             const filteredCachedSnapshot = this.filterSnapshotByTargetFolder(cachedSnapshot, targetFolderPath);
@@ -1154,15 +1177,12 @@ export default class GDriveSyncPlugin extends Plugin {
             // Sort changes by priority and dependencies
             const sortedChanges = this.sortChangesByPriority(changes);
 
-            // Update cached snapshot
-            await this.updateRemoteSnapshot(currentSnapshot);
-
             // Update cached snapshot by merging, not replacing
             await this.updateRemoteSnapshotSelective(currentSnapshot, targetFolderPath);
             
             const summary = this.calculateChangeSummary(sortedChanges);
 
-            console.log(`📊 Remote change summary:`, summary);
+            console.log(`Remote change summary for ${targetFolderPath}:`, summary);
 
             return {
                 changes: sortedChanges,
@@ -1194,21 +1214,20 @@ export default class GDriveSyncPlugin extends Plugin {
             }
         };
 
-        console.log(`📋 All cached files (${snapshot.files.length}):`);
+        console.log(`📋 All cached files (${snapshot.files.length}), folders (${snapshot.folders.length})`);
         const filteredFiles = snapshot.files.filter(file => {
             const inScope = isInScope(file.path);
-            if (!inScope) {
-                console.log(`📤 Excluding file from comparison: ${file.path} (out of scope)`);
-            }
+            // if (!inScope) {
+            //     console.log(`📤 Excluding file from comparison: ${file.path} (out of scope)`);
+            // }
             return inScope;
         });
 
-         console.log(`📋 All cached folders (${snapshot.folders.length}):`);
         const filteredFolders = snapshot.folders.filter(folder => {
             const inScope = isInScope(folder.path);
-            if (!inScope) {
-                console.log(`📤 Excluding folder from comparison: ${folder.path} (out of scope)`);
-            }
+            // if (!inScope) {
+            //     console.log(`📤 Excluding folder from comparison: ${folder.path} (out of scope)`);
+            // }
             return inScope;
         });
 
@@ -1277,7 +1296,10 @@ export default class GDriveSyncPlugin extends Plugin {
     /**
      * Get current snapshot of Google Drive folder
      */
-    async getDriveSnapshot(targetFolderPath: string): Promise<DriveSnapshot> {
+    async getDriveSnapshotWithProgress(
+        targetFolderPath: string, 
+        progressNotice: Notice
+    ): Promise<DriveSnapshot> {
         const files: DriveFile[] = [];
         const folders: DriveFolder[] = [];
 
@@ -1286,6 +1308,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 const rootFolder = await this.getOrCreateDriveFolder();
                 if (!rootFolder) throw new Error('Failed to access root folder');
 
+                progressNotice.setMessage('Scanning entire vault in Google Drive...');
                 await this.scanDriveFolderRecursive(rootFolder.id, '', files, folders);
             } else {
                 const targetFolder = this.findTargetFolderConfig(targetFolderPath);
@@ -1293,6 +1316,8 @@ export default class GDriveSyncPlugin extends Plugin {
                     console.warn(`⚠️ Target folder ${targetFolderPath} not found in selected folders`);
                     return { files: [], folders: [], scanTime: Date.now() };
                 }
+
+                progressNotice.setMessage(`Scanning "${targetFolder.name}" in Google Drive...`);
                 console.log(`📁 Scanning specific Drive folder: ${targetFolder.name} (${targetFolder.id})`);
                 await this.scanDriveFolderRecursive(targetFolder.id, targetFolder.path, files, folders); 
             }
@@ -1571,10 +1596,12 @@ export default class GDriveSyncPlugin extends Plugin {
 
         const sortedChanges = this.sortChangesByPriorityAndDependency(changes);
     
-        console.log(`📋 [INFER] Total changes inferred: ${sortedChanges.length}`);
-        sortedChanges.forEach((change, index) => {
-            console.log(`  ${index + 1}. ${change.type} - ${change.fileName} (priority: ${change.priority})`);
-        });
+        if (sortedChanges.length > 0) {
+            console.log(`📋 [INFER] Total changes inferred: ${sortedChanges.length}`);
+            sortedChanges.forEach((change, index) => {
+                console.log(`  ${index + 1}. ${change.type} - ${change.fileName} (priority: ${change.priority})`);
+            });
+        }
         
         return sortedChanges;
     }
@@ -1628,8 +1655,10 @@ export default class GDriveSyncPlugin extends Plugin {
             return depthB - depthA; // 깊은 것부터 (역순)
         });
         
-        console.log(`🗑️ [SORT_DELETE] Delete order: ${fileDeletes.length} files first, then ${sortedFolderDeletes.length} folders (deepest first)`);
-        
+        if (fileDeletes.length > 0 || sortedFolderDeletes.length > 0) {
+            console.log(`🗑️ [SORT_DELETE] Delete order: ${fileDeletes.length} files first, then ${sortedFolderDeletes.length} folders (deepest first)`);
+        }   
+
         // 파일 먼저, 그 다음 폴더 (깊은 것부터)
         return [...fileDeletes, ...sortedFolderDeletes];
     }
@@ -2202,7 +2231,7 @@ export default class GDriveSyncPlugin extends Plugin {
                 }
                 
                 const result = hash.digest('hex');
-                console.log(`📊 Hash calculated for ${file.name} (${this.formatFileSize(fileSize)}): ${result.substring(0, 8)}...`);
+                //console.log(`📊 Hash calculated for ${file.name} (${this.formatFileSize(fileSize)}): ${result.substring(0, 8)}...`);
                 return result;
             }
         } catch (error) {
@@ -2261,7 +2290,7 @@ export default class GDriveSyncPlugin extends Plugin {
     
             // 🔥 Case 2: Identical hash - content is same, no sync needed
             if (currentLocalHash === currentRemoteHash) {
-                console.log(`✅ ${fileName}: Hash identical - no content changes`);
+                // console.log(`✅ ${fileName}: Hash identical - no content changes`);
                 
                 // Update cache state (record as synchronized)
                 this.setFileState(filePath, {
@@ -2271,7 +2300,6 @@ export default class GDriveSyncPlugin extends Plugin {
                     remoteModTime: currentRemoteModTime,
                     lastSyncTime: Date.now()
                 });
-                await this.saveSettings();
     
                 return {
                     shouldSync: false,
@@ -2298,10 +2326,10 @@ export default class GDriveSyncPlugin extends Plugin {
             const localMtimeChanged = cachedLocalModTime !== currentLocalModTime;
     
             // Debug logging
-            console.log(`🔍 Sync analysis for ${fileName}:`);
-            console.log(`  Current hash: local=${currentLocalHash.substring(0, 8)}..., remote=${currentRemoteHash?.substring(0, 8) || 'none'}...`);
-            console.log(`  Cached hash:  local=${cachedLocalHash?.substring(0, 8) || 'none'}..., remote=${cachedRemoteHash?.substring(0, 8) || 'none'}...`);
-            console.log(`  Change detect: localContent=${localContentChanged}, remoteContent=${remoteContentChanged}, localTime=${localMtimeChanged}`);
+            // console.log(`🔍 Sync analysis for ${fileName}:`);
+            // console.log(`  Current hash: local=${currentLocalHash.substring(0, 8)}..., remote=${currentRemoteHash?.substring(0, 8) || 'none'}...`);
+            // console.log(`  Cached hash:  local=${cachedLocalHash?.substring(0, 8) || 'none'}..., remote=${cachedRemoteHash?.substring(0, 8) || 'none'}...`);
+            // console.log(`  Change detect: localContent=${localContentChanged}, remoteContent=${remoteContentChanged}, localTime=${localMtimeChanged}`);
     
             // 🔥 Case 3: No hash changes detected
             if (!localContentChanged && !remoteContentChanged) {
@@ -2309,7 +2337,6 @@ export default class GDriveSyncPlugin extends Plugin {
                     // Only mtime changed - consider as system change
                     console.log(`⏰ ${fileName}: Only mtime changed - treating as system modification`);
                     this.setFileState(filePath, { localModTime: currentLocalModTime });
-                    await this.saveSettings();
                     
                     return {
                         shouldSync: false,
@@ -2397,8 +2424,10 @@ export default class GDriveSyncPlugin extends Plugin {
         const detailsInfo = decision.details
             ? ` | Details: ${JSON.stringify(decision.details)}`
             : '';
-    
-        console.log(`[${timestamp}] ${icon} SYNC DECISION: ${decision.action} "${fileName}" | Should sync: ${decision.shouldSync ? '✅' : '❌'} | Reason: ${decision.reason}${hashInfo}${detailsInfo}`);
+
+        if (decision.action != 'skip' ) {
+            console.log(`[${timestamp}] ${icon} SYNC DECISION: ${decision.action} "${fileName}" | Should sync: ${decision.shouldSync ? 'Y' : 'N'} | Reason: ${decision.reason}${hashInfo}${detailsInfo}`);
+        }
     }
 
     public clearFileStateCache(): void {
@@ -2936,15 +2965,15 @@ export default class GDriveSyncPlugin extends Plugin {
             // Phase 4: Update state
             await this.removeFileStateAfterDelete(context.originalPath);
             
-            progressNotice.hide();
             new Notice(`✅ Deleted "${file.name}" from both local and Drive`);
             
         } catch (error) {
             console.error(`[SYNC_DELETE] Error:`, error);
-            progressNotice.hide();
             
             // Show error (no rollback for delete)
             new Notice(`❌ Failed to delete "${file.name}": ${error.message}`);
+        } finally {
+            progressNotice.hide();
         }
     }    
     private async removeFileStateAfterDelete(filePath: string): Promise<void> {
@@ -3531,7 +3560,7 @@ export default class GDriveSyncPlugin extends Plugin {
             operationType: 'rename'
         };
 
-        const progressNotice = new Notice(`🔄 Renaming folder "${folder.name}" to "${newName}"...`, 0);
+        const progressNotice = new Notice(`🔄 Renaming folder "${folder.name}" to "${newName}"...`);
 
         try {
             console.log(`[SYNC_RENAME_FOLDER] Starting: ${folder.name} → ${newName}`);
@@ -4089,9 +4118,9 @@ export default class GDriveSyncPlugin extends Plugin {
             const summary = messages.length > 0 ? messages.join(', ') : 'No changes';
             
             if (result.errors === 0) {
-                new Notice(`✅ Folder sync completed: ${summary}`);
+                new Notice(`✅ Folder sync completed: ${summary}`, 5000);
             } else {
-                new Notice(`⚠️ Folder sync completed with ${result.errors} errors: ${summary}`);
+                new Notice(`⚠️ Folder sync completed with ${result.errors} errors: ${summary}`, 5000);
             }
     
             this.settings.lastSyncTime = Date.now();
@@ -5794,7 +5823,7 @@ export default class GDriveSyncPlugin extends Plugin {
                         path: filePath,
                         isShortcut: false
                     });
-                    console.log(`📄 Found file: ${file.name}, hash: ${file.md5Checksum || 'none'}, modified: ${file.modifiedTime}`);
+                    // console.log(`📄 Found file: ${file.name}, hash: ${file.md5Checksum || 'none'}, modified: ${file.modifiedTime}`);
                 }
                 
                 // 🔥 바로가기 처리 (기존 기능 유지)
@@ -6167,9 +6196,7 @@ export default class GDriveSyncPlugin extends Plugin {
             
             // 🔥 Hash consistency validation
             if (localHash !== remoteHash) {
-                console.warn(`⚠️ Hash mismatch after sync for ${filePath}:`);
-                console.warn(`  Local:  ${localHash}`);
-                console.warn(`  Remote: ${remoteHash}`);
+                console.warn(`⚠️ Hash mismatch after sync for ${filePath}`);
             } else {
                 console.log(`✅ Sync completed for ${filePath} - hash consistency confirmed`);
             }
@@ -6183,12 +6210,10 @@ export default class GDriveSyncPlugin extends Plugin {
                 lastSyncTime: Date.now(),
                 version: remoteFileData.version
             });
-            
-            await this.saveSettings();
-            
-            console.log(`💾 State cache updated for ${filePath}:`);
-            console.log(`  Hash: ${localHash.substring(0, 8)}... (local/remote identical)`);
-            console.log(`  Time: ${new Date(localModTime).toLocaleString()} / ${new Date(remoteModTime).toLocaleString()}`);
+
+            // console.log(`💾 State cache updated for ${filePath}`);
+            // console.log(`  Hash: ${localHash.substring(0, 8)}... (local/remote identical)`);
+            // console.log(`  Time: ${new Date(localModTime).toLocaleString()} / ${new Date(remoteModTime).toLocaleString()}`);
             
         } catch (error) {
             console.error(`❌ Failed to update state for ${filePath}:`, error);
