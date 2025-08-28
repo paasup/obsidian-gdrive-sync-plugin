@@ -1142,8 +1142,11 @@ export default class GDriveSyncPlugin extends Plugin {
                 };
             }
 
+            // Filter cached snapshot to only include files from target folder scope
+            const filteredCachedSnapshot = this.filterSnapshotByTargetFolder(cachedSnapshot, targetFolderPath);
+
             // Compare snapshots
-            const comparison = this.compareSnapshots(cachedSnapshot, currentSnapshot);
+            const comparison = this.compareSnapshots(filteredCachedSnapshot, currentSnapshot);
             
             // Infer changes with heuristics
             const changes = this.inferChangesFromComparison(comparison);
@@ -1154,6 +1157,9 @@ export default class GDriveSyncPlugin extends Plugin {
             // Update cached snapshot
             await this.updateRemoteSnapshot(currentSnapshot);
 
+            // Update cached snapshot by merging, not replacing
+            await this.updateRemoteSnapshotSelective(currentSnapshot, targetFolderPath);
+            
             const summary = this.calculateChangeSummary(sortedChanges);
 
             console.log(`📊 Remote change summary:`, summary);
@@ -1170,6 +1176,104 @@ export default class GDriveSyncPlugin extends Plugin {
         }
     }
 
+    private filterSnapshotByTargetFolder(snapshot: DriveSnapshot, targetFolderPath: string): DriveSnapshot {
+        console.log(`🔍 Filtering cached snapshot for target folder: ${targetFolderPath}`);
+        
+        // Determine which files/folders are in scope
+        const isInScope = (itemPath: string): boolean => {
+            if (this.settings.syncWholeVault) {
+                // Whole vault mode - everything is in scope
+                return true;
+            } else {
+                if (targetFolderPath === '') {
+                    return !itemPath.includes('/');
+                } else {
+                    return itemPath === targetFolderPath || 
+                        itemPath.startsWith(targetFolderPath + '/');
+                }
+            }
+        };
+
+        console.log(`📋 All cached files (${snapshot.files.length}):`);
+        const filteredFiles = snapshot.files.filter(file => {
+            const inScope = isInScope(file.path);
+            if (!inScope) {
+                console.log(`📤 Excluding file from comparison: ${file.path} (out of scope)`);
+            }
+            return inScope;
+        });
+
+         console.log(`📋 All cached folders (${snapshot.folders.length}):`);
+        const filteredFolders = snapshot.folders.filter(folder => {
+            const inScope = isInScope(folder.path);
+            if (!inScope) {
+                console.log(`📤 Excluding folder from comparison: ${folder.path} (out of scope)`);
+            }
+            return inScope;
+        });
+
+        console.log(`✅ Filtered snapshot: ${filteredFiles.length}/${snapshot.files.length} files, ${filteredFolders.length}/${snapshot.folders.length} folders`);
+
+        return {
+            files: filteredFiles,
+            folders: filteredFolders,
+            scanTime: snapshot.scanTime
+        };
+    }    
+
+    async updateRemoteSnapshotSelective(newSnapshot: DriveSnapshot, targetFolderPath: string): Promise<void> {
+        const existingSnapshot = this.settings.lastRemoteSnapshot;
+        
+        if (!existingSnapshot) {
+            // No existing snapshot - use new snapshot as-is
+            await this.updateRemoteSnapshot(newSnapshot);
+            return;
+        }
+
+        console.log(`🔄 Merging snapshot for target folder: ${targetFolderPath}`);
+        
+        // Determine which files/folders are being updated
+        const isBeingUpdated = (itemPath: string): boolean => {
+            if (this.settings.syncWholeVault) {
+                return true; // Whole vault mode - everything gets updated
+            } else {
+                // Check if item path is within target folder scope
+                for (const selectedFolder of this.settings.selectedDriveFolders) {
+                    if (targetFolderPath === selectedFolder.path || 
+                        targetFolderPath.startsWith(selectedFolder.path + '/')) {
+                        
+                        if (itemPath === selectedFolder.path || 
+                            itemPath.startsWith(selectedFolder.path + '/')) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        };
+
+        // Remove old data for target folder scope from existing snapshot
+        const preservedFiles = existingSnapshot.files.filter(file => !isBeingUpdated(file.path));
+        const preservedFolders = existingSnapshot.folders.filter(folder => !isBeingUpdated(folder.path));
+
+        // Merge with new data
+        const mergedSnapshot: DriveSnapshot = {
+            files: [...preservedFiles, ...newSnapshot.files],
+            folders: [...preservedFolders, ...newSnapshot.folders],
+            scanTime: newSnapshot.scanTime
+        };
+
+        // console.log(`📊 Snapshot merge result:`);
+        // console.log(`  Preserved: ${preservedFiles.length} files, ${preservedFolders.length} folders`);
+        // console.log(`  New: ${newSnapshot.files.length} files, ${newSnapshot.folders.length} folders`);
+        // console.log(`  Total: ${mergedSnapshot.files.length} files, ${mergedSnapshot.folders.length} folders`);
+
+        // Save merged snapshot
+        this.settings.lastRemoteSnapshot = mergedSnapshot;
+        await this.saveSettings();
+        
+        console.log(`💾 Updated remote snapshot cache (selective merge for ${targetFolderPath})`);
+    }
     /**
      * Get current snapshot of Google Drive folder
      */
@@ -1178,22 +1282,20 @@ export default class GDriveSyncPlugin extends Plugin {
         const folders: DriveFolder[] = [];
 
         try {
-            let targetFolderId: string;
-
             if (this.settings.syncWholeVault) {
                 const rootFolder = await this.getOrCreateDriveFolder();
                 if (!rootFolder) throw new Error('Failed to access root folder');
-                targetFolderId = rootFolder.id;
-            } else {
-                const selectedFolder = this.settings.selectedDriveFolders.find(f => 
-                    targetFolderPath === f.path || targetFolderPath.startsWith(f.path + '/')
-                );
-                if (!selectedFolder) throw new Error('Target folder not in sync scope');
-                targetFolderId = selectedFolder.id;
-            }
 
-            // Recursively get all files and folders
-            await this.scanDriveFolderRecursive(targetFolderId, '', files, folders);
+                await this.scanDriveFolderRecursive(rootFolder.id, '', files, folders);
+            } else {
+                const targetFolder = this.findTargetFolderConfig(targetFolderPath);
+                if (!targetFolder) {
+                    console.warn(`⚠️ Target folder ${targetFolderPath} not found in selected folders`);
+                    return { files: [], folders: [], scanTime: Date.now() };
+                }
+                console.log(`📁 Scanning specific Drive folder: ${targetFolder.name} (${targetFolder.id})`);
+                await this.scanDriveFolderRecursive(targetFolder.id, targetFolder.path, files, folders); 
+            }
 
             return {
                 files,
@@ -1206,7 +1308,18 @@ export default class GDriveSyncPlugin extends Plugin {
             throw error;
         }
     }
-
+    private findTargetFolderConfig(targetFolderPath: string): {id: string, name: string, path: string} | null {
+        // Find the selected folder that contains or matches the target path
+        for (const selectedFolder of this.settings.selectedDriveFolders) {
+            if (targetFolderPath === selectedFolder.path || 
+                targetFolderPath.startsWith(selectedFolder.path + '/')) {
+                return selectedFolder;
+            }
+        }
+        
+        console.warn(`❌ No matching selected folder found for target: ${targetFolderPath}`);
+        return null;
+    }
     /**
      * Recursively scan Google Drive folder
      */
