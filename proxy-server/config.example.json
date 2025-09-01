@@ -1,0 +1,18 @@
+{
+  "port": "8080",
+  "client_id": "your-google-client-id.apps.googleusercontent.com",
+  "client_secret": "your-google-client-secret",
+  "redirect_uri": "http://localhost:8080/auth/callback",
+  "secret_keys": {
+    "your-secret-key-here": {
+      "user_id": "user1",
+      "rate_limit": 100,
+      "permissions": ["drive.read", "drive.write"]
+    },
+    "another-secret-key": {
+      "user_id": "user2", 
+      "rate_limit": 50,
+      "permissions": ["drive.read"]
+    }
+  }
+}

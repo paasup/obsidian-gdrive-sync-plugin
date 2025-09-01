@@ -32,7 +32,11 @@ interface GDriveSyncSettings {
     selectedDriveFolders: Array<{id: string, name: string, path: string}>; // 선택된 Google Drive 폴더 정보
     fileStateCache: {[filePath: string]: FileState};
     lastRemoteSnapshot?: DriveSnapshot;
-    enableRemoteChangeDetection: boolean;    
+    enableRemoteChangeDetection: boolean;
+    // OAuth Proxy Server settings
+    useProxyServer: boolean;
+    proxyServerUrl: string;
+    proxySecretKey: string;
 }
 // 🔥 간소화된 파일 상태 인터페이스
 interface FileState {
@@ -85,7 +89,11 @@ const DEFAULT_SETTINGS: GDriveSyncSettings = {
     createMissingFolders: true,
     selectedDriveFolders: [],
     fileStateCache: {},
-    enableRemoteChangeDetection: true
+    enableRemoteChangeDetection: true,
+    // OAuth Proxy Server settings
+    useProxyServer: false,
+    proxyServerUrl: 'https://gdrive-proxy.example.com',
+    proxySecretKey: ''
 };
 
 // 동기화 결과 인터페이스
@@ -4455,6 +4463,161 @@ export default class GDriveSyncPlugin extends Plugin {
             }, 100);
         }
     }
+
+    // OAuth Proxy Server authentication methods
+    async authenticateViaProxy(): Promise<boolean> {
+        console.log('=== Starting OAuth Proxy Authentication ===');
+
+        if (!this.settings.proxyServerUrl || !this.settings.proxySecretKey) {
+            new Notice('❌ Please set Proxy Server URL and Secret Key first.');
+            return false;
+        }
+
+        try {
+            console.log('Authenticating via proxy server...');
+            
+            const response = await requestUrl({
+                url: `${this.settings.proxyServerUrl}/auth/initiate`,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Secret-Key': this.settings.proxySecretKey
+                },
+                body: JSON.stringify({
+                    client_type: 'obsidian_plugin',
+                    redirect_uri: 'urn:ietf:wg:oauth:2.0:oob'
+                }),
+                throw: false
+            });
+
+            if (response.status === 200) {
+                const authData = response.json;
+                const authUrl = authData.auth_url;
+                const sessionId = authData.session_id;
+
+                new Notice('Opening browser for proxy authentication...');
+                console.log('Proxy Auth URL:', authUrl);
+
+                try {
+                    window.open(authUrl, '_blank');
+                    
+                    // Poll for completion
+                    new Notice('🔗 Complete authentication in browser. Waiting for completion...');
+                    const success = await this.pollForProxyAuthCompletion(sessionId);
+                    
+                    if (success) {
+                        new Notice('✅ Proxy authentication successful!');
+                        return true;
+                    } else {
+                        new Notice('❌ Proxy authentication failed or timed out.');
+                        return false;
+                    }
+                } catch (error) {
+                    console.error('Failed to open browser:', error);
+                    new Notice('❌ Failed to open browser. Please check console for auth URL.');
+                    return false;
+                }
+            } else {
+                console.error('Proxy auth initiation failed:', response.status, response.json);
+                new Notice('❌ Failed to initiate proxy authentication.');
+                return false;
+            }
+        } catch (error) {
+            console.error('Proxy authentication error:', error);
+            new Notice('❌ Proxy authentication failed. Check console for details.');
+            return false;
+        }
+    }
+
+    private async pollForProxyAuthCompletion(sessionId: string): Promise<boolean> {
+        const maxAttempts = 60; // 5 minutes (5 second intervals)
+        let attempts = 0;
+
+        while (attempts < maxAttempts) {
+            try {
+                const response = await requestUrl({
+                    url: `${this.settings.proxyServerUrl}/auth/status/${sessionId}`,
+                    method: 'GET',
+                    headers: {
+                        'X-Secret-Key': this.settings.proxySecretKey
+                    },
+                    throw: false
+                });
+
+                if (response.status === 200) {
+                    const statusData = response.json;
+                    
+                    if (statusData.status === 'completed') {
+                        // Store the proxy session token
+                        this.settings.accessToken = statusData.access_token;
+                        this.settings.refreshToken = statusData.refresh_token || '';
+                        this.settings.tokenExpiresAt = statusData.expires_at || (Date.now() + 3600000);
+                        
+                        await this.saveSettings();
+                        return true;
+                    } else if (statusData.status === 'failed') {
+                        return false;
+                    }
+                    // If status is 'pending', continue polling
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+                attempts++;
+            } catch (error) {
+                console.error('Error polling auth status:', error);
+                attempts++;
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+        }
+        
+        return false; // Timeout
+    }
+
+    async testProxyConnection(): Promise<boolean> {
+        try {
+            if (!this.settings.proxyServerUrl || !this.settings.proxySecretKey) {
+                new Notice('❌ Please set Proxy Server URL and Secret Key first.');
+                return false;
+            }
+
+            console.log('Testing proxy server connection...');
+
+            const response = await requestUrl({
+                url: `${this.settings.proxyServerUrl}/health`,
+                method: 'GET',
+                headers: {
+                    'X-Secret-Key': this.settings.proxySecretKey
+                },
+                throw: false
+            });
+
+            console.log('Proxy Response Status:', response.status);
+
+            if (response.status === 200) {
+                const data = response.json;
+                console.log('Proxy connection test successful:', data);
+                new Notice('✅ Proxy server connection successful!');
+                return true;
+            } else if (response.status === 401) {
+                console.error('Proxy authentication failed - Invalid secret key');
+                new Notice('❌ Invalid secret key. Please check your credentials.');
+                return false;
+            } else if (response.status === 403) {
+                console.error('Proxy access denied - Check permissions');
+                new Notice('❌ Access denied. Check your secret key permissions.');
+                return false;
+            } else {
+                console.error('Proxy connection failed:', response.status, response.json);
+                new Notice('❌ Proxy server connection failed.');
+                return false;
+            }
+        } catch (error) {
+            console.error('Proxy connection test error:', error);
+            new Notice('❌ Failed to connect to proxy server. Check URL and network connection.');
+            return false;
+        }
+    }
+
     isAuthenticated(): boolean {
         return !!(this.settings.accessToken && this.settings.refreshToken);
     }
@@ -4464,7 +4627,13 @@ export default class GDriveSyncPlugin extends Plugin {
         if (!await this.ensureValidToken()) {
             throw new Error('Authentication failed');
         }
-    
+
+        // Route through proxy server if enabled
+        if (this.settings.useProxyServer) {
+            return await this.makeProxyRequest(url, options);
+        }
+
+        // Direct Google API request (original behavior)
         const response = await requestUrl({
             url,
             method: options.method || 'GET',
@@ -4504,6 +4673,63 @@ export default class GDriveSyncPlugin extends Plugin {
             arrayBuffer: response.arrayBuffer,
             text: response.text
         };
+    }
+
+    // Proxy server request handler
+    private async makeProxyRequest(originalUrl: string, options: any): Promise<any> {
+        try {
+            // Extract the Google Drive API path from the original URL
+            const apiPath = originalUrl.replace('https://www.googleapis.com/drive/v3/', '')
+                                     .replace('https://www.googleapis.com/upload/drive/v3/', 'upload/');
+
+            const proxyUrl = `${this.settings.proxyServerUrl}/api/drive/${apiPath}`;
+
+            const response = await requestUrl({
+                url: proxyUrl,
+                method: options.method || 'GET',
+                headers: {
+                    'X-Secret-Key': this.settings.proxySecretKey,
+                    'X-Access-Token': this.settings.accessToken,
+                    'Content-Type': options.headers?.['Content-Type'] || 'application/json',
+                    ...options.headers
+                },
+                body: options.body,
+                throw: false
+            });
+
+            // Handle media downloads
+            if (originalUrl.includes('alt=media')) {
+                return {
+                    status: response.status,
+                    json: null,
+                    arrayBuffer: response.arrayBuffer,
+                    text: response.text
+                };
+            }
+
+            // Parse JSON response
+            let jsonData = null;
+            if (response.text) {
+                try {
+                    jsonData = JSON.parse(response.text);
+                } catch (error) {
+                    console.warn(`JSON parsing failed for proxy URL: ${proxyUrl}`, error);
+                    if (!originalUrl.includes('alt=media')) {
+                        console.error('Unexpected JSON parsing failure:', response.text.substring(0, 100));
+                    }
+                }
+            }
+
+            return {
+                status: response.status,
+                json: jsonData,
+                arrayBuffer: response.arrayBuffer,
+                text: response.text
+            };
+        } catch (error) {
+            console.error('Proxy request failed:', error);
+            throw new Error(`Proxy request failed: ${error.message}`);
+        }
     }
 
     private getRelativePath(filePath: string, baseFolder: string): string {
@@ -7368,6 +7594,57 @@ class GDriveSyncSettingTab extends PluginSettingTab {
                             button.setDisabled(false);
                         }
                     }));
+        }
+
+        // OAuth Proxy Server section
+        containerEl.createEl('h4', { text: 'OAuth Proxy Server (Pro Feature)' });
+        
+        new Setting(containerEl)
+            .setName('Use Proxy Server')
+            .setDesc('Enable simplified authentication through OAuth proxy server')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.useProxyServer)
+                .onChange(async (value) => {
+                    this.plugin.settings.useProxyServer = value;
+                    await this.plugin.saveSettings();
+                    this.display(); // Refresh to show/hide proxy settings
+                }));
+
+        // Show proxy settings only when proxy is enabled
+        if (this.plugin.settings.useProxyServer) {
+            new Setting(containerEl)
+                .setName('Proxy Server URL')
+                .setDesc('URL of the OAuth proxy server')
+                .addText(text => text
+                    .setPlaceholder('https://gdrive-proxy.example.com')
+                    .setValue(this.plugin.settings.proxyServerUrl)
+                    .onChange(async (value) => {
+                        this.plugin.settings.proxyServerUrl = value;
+                        await this.plugin.saveSettings();
+                    }));
+
+            new Setting(containerEl)
+                .setName('Secret Key')
+                .setDesc('Your unique secret key for proxy authentication')
+                .addText(text => text
+                    .setPlaceholder('Enter your secret key')
+                    .setValue(this.plugin.settings.proxySecretKey)
+                    .onChange(async (value) => {
+                        this.plugin.settings.proxySecretKey = value;
+                        await this.plugin.saveSettings();
+                    }));
+
+            // Proxy authentication actions
+            new Setting(containerEl)
+                .setName('Proxy Authentication')
+                .setDesc('Authenticate through proxy server')
+                .addButton(button => button
+                    .setButtonText('Authenticate via Proxy')
+                    .setCta()
+                    .onClick(() => this.plugin.authenticateViaProxy()))
+                .addButton(button => button
+                    .setButtonText('Test Proxy Connection')
+                    .onClick(() => this.plugin.testProxyConnection()));
         }
     }
 
